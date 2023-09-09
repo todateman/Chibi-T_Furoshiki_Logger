@@ -42,7 +42,7 @@ double L = 85.05112878;
 int z = 18;  //ズーム倍率
 float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
 unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
-int Lapcount = 0, worktime, workmin, worksec, LAPRADchange = 0;
+int Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
 // const char* ssid = "****";  // Wi-Fi SSID
 // const char* password = "****";  // Wi-Fi Password
 bool isWifiConfigSucceeded = false;  // WiFi設定が成功したかどうかのフラグ
