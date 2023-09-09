@@ -25,8 +25,10 @@ WiFiManager wifiManager;
 double goal_la, goal_ln;
 double goal_la_su = 34.842925;   // 鈴鹿サーキットスタートライン
 double goal_ln_su = 136.540692;  // 鈴鹿サーキットスタートライン
-double goal_la_mo = 36.532770;   // ツインリンクもてぎオーバルコーススタートライン
-double goal_ln_mo = 140.226208;  // ツインリンクもてぎオーバルコーススタートライン
+//double goal_la_mo = 36.532770;   // ツインリンクもてぎオーバルコーススタートライン
+//double goal_ln_mo = 140.226208;  // ツインリンクもてぎオーバルコーススタートライン
+double goal_la_mo = 36.533590;   // ツインリンクもてぎオーバルコーススタートライン
+double goal_ln_mo = 140.225706;  // ツインリンクもてぎオーバルコーススタートライン
 double goal_la_to = 35.082078;   // 豊田市SENTAN
 double goal_ln_to = 137.160358;  // 豊田市SENTAN
 //double goal_la_to = 35.066781;
