@@ -8,9 +8,9 @@
 #include <M5Unified.h>
 #include "Ambient.h"
 #include <WiFiManager.h>
+#include <TimeLib.h>
 
 #define pi 3.141592653589793
-#define PERIOD 10  // データの送信間隔(sec)
 
 static M5GFX lcd1;
 static M5UnitLCD lcd2;
@@ -43,9 +43,13 @@ int z = 18;  //ズーム倍率
 float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
 unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
 int Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
+
+// Wi-Fi
 // const char* ssid = "****";  // Wi-Fi SSID
 // const char* password = "****";  // Wi-Fi Password
 bool isWifiConfigSucceeded = false;  // WiFi設定が成功したかどうかのフラグ
+
+// ambient
 // unsigned int channelId = 65530; // AmbientのチャネルID
 // const char* writeKey = "050985c9530d8eb0"; // ライトキー
 const char* userKey = "64bd5933d381952b59"; // ユーザーキー
@@ -53,7 +57,20 @@ char devKey[20];
 unsigned int channelId;
 char writeKey[20];
 bool ambientpush = true;  // // ambientへの送信 有効(true)/無効(false)
-unsigned long t;
+unsigned long t_amb;  // Ambientへの送信時刻
+
+//ログファイル
+File logFile;
+char fileName[16];       // ファイル名
+uint8_t fileNum = 0;     // ファイル連番
+unsigned long t_SD;      // SDの記録時刻
+uint8_t jst_year;
+uint8_t jst_month;
+uint8_t jst_day;
+uint8_t jst_hour;
+uint8_t jst_minute;
+uint8_t jst_second;
+#define time_offset 32400    // UTC+9時間(60*60*9 秒）
 
 HardwareSerial GPS_s(2);  // Serial2 = PortC(RX:13 TX:14)
 TinyGPSPlus gps;
@@ -160,10 +177,21 @@ void getGNSS() {
     if (gps.encode(GPS_s.read())) {
       if (gps.location.isUpdated()) {
         // 経度緯度速度を取得
-        la = gps.location.lat();
-        ln = gps.location.lng();
-        spd = gps.speed.kmph();
-        alt = gps.altitude.meters();
+        if (gps.location.lng() > 120) {  // 東経120度の場合
+          la         = gps.location.lat();
+          ln         = gps.location.lng();
+          spd        = gps.speed.kmph();
+          alt        = gps.altitude.meters();
+          jst_day    = gps.date.day();
+          jst_month  = gps.date.month();
+          jst_year   = gps.date.year();
+          jst_hour   = gps.time.hour();
+          jst_minute = gps.time.minute();
+          jst_second = gps.time.second();
+          setTime(jst_hour, jst_minute, jst_second, jst_day, jst_month, jst_year);
+          // JST変換
+          adjustTime(time_offset);
+        }
         break;
       }
     }    
@@ -350,8 +378,58 @@ void pushAmbient() {
     ambient.set(10, lnbuf); // 10番目のデータとして経度をセット
 
     ambient.send();
-    t = millis();
+    t_amb = millis();
   }
+}
+
+// SDに保存
+void WriteSD(){
+  // ファイル名の連番を決定
+  while(1){      
+    sprintf_P(fileName, PSTR("LOG/LOG%04d.CSV"), fileNum);
+    if(!SD.exists(fileName)) {
+      Serial.println(fileName);
+      break;
+    }
+    fileNum++;
+  }
+
+  // ログファイルが無かったらヘッダを書き込む
+  if(!SD.exists(fileName)) {
+    logFile = SD.open(fileName, FILE_WRITE);
+    if (logFile){
+      logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),	,	, , ,lat,lng,"));
+    }
+  }
+
+  // ログファイルに書き込み
+  logFile = SD.open(fileName, FILE_WRITE);
+  if (logFile){
+    logFile.printf_P(PSTR("%d/%d/%d %d:%d:%d"), jst_year, jst_month, jst_day, jst_hour, jst_minute, jst_second);  // 0.日時
+    logFile.print(F(","));
+    logFile.print(spdbuf);    // 1.速度
+    logFile.print(F(","));
+    logFile.print(altbuf);    // 2.標高
+    logFile.print(F(","));
+    logFile.print(Lapcount);  // 3.ラップ数
+    logFile.print(F(","));
+    logFile.print(worktime);  // 4.走行時間(sec)
+    logFile.print(F(","));
+    logFile.print("");        // 5.
+    logFile.print(F(","));
+    logFile.print("");        // 6.
+    logFile.print(F(","));
+    logFile.print("");        // 7.
+    logFile.print(F(","));
+    logFile.print("");        // 8.
+    logFile.print(F(","));
+    logFile.print(labuf);   // 9.緯度
+    logFile.print(F(","));
+    logFile.println(lnbuf);   // 10.経度
+  }
+  logFile.close();
+
+  t_SD = millis();
 }
 
 void setup()
@@ -449,8 +527,8 @@ void setup()
 
   Serial.println(F("lat,lon,spd,alt"));
 
-  t = millis();
-
+  t_amb = millis();
+  t_SD = millis();
 
   // タイマ割込み設定
     /*
@@ -492,12 +570,16 @@ void loop()
   // 外部ディスプレイに速度と高度を表示
   drawinfo();
 
-  // Ambientへ送信
-  if (ambientpush) {             // ambientへの送信が有効の場合
-    if (millis() - t >= PERIOD * 1000) {
+  if (ambientpush) {                      // ambientへの送信が有効の場合
+    if (millis() - t_amb >= 10 * 1000) {  // 10秒ごとにAmbientへ送信
       pushAmbient();
     }
   }
+
+  if (millis() - t_SD >= 10 * 1000) {  // 1秒ごとにSDへ記録
+    WriteSD();
+  }
+
 
   delay(100);
 }
