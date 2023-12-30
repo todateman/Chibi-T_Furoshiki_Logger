@@ -9,6 +9,8 @@
 #include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
+#include <Adafruit_ADS1X15.h>
+#define  IGPLS_PIN 26                 // 点火コイル.クランク1回転ごとにON
 
 #define pi 3.141592653589793
 
@@ -20,6 +22,15 @@ static M5Canvas lcd2_s(&lcd2);
 WiFiClient client;
 Ambient ambient;
 WiFiManager wifiManager;
+Adafruit_ADS1115 ads;
+
+//#define CFACTOR 0.18750 // GAIN_TWOTHIRDS: +/-6.144V range: Calibration factor (mV/bit) for ADS1115 
+#define CFACTOR 0.12500 // GAIN_ONE: +/-4.096V range: Calibration factor (mV/bit) for ADS1115
+//#define CFACTOR 0.06250 // GAIN_TWO: +/-2.048V range: Calibration factor (mV/bit) for ADS1115
+//#define CFACTOR 0.03125 // GAIN_FOUR: +/-1.024V range: Calibration factor (mV/bit) for ADS1115
+//#define CFACTOR 0.01563 // GAIN_EIGHT: +/-/0.512V range: Calibration factor (mV/bit) for ADS1115
+//#define CFACTOR 0.00781 // GAIN_SIXTEEN: +/-0.256V range: Calibration factor (mV/bit) for ADS1115
+
 
 //変数の定義
 double goal_la, goal_ln;
@@ -36,13 +47,21 @@ double goal_ln_to = 137.160358;  // 豊田市SENTAN
 double la = goal_la_su;
 double ln = goal_ln_su;
 double spd=0.0, alt=0.0;  // 速度(km/h), 標高(m)
-char labuf[12], lnbuf[12], spdbuf[6], altbuf[7], lobuf[7];
+char labuf[12], lnbuf[12], spdbuf[6], altbuf[7], lobuf[7], O2buf[5];
 String Loc = "";
 double L = 85.05112878;
 int z = 18;  //ズーム倍率
 float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
 unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
-int Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
+uint16_t Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
+volatile unsigned long tachoBefore = 0;   // クランクセンサーの前回の反応時の時間
+volatile unsigned long tachoAfter = 0;    // クランクセンサーの今回の反応時の時間
+volatile unsigned long tachoWidth = 0;    // クランク一回転の時間　tachoAfter - tachoBefore
+volatile uint16_t RPM = 0;                // エンジンの回転数(0-8500rpm)
+uint16_t read_from_ads;                   // ADS1115から読んだ生値
+uint8_t Value_THL = 0;                    // スロットル開度(0-100%)
+float inputO2 = 0;                        // O2センサ出力電圧(0-1000mV)
+float Value_O2 = 0;                       // O2センサから概算した空燃比(10.0-20.0)
 
 // Wi-Fi
 // const char* ssid = "****";  // Wi-Fi SSID
@@ -214,6 +233,27 @@ void getGNSS() {
   Serial.printf_P(PSTR("%s,%s,%s,%s,%s\n"), labuf, lnbuf, spdbuf, altbuf, lobuf);
 }
 
+ // エンジン回転数を取得
+void IRAM_ATTR getRPM() {
+  tachoAfter = micros();                                    // 現在の時刻を記録
+  tachoWidth = tachoAfter - tachoBefore;                    // 前回と今回の時間の差(カムシャフト1回転当たりの時間)を計算
+  RPM = (60000000 / tachoWidth);                            //クランクの回転数[rpm]を計算
+
+  tachoBefore = tachoAfter;                                 // 今回の値を前回の値に代入する
+}
+
+// スロットル開度・空燃比を取得
+void getTHL_O2(){
+  uint16_t read_from_ads;                                   // ADS1115から読んだ生値
+  read_from_ads = uint16_t(ads.readADC_Differential_0_1()); // チャネル0,1の作動(Differential)入力
+  Value_THL = map(read_from_ads, 4960, 38202, 0, 100);      // スロットル開度(0-100%)を算出
+
+  read_from_ads = uint16_t(ads.readADC_SingleEnded(2));     // チャネル2の単動(SingleEnd)入力
+  inputO2 = read_from_ads * CFACTOR;                        // 校正係数を掛けてO2センサ出力電圧(mV)とする
+  Value_O2 = map(read_from_ads, 0, 8000, 100, 200) * 0.1;   // 空燃比(10.0-20.0)を算出
+  dtostrf(Value_O2, -1, 1, O2buf);                          // 小数を含んだ数値を文字列に変換
+}
+
 // ラップタイム,周回数,走行時間を計測
 void lap_count() {
   if (Loc == "suzuka") {
@@ -367,15 +407,44 @@ void drawinfo() {
   lcd2.endWrite();
 }
 
+// M5Core2本体にエンジン回転数・スロットル開度・空燃比を表示
+void drawinfo_cab() {
+  lcd1_s.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd1_s.setTextSize(1.5);
+  lcd1_s.fillScreen(BLACK);
+  lcd1_s.setTextColor(ORANGE);
+
+  lcd1_s.setCursor(10, 10);
+  lcd1_s.printf_P(PSTR("回転数: %drpm"), RPM);
+  lcd1_s.drawRect(10, 50, 300, 20, ORANGE);
+  lcd1_s.fillRect(10, 50, map(RPM, 0, 8500, 0, 300), 20, ORANGE);
+  lcd1_s.setCursor(10, 90);
+  lcd1_s.printf_P(PSTR("スロットル開度: %d%"), Value_THL);
+  lcd1_s.drawRect(10, 130, 300, 20, ORANGE);
+  lcd1_s.fillRect(10, 130, map(Value_THL, 0, 100, 0, 300), 20, ORANGE);
+  lcd1_s.setCursor(10, 170);
+  lcd1_s.printf_P(PSTR("概算空燃比: %s"), O2buf);
+  lcd1_s.drawRect(10, 210, 300, 20, ORANGE);
+  lcd1_s.fillRect(10, 210, map(inputO2, 0, 1000, 0, 300), 20, ORANGE);
+
+  // スプライトを表示
+  lcd1.startWrite();
+  lcd1_s.pushSprite(5, 5);
+  lcd1.endWrite();
+}
+
 // Ambientへ送信
 void pushAmbient() {
   if (WiFi.status() == WL_CONNECTED) {  //  Wi-Fi 接続できている場合
-    ambient.set(1, spdbuf); // 1番目のデータとして速度をセット
-    ambient.set(2, altbuf); // 2番目のデータとして標高をセット
-    ambient.set(3, Lapcount); // 3番目のデータとしてラップ数をセット
-    ambient.set(4, worktime); // 4番目のデータとして走行時間(sec)をセット
-    ambient.set(9, labuf);  // 9番目のデータとして緯度をセット
-    ambient.set(10, lnbuf); // 10番目のデータとして経度をセット
+    ambient.set(1, spdbuf);     // 1番目のデータとして速度をセット
+    ambient.set(2, altbuf);     // 2番目のデータとして標高をセット
+    ambient.set(3, Lapcount);   // 3番目のデータとしてラップ数をセット
+    ambient.set(4, worktime);    // 4番目のデータとして走行時間(sec)をセット
+    ambient.set(5, RPM);        // 5番目のデータとして回転数(rpm)をセット
+    ambient.set(6, Value_THL);  // 6番目のデータとしてスロットル開度(%)をセット
+    ambient.set(7, O2buf);      // 7番目のデータとして概算空燃比をセット
+    ambient.set(9, labuf);      // 9番目のデータとして緯度をセット
+    ambient.set(10, lnbuf);     // 10番目のデータとして経度をセット
 
     ambient.send();
     t_amb = millis();
@@ -384,26 +453,8 @@ void pushAmbient() {
 
 // SDに保存
 void WriteSD(){
-  // ファイル名の連番を決定
-  while(1){      
-    sprintf_P(fileName, PSTR("LOG/LOG%04d.CSV"), fileNum);
-    if(!SD.exists(fileName)) {
-      Serial.println(fileName);
-      break;
-    }
-    fileNum++;
-  }
-
-  // ログファイルが無かったらヘッダを書き込む
-  if(!SD.exists(fileName)) {
-    logFile = SD.open(fileName, FILE_WRITE);
-    if (logFile){
-      logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),	,	, , ,lat,lng,"));
-    }
-  }
-
   // ログファイルに書き込み
-  logFile = SD.open(fileName, FILE_WRITE);
+  logFile = SD.open(fileName, FILE_APPEND);
   if (logFile){
     logFile.printf_P(PSTR("%d/%d/%d %d:%d:%d"), jst_year, jst_month, jst_day, jst_hour, jst_minute, jst_second);  // 0.日時
     logFile.print(F(","));
@@ -415,15 +466,15 @@ void WriteSD(){
     logFile.print(F(","));
     logFile.print(worktime);  // 4.走行時間(sec)
     logFile.print(F(","));
-    logFile.print("");        // 5.
+    logFile.print(RPM);       // 5.回転数(rpm)
     logFile.print(F(","));
-    logFile.print("");        // 6.
+    logFile.print(Value_THL); // 6.スロットル開度(%)
     logFile.print(F(","));
-    logFile.print("");        // 7.
+    logFile.print(O2buf);     // 7.概算空燃比
     logFile.print(F(","));
     logFile.print("");        // 8.
     logFile.print(F(","));
-    logFile.print(labuf);   // 9.緯度
+    logFile.print(labuf);     // 9.緯度
     logFile.print(F(","));
     logFile.println(lnbuf);   // 10.経度
   }
@@ -437,6 +488,8 @@ void setup()
   auto cfg = M5.config();
   M5.begin(cfg);
 
+  pinMode(IGPLS_PIN, INPUT);
+
   lcd1.init();
   lcd2.init();
   lcd2.setRotation(3);
@@ -449,6 +502,24 @@ void setup()
   lcd1.setTextDatum( baseline_center );
 
   delay(500);
+  
+  // アナログ電圧測定のため、ADS1115有効化
+  // ads.setGain(GAIN_TWOTHIRDS);  // 2/3x gain +/- 6.144V  1 bit = 3mV      0.1875mV (default)
+  ads.setGain(GAIN_ONE);           // 1x gain   +/- 4.096V  1 bit = 2mV      0.125mV
+  // ads.setGain(GAIN_TWO);        // 2x gain   +/- 2.048V  1 bit = 1mV      0.0625mV
+  // ads.setGain(GAIN_FOUR);       // 4x gain   +/- 1.024V  1 bit = 0.5mV    0.03125mV
+  // ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
+  // ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
+  if (!ads.begin()) {
+    Serial.println("Failed to initialize ADS.");
+    lcd1.clear(RED);
+    //lcd1_s.fillScreen(RED);
+    lcd1.setTextColor(BLACK);
+    lcd1.drawString("ADS1115が見つかりません", lcd1.width()/2, lcd1.height()/2);
+    //lcd1_s.pushSprite(0, 0);
+    while (1);
+  }
+
   // SDカードマウント待ち
   while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
     Serial.println("SD Wait...");
@@ -538,6 +609,30 @@ void setup()
   timerAlarmWrite(tim0, 10000000, true);         //tim0割込み発生周期を10s（1us × 1000(ms) x 1000(s) x 10）に設定
   timerAlarmEnable(tim0);                     //タイマー0割込みを有効化
   */
+  // SD内にLOGディレクトリがない場合はLOGディレクトリを作成する
+  if(!SD.exists("/LOG")) {
+    if(SD.mkdir("/LOG"));
+  }
+  // microSD内のファイル名の連番を決定
+  while(1){      
+    sprintf_P(fileName, PSTR("/LOG/LOG%04d.CSV"), fileNum);
+    if(!SD.exists(fileName)) {
+      Serial.println(fileName);
+      logFile = SD.open(fileName, FILE_APPEND);
+      if (logFile){
+        logFile.write(0xEF);                                                  // BOMを書き込む
+        logFile.write(0xBB);                                                  // BOMを書き込む
+        logFile.write(0xBF);                                                  // BOMを書き込む
+        logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),回転数(rpm),スロットル開度(%),概算空燃比, ,lat,lng,"));
+        logFile.close();                                                      // ファイルを閉じる
+      }
+      break;
+    }
+    fileNum++;
+  }
+
+  // 回転数取得用の割り込みを登録 トリガはLOWになった時
+	attachInterrupt((IGPLS_PIN), getRPM, FALLING);
 }
 
 void loop()
@@ -561,14 +656,23 @@ void loop()
   // 位置情報を取得
   getGNSS();
 
+  // エンジン回転数を取得
+  getRPM();
+
+  // スロットル開度・空燃比を取得
+  getTHL_O2();
+
   // ラップタイム,周回数,走行時間を計測
   lap_count();
 
   // 地図を表示
-  drawmap();
+  // drawmap();
 
   // 外部ディスプレイに速度と高度を表示
-  drawinfo();
+  // drawinfo();
+
+  // M5Core2本体にエンジン回転数・スロットル開度・空燃比を表示
+  drawinfo_cab();
 
   if (ambientpush) {                      // ambientへの送信が有効の場合
     if (millis() - t_amb >= 10 * 1000) {  // 10秒ごとにAmbientへ送信
@@ -576,7 +680,7 @@ void loop()
     }
   }
 
-  if (millis() - t_SD >= 10 * 1000) {  // 1秒ごとにSDへ記録
+  if (millis() - t_SD >= 1 * 1000) {      // 1秒ごとにSDへ記録
     WriteSD();
   }
 
