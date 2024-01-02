@@ -2,6 +2,7 @@
 // 計算式 https://www.trail-note.net/tech/coordinate/
 
 #include <Arduino.h>
+#include <Wire.h>
 #include <TinyGPS++.h>
 #include "SD.h"
 #include <M5UnitLCD.h>
@@ -487,6 +488,8 @@ void setup()
 {
   auto cfg = M5.config();
   M5.begin(cfg);
+  Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());         // PortA
+  Wire1.begin(21, 22);                                        // M5Core2の内部I2C(M5Unifiedでは無効化？)
 
   pinMode(IGPLS_PIN, INPUT);
 
