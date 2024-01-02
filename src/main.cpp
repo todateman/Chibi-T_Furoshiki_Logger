@@ -33,7 +33,8 @@ Adafruit_ADS1115 ads;
 //#define CFACTOR 0.00781 // GAIN_SIXTEEN: +/-0.256V range: Calibration factor (mV/bit) for ADS1115
 
 
-//変数の定義
+// 変数の定義
+// GPS
 double goal_la, goal_ln;
 double goal_la_su = 34.842925;   // 鈴鹿サーキットスタートライン
 double goal_ln_su = 136.540692;  // 鈴鹿サーキットスタートライン
@@ -55,6 +56,9 @@ int z = 18;  //ズーム倍率
 float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
 unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
 uint16_t Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
+unsigned long t_Serial;           // Serialの送信時刻
+
+// ECU
 volatile unsigned long tachoBefore = 0;   // クランクセンサーの前回の反応時の時間
 volatile unsigned long tachoAfter = 0;    // クランクセンサーの今回の反応時の時間
 volatile unsigned long tachoWidth = 0;    // クランク一回転の時間　tachoAfter - tachoBefore
@@ -76,10 +80,11 @@ const char* userKey = "64bd5933d381952b59"; // ユーザーキー
 char devKey[20];
 unsigned int channelId;
 char writeKey[20];
-bool ambientpush = true;  // // ambientへの送信 有効(true)/無効(false)
+bool ambientpush = true;  // ambientへの送信 有効(true)/無効(false)
 unsigned long t_amb;  // Ambientへの送信時刻
 
 //ログファイル
+bool LOGGING = true;     // ロギング有効/無効
 File logFile;
 char fileName[16];       // ファイル名
 uint8_t fileNum = 0;     // ファイル連番
@@ -116,8 +121,9 @@ void IRAM_ATTR PushAmbient() {
 void showMessage(String msg)
 {
   //lcd1.setRotation(1);
-  lcd1.setCursor(0, 20);
   lcd1.fillScreen(BLACK);
+  lcd1.setTextColor(WHITE);
+  lcd1.setCursor(0, 20);
   lcd1.println(msg);
   lcd1.setCursor(50, 230);
   lcd1.print("A");
@@ -231,7 +237,6 @@ void getGNSS() {
   dtostrf(la, 11, 7, labuf);
   dtostrf(ln, 11, 7, lnbuf);
 
-  Serial.printf_P(PSTR("%s,%s,%s,%s,%s\n"), labuf, lnbuf, spdbuf, altbuf, lobuf);
 }
 
  // エンジン回転数を取得
@@ -246,12 +251,14 @@ void IRAM_ATTR getRPM() {
 // スロットル開度・空燃比を取得
 void getTHL_O2(){
   uint16_t read_from_ads;                                   // ADS1115から読んだ生値
-  read_from_ads = uint16_t(ads.readADC_Differential_0_1()); // チャネル0,1の作動(Differential)入力
-  Value_THL = map(read_from_ads, 4960, 38202, 0, 100);      // スロットル開度(0-100%)を算出
+  read_from_ads = uint16_t(ads.readADC_Differential_0_1()); // チャネル0,1の差動(Differential)入力
+  //Serial.println(read_from_ads);
+  Value_THL = map(read_from_ads, 3300, 25320, 0, 100);      // スロットル開度(0-100%)を算出
 
-  read_from_ads = uint16_t(ads.readADC_SingleEnded(2));     // チャネル2の単動(SingleEnd)入力
+  read_from_ads = uint16_t(ads.readADC_Differential_2_3()); // チャネル2,3の差動(Differential)入力
   inputO2 = read_from_ads * CFACTOR;                        // 校正係数を掛けてO2センサ出力電圧(mV)とする
-  Value_O2 = map(read_from_ads, 0, 8000, 100, 200) * 0.1;   // 空燃比(10.0-20.0)を算出
+  //Serial.println(read_from_ads);
+  Value_O2 = map(read_from_ads, 0, 8020, 100, 200) * 0.1;   // 空燃比(10.0-20.0)を算出
   dtostrf(Value_O2, -1, 1, O2buf);                          // 小数を含んだ数値を文字列に変換
 }
 
@@ -434,6 +441,12 @@ void drawinfo_cab() {
   lcd1.endWrite();
 }
 
+// Serial送信
+void pushSerial() {
+  Serial.printf_P(PSTR("%s,%s,%s,%s,%s\n"), labuf, lnbuf, spdbuf, altbuf, lobuf);
+    t_Serial = millis();
+}
+
 // Ambientへ送信
 void pushAmbient() {
   if (WiFi.status() == WL_CONNECTED) {  //  Wi-Fi 接続できている場合
@@ -524,16 +537,52 @@ void setup()
   }
 
   // SDカードマウント待ち
-  while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
-    Serial.println("SD Wait...");
+  if (LOGGING) {                                  // ロギング有効の場合
+    uint8_t i = 0;
+    while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
+      if (i > 6){
+        LOGGING = false;
+        break;
+      }
+      Serial.println("SD Wait...");
 
-    lcd1.clear(RED);
-    //lcd1_s.fillScreen(RED);
-    lcd1.setTextColor(BLACK);
-    lcd1.drawString("MicroSDが見つかりません", lcd1.width()/2, lcd1.height()/2);
-    //lcd1_s.pushSprite(0, 0);
+      lcd1.clear(RED);
+      //lcd1_s.fillScreen(RED);
+      lcd1.setTextColor(BLACK);
+      lcd1.drawString("MicroSDが見つかりません", lcd1.width()/2, lcd1.height()/2);
+      //lcd1_s.pushSprite(0, 0);
 
-    delay(500);
+      delay(500);
+      i++;
+    }
+  }
+
+  if (LOGGING) {                                  // ロギング有効の場合
+    lcd1.fillScreen(TFT_BLACK);
+    //lcd_s.fillScreen(TFT_BLACK);
+    lcd1.setTextColor(TFT_WHITE);
+
+    // SD内にLOGディレクトリがない場合はLOGディレクトリを作成する
+    if(!SD.exists("/LOG")) {
+      if(SD.mkdir("/LOG"));
+    }
+    // microSD内のファイル名の連番を決定
+    while(1){      
+      sprintf_P(fileName, PSTR("/LOG/LOG%04d.CSV"), fileNum);
+      if(!SD.exists(fileName)) {
+        Serial.println(fileName);
+        logFile = SD.open(fileName, FILE_APPEND);
+        if (logFile){
+          logFile.write(0xEF);                                                  // BOMを書き込む
+          logFile.write(0xBB);                                                  // BOMを書き込む
+          logFile.write(0xBF);                                                  // BOMを書き込む
+          logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),回転数(rpm),スロットル開度(%),概算空燃比, ,lat,lng,"));
+          logFile.close();                                                      // ファイルを閉じる
+        }
+        break;
+      }
+      fileNum++;
+    }
   }
 
   if (ambientpush) {             // ambientへの送信が有効の場合
@@ -612,27 +661,6 @@ void setup()
   timerAlarmWrite(tim0, 10000000, true);         //tim0割込み発生周期を10s（1us × 1000(ms) x 1000(s) x 10）に設定
   timerAlarmEnable(tim0);                     //タイマー0割込みを有効化
   */
-  // SD内にLOGディレクトリがない場合はLOGディレクトリを作成する
-  if(!SD.exists("/LOG")) {
-    if(SD.mkdir("/LOG"));
-  }
-  // microSD内のファイル名の連番を決定
-  while(1){      
-    sprintf_P(fileName, PSTR("/LOG/LOG%04d.CSV"), fileNum);
-    if(!SD.exists(fileName)) {
-      Serial.println(fileName);
-      logFile = SD.open(fileName, FILE_APPEND);
-      if (logFile){
-        logFile.write(0xEF);                                                  // BOMを書き込む
-        logFile.write(0xBB);                                                  // BOMを書き込む
-        logFile.write(0xBF);                                                  // BOMを書き込む
-        logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),回転数(rpm),スロットル開度(%),概算空燃比, ,lat,lng,"));
-        logFile.close();                                                      // ファイルを閉じる
-      }
-      break;
-    }
-    fileNum++;
-  }
 
   // 回転数取得用の割り込みを登録 トリガはLOWになった時
 	attachInterrupt((IGPLS_PIN), getRPM, FALLING);
@@ -673,6 +701,10 @@ void loop()
 
   // 外部ディスプレイに速度と高度を表示
   // drawinfo();
+  
+  if (millis() - t_Serial >= 1 * 1000) {      // 1秒ごとにSerial送信
+    pushSerial();
+  }
 
   // M5Core2本体にエンジン回転数・スロットル開度・空燃比を表示
   drawinfo_cab();
