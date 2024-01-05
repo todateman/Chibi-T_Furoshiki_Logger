@@ -10,15 +10,17 @@
 #include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
+#define time_offset 32400    // UTC+9時間(60*60*9 秒）
 #include <Adafruit_ADS1X15.h>
-#define  IGPLS_PIN 26                 // 点火コイル.クランク1回転ごとにON
+#define  IGPLS_PIN 35                 // 点火コイル.クランク1回転ごとにON
 
 #define pi 3.141592653589793
 
 static M5GFX lcd1;
-static M5UnitLCD lcd2;
+//static M5UnitLCD lcd2;
 static M5Canvas lcd1_s(&lcd1);
-static M5Canvas lcd2_s(&lcd2);
+//static M5Canvas lcd2_s(&lcd2);
+static M5Canvas lcd1_s_hb(&lcd1_s);
 
 WiFiClient client;
 Ambient ambient;
@@ -95,7 +97,6 @@ uint8_t jst_day;
 uint8_t jst_hour;
 uint8_t jst_minute;
 uint8_t jst_second;
-#define time_offset 32400    // UTC+9時間(60*60*9 秒）
 
 HardwareSerial GPS_s(2);  // Serial2 = PortC(RX:13 TX:14)
 TinyGPSPlus gps;
@@ -240,25 +241,49 @@ void getGNSS() {
 }
 
  // エンジン回転数を取得
-void IRAM_ATTR getRPM() {
+void getRPM() {
   tachoAfter = micros();                                    // 現在の時刻を記録
   tachoWidth = tachoAfter - tachoBefore;                    // 前回と今回の時間の差(カムシャフト1回転当たりの時間)を計算
-  RPM = (60000000 / tachoWidth);                            //クランクの回転数[rpm]を計算
+  RPM = 60000000 / tachoWidth;                            //クランクの回転数[rpm]を計算
 
   tachoBefore = tachoAfter;                                 // 今回の値を前回の値に代入する
 }
 
 // スロットル開度・空燃比を取得
 void getTHL_O2(){
+  while (!ads.begin()) {
+    Serial.println("Failed to initialize ADS.");
+    lcd1.clear(RED);
+    lcd1.setTextColor(BLACK);
+    lcd1.drawString("ADS1115が見つかりません", lcd1.width()/2, lcd1.height()/2);
+    delay(100);
+  }
+
   uint16_t read_from_ads;                                   // ADS1115から読んだ生値
   read_from_ads = uint16_t(ads.readADC_Differential_0_1()); // チャネル0,1の差動(Differential)入力
   //Serial.println(read_from_ads);
-  Value_THL = map(read_from_ads, 3300, 25320, 0, 100);      // スロットル開度(0-100%)を算出
+  if (read_from_ads <= 2500) {
+    Value_THL = 0;
+  }
+  else if (read_from_ads >= 19800) {
+    Value_THL = 100;
+  }
+  else {
+    Value_THL = map(read_from_ads, 2500, 19800, 0, 100);      // スロットル開度(0-100%)を算出
+  }
 
   read_from_ads = uint16_t(ads.readADC_Differential_2_3()); // チャネル2,3の差動(Differential)入力
   inputO2 = read_from_ads * CFACTOR;                        // 校正係数を掛けてO2センサ出力電圧(mV)とする
   //Serial.println(read_from_ads);
-  Value_O2 = map(read_from_ads, 0, 8020, 100, 200) * 0.1;   // 空燃比(10.0-20.0)を算出
+  if (read_from_ads <= 0) {
+    Value_O2 = 10.0;
+  }
+  else if (read_from_ads >= 4096) {
+    Value_O2 = 20.0;
+  }
+  else {
+    Value_O2 = map(read_from_ads, 0, 4096, 100, 200) * 0.1;   // 空燃比(10.0-20.0)を算出
+  }
   dtostrf(Value_O2, -1, 1, O2buf);                          // 小数を含んだ数値を文字列に変換
 }
 
@@ -398,11 +423,12 @@ void drawmap() {
 }
 
 // 外部ディスプレイに速度,周回数,走行時間を表示
+/*
 void drawinfo() {
   lcd2_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd2_s.setTextSize(1.5);
   lcd2_s.fillScreen(BLACK);
-  lcd2_s.setTextColor(ORANGE);
+  lcd2_s.setTextColor(WHITE);
 
   lcd2_s.setCursor(0, 0);
   lcd2_s.printf_P(PSTR("速度: %skm/h\n"), spdbuf);
@@ -414,30 +440,44 @@ void drawinfo() {
   lcd2_s.pushSprite(5, 5);
   lcd2.endWrite();
 }
+*/
 
-// M5Core2本体にエンジン回転数・スロットル開度・空燃比を表示
+// M5Core2本体にエンジン回転数・スロットル開度・速度を表示
 void drawinfo_cab() {
   lcd1_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd1_s.setTextSize(1.5);
   lcd1_s.fillScreen(BLACK);
-  lcd1_s.setTextColor(ORANGE);
+  lcd1_s.setTextColor(WHITE);
 
   lcd1_s.setCursor(10, 10);
   lcd1_s.printf_P(PSTR("回転数: %drpm"), RPM);
-  lcd1_s.drawRect(10, 50, 300, 20, ORANGE);
-  lcd1_s.fillRect(10, 50, map(RPM, 0, 8500, 0, 300), 20, ORANGE);
+  lcd1_s.drawRect(10, 50, 300, 20, WHITE);
+  lcd1_s.fillRect(10, 50, map(RPM, 0, 8500, 0, 300), 20, WHITE);
   lcd1_s.setCursor(10, 90);
   lcd1_s.printf_P(PSTR("スロットル開度: %d%"), Value_THL);
-  lcd1_s.drawRect(10, 130, 300, 20, ORANGE);
-  lcd1_s.fillRect(10, 130, map(Value_THL, 0, 100, 0, 300), 20, ORANGE);
+  lcd1_s.drawRect(10, 130, 300, 20, WHITE);
+  lcd1_s.fillRect(10, 130, map(Value_THL, 0, 100, 0, 300), 20, WHITE);
   lcd1_s.setCursor(10, 170);
-  lcd1_s.printf_P(PSTR("概算空燃比: %s"), O2buf);
-  lcd1_s.drawRect(10, 210, 300, 20, ORANGE);
-  lcd1_s.fillRect(10, 210, map(inputO2, 0, 1000, 0, 300), 20, ORANGE);
+  lcd1_s.printf_P(PSTR("速度: %skm/h"), spdbuf);
+  lcd1_s.drawRect(10, 210, 300, 20, WHITE);
+  if (spd <= 10) {
+    lcd1_s.fillRect(10, 210, 0, 20, WHITE);
+  }
+  else if (spd >= 40) {
+    lcd1_s.fillRect(10, 210, 300, 20, WHITE);
+  }
+  else {
+    lcd1_s.fillRect(10, 210, map(spd, 10, 40, 0, 300), 20, WHITE);
+  }
+
+  lcd1_s_hb.fillScreen(BLACK);
+  lcd1_s_hb.drawLine (0, 0, 10, 10, WHITE);
 
   // スプライトを表示
   lcd1.startWrite();
-  lcd1_s.pushSprite(5, 5);
+  //lcd1_s_hb.setPivot(315, 5);
+  lcd1_s_hb.pushRotateZoom(315, 5, map(millis()*1000%60, 0, 60, 0, 359), 1, 1);	
+  lcd1_s.pushSprite(0, 0);
   lcd1.endWrite();
 }
 
@@ -470,7 +510,7 @@ void WriteSD(){
   // ログファイルに書き込み
   logFile = SD.open(fileName, FILE_APPEND);
   if (logFile){
-    logFile.printf_P(PSTR("%d/%d/%d %d:%d:%d"), jst_year, jst_month, jst_day, jst_hour, jst_minute, jst_second);  // 0.日時
+    logFile.printf_P(PSTR("%d/%d/%d %d:%d:%d"), year(), month(), day(), hour(), minute(), second());  // 0.日時
     logFile.print(F(","));
     logFile.print(spdbuf);    // 1.速度
     logFile.print(F(","));
@@ -507,10 +547,11 @@ void setup()
   pinMode(IGPLS_PIN, INPUT);
 
   lcd1.init();
-  lcd2.init();
-  lcd2.setRotation(3);
+  //lcd2.init();
+  //lcd2.setRotation(3);
   lcd1_s.createSprite(lcd1.width(), lcd1.height());
-  lcd2_s.createSprite(lcd2.width(), lcd2.height());
+  //lcd2_s.createSprite(lcd2.width(), lcd2.height());
+  lcd1_s_hb.createSprite(10, 10);
   GPS_s.begin(115200);
 
   lcd1.setFont(&fonts::lgfxJapanGothicP_20);
@@ -639,14 +680,12 @@ void setup()
   lcd1.drawString("読み込み中...", lcd1.width()/2, lcd1.height()/2);
   //lcd1_s.pushSprite(0, 0);
 
-  lcd2.setFont(&fonts::lgfxJapanGothicP_20);
-  lcd2.setTextSize(1.0);
-  lcd2.setTextDatum( baseline_center );
-  lcd2.clear(BLACK);
-  //lcd2_s.fillScreen(BLACK);
-  lcd2.setTextColor(WHITE);
-  lcd2.drawString("読み込み中...", lcd2.width()/2, lcd2.height()/2);
-  //lcd2_s.pushSprite(0, 0);
+  //lcd2.setFont(&fonts::lgfxJapanGothicP_20);
+  //lcd2.setTextSize(1.0);
+  //lcd2.setTextDatum( baseline_center );
+  //lcd2.clear(BLACK);
+  //lcd2.setTextColor(WHITE);
+  //lcd2.drawString("読み込み中...", lcd2.width()/2, lcd2.height()/2);
 
   Serial.println(F("lat,lon,spd,alt"));
 
@@ -688,7 +727,8 @@ void loop()
   getGNSS();
 
   // エンジン回転数を取得
-  getRPM();
+  //getRPM();
+  if (micros() - tachoBefore > 60000000 / 100 ){RPM = 0;}  // 100rpm以下の時は0にする 
 
   // スロットル開度・空燃比を取得
   getTHL_O2();
