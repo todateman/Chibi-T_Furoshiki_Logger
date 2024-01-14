@@ -138,6 +138,9 @@ void configModeCallback (WiFiManager *myWiFiManager) {
   Serial.println(WiFi.softAPIP());
   Serial.println(myWiFiManager->getConfigPortalSSID());
   showMessage("このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: " + myWiFiManager->getConfigPortalSSID());
+  char ConfigSSID[40];
+  sprintf(ConfigSSID, "WIFI:S:%s;T:nopass;R:1;;", myWiFiManager->getConfigPortalSSID());
+  lcd1.qrcode(ConfigSSID, 105, 92, 135, 5);
 }
 
 // 起動後すぐにAボタンが押されたらWiFi設定モードに移行し、そうでなければ自動接続を行う
