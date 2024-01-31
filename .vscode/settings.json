@@ -12,5 +12,6 @@
         "array": "cpp",
         "string_view": "cpp",
         "initializer_list": "cpp"
-    }
+    },
+    "cmake.sourceDirectory": "C:/Users/todat/vscode/PlatformIO/M5Stack_Gps_Map/.pio/libdeps/m5stack-core2/Adafruit BusIO"
 }

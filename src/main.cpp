@@ -503,8 +503,17 @@ void pushAmbient() {
     ambient.set(9, labuf);      // 9番目のデータとして緯度をセット
     ambient.set(10, lnbuf);     // 10番目のデータとして経度をセット
 
-    ambient.send();
+    if (ambient.send()) {
+      Serial.println(F("Amb:Success!"));
+    }
+    else {
+      Serial.println(F("Amb:failure..."));
+    }
     t_amb = millis();
+  }
+  else {
+    Serial.println(F("WiFi:Disconnected..."));
+    WiFi.reconnect();           // 再接続
   }
 }
 
