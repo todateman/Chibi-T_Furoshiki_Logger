@@ -12,37 +12,55 @@
 
 #define pi 3.141592653589793
 
-static M5GFX lcd1;
-static M5UnitLCD lcd2;
-static M5Canvas lcd1_s(&lcd1);
-static M5Canvas lcd2_s(&lcd2);
+static M5GFX lcd;
+static LGFX_Sprite lcd_s(&lcd);
 
 WiFiClient client;
 Ambient ambient;
 WiFiManager wifiManager;
 
-//変数の定義
-double goal_la, goal_ln;
-double goal_la_su = 34.842925;   // 鈴鹿サーキットスタートライン
-double goal_ln_su = 136.540692;  // 鈴鹿サーキットスタートライン
-//double goal_la_mo = 36.532770;   // ツインリンクもてぎオーバルコーススタートライン
-//double goal_ln_mo = 140.226208;  // ツインリンクもてぎオーバルコーススタートライン
-double goal_la_mo = 36.533590;   // ツインリンクもてぎオーバルコーススタートライン
-double goal_ln_mo = 140.225706;  // ツインリンクもてぎオーバルコーススタートライン
-double goal_la_to = 35.082078;   // 豊田市SENTAN
-double goal_ln_to = 137.160358;  // 豊田市SENTAN
+// 変数の定義
+// 画面表示
+uint8_t dispmode = 0;             // ディスプレイの表示モード(0:回転数/燃料噴射時間/進角角度 1:速度/周回数/走行時間 2:速度/回転数/燃費)
+
+// ECU
+unsigned long receiveECUtime = 0; // ECUからデータを受信した時間
+uint16_t tachoRpm = 0;            // エンジンの回転数(rpm)
+float INJ_timems = 0.0;           // インジェクタ噴射時間(msec)
+uint8_t IGN_CA = 0;               // 進角角度(CA)
+uint8_t speed = 0;                // 速度(km/h)
+uint16_t distance = 0;            // 走行距離積算(m)
+float gasml = 0.0;                // 積算燃料消費量(ml)
+float dispergas = 0.0;            // 燃費(km/l)
+uint16_t Lapcount = 0;            // 現在の周回数
+uint8_t totallaps = 3;            // トータル周回数
+uint16_t goal = 1000;             // 総走行距離(m)
+uint16_t limittime = 100;         // 規定時間(sec)
+const uint8_t totallaps_su = 8;   // 鈴鹿のトータル周回数
+const uint8_t totallaps_mo = 7;   // 茂木のトータル周回数
+const uint16_t goal_su = 17616;   // 鈴鹿の総走行距離(m)
+const uint16_t goal_mo = 16389;   // 鈴鹿の総走行距離(m)
+const uint16_t limittime_su = 2536; // 鈴鹿の規定時間(42分16秒 = 2536sec)
+const uint16_t limittime_mo = 2360; // 茂木の規定時間(39分20秒 = 2360sec)
+unsigned long starttime = 0;      // 走行開始時間(msec)
+uint16_t worktime = 0;            // 走行時間(sec)
+
+// GPS
+double goal_la_su = 34.842925;    // 鈴鹿サーキットスタートライン
+double goal_ln_su = 136.540692;   // 鈴鹿サーキットスタートライン
+//double goal_la_mo = 36.532770;  // ツインリンクもてぎオーバルコーススタートライン
+//double goal_ln_mo = 140.226208; // ツインリンクもてぎオーバルコーススタートライン
+double goal_la_mo = 36.533590;    // ツインリンクもてぎオーバルコーススタートライン
+double goal_ln_mo = 140.225706;   // ツインリンクもてぎオーバルコーススタートライン
+double goal_la_to = 35.082078;    // 豊田市SENTAN
+double goal_ln_to = 137.160358;   // 豊田市SENTAN
 //double goal_la_to = 35.066781;
 //double goal_ln_to = 137.111857;
-double la = goal_la_su;
-double ln = goal_ln_su;
-double spd=0.0, alt=0.0;  // 速度(km/h), 標高(m)
-char labuf[12], lnbuf[12], spdbuf[6], altbuf[7], lobuf[7];
+double la = goal_la_to;           // 初期設定で豊田市SENTANを設定
+double ln = goal_ln_to;           // 初期設定で豊田市SENTANを設定
+float spd=0.0;                    // 速度(km/h)
 String Loc = "";
-double L = 85.05112878;
-int z = 18;  //ズーム倍率
-float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
-unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
-int Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
+unsigned long t_Serial;           // Serialの送信時刻
 
 // Wi-Fi
 // const char* ssid = "****";  // Wi-Fi SSID
@@ -50,59 +68,38 @@ int Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
 bool isWifiConfigSucceeded = false;  // WiFi設定が成功したかどうかのフラグ
 
 // ambient
-// unsigned int channelId = 65530; // AmbientのチャネルID
-// const char* writeKey = "050985c9530d8eb0"; // ライトキー
+//unsigned int channelId = 65530; // AmbientのチャネルID
+//const char* writeKey = "050985c9530d8eb0"; // ライトキー
 const char* userKey = "64bd5933d381952b59"; // ユーザーキー
 char devKey[20];
 unsigned int channelId;
 char writeKey[20];
-bool ambientpush = true;  // // ambientへの送信 有効(true)/無効(false)
-unsigned long t_amb;  // Ambientへの送信時刻
+bool ambientpush = false;    // ambientへの送信 有効(true)/無効(false)
+unsigned long t_amb;        // Ambientへの送信時刻
 
-//ログファイル
+// ログファイル
+bool LOGGING = true;        // ロギング有効/無効
 File logFile;
-char fileName[16];       // ファイル名
-uint8_t fileNum = 0;     // ファイル連番
-unsigned long t_SD;      // SDの記録時刻
-uint8_t jst_year;
-uint8_t jst_month;
-uint8_t jst_day;
-uint8_t jst_hour;
-uint8_t jst_minute;
-uint8_t jst_second;
-#define time_offset 32400    // UTC+9時間(60*60*9 秒）
+char fileName[20];          // ファイル名
+int fileNum = 0;            // ファイル連番
+unsigned long t_SD;         // SDの記録時刻
+#define time_offset 32400   // UTC+9時間(60*60*9 秒）
 
-HardwareSerial GPS_s(2);  // Serial2 = PortC(RX:13 TX:14)
 TinyGPSPlus gps;
 
-
-// タイマ割込み設定
-/*
-hw_timer_t * tim0 = NULL;                   //タイマー0の割り込みtim0で定義
-volatile SemaphoreHandle_t timerSemaphore;  //セマフォの宣言（割込み発生の確認用）
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; //排他制御の利用を宣言
-
-// Ambientへ送信
-void IRAM_ATTR PushAmbient() {
-  portENTER_CRITICAL_ISR(&timerMux);  //排他制御で以下を実行（割込み禁止）
-  
-  
-  portEXIT_CRITICAL_ISR(&timerMux);   //排他制御終了（割り込み許可）
-  xSemaphoreGiveFromISR(timerSemaphore, NULL);  //セマフォを開放
-}
-*/
 
 // LCD画面にメッセージを表示する
 void showMessage(String msg)
 {
-  //lcd1.setRotation(1);
-  lcd1.setCursor(0, 20);
-  lcd1.fillScreen(BLACK);
-  lcd1.println(msg);
-  lcd1.setCursor(50, 230);
-  lcd1.print("A");
-  lcd1.setCursor(260, 230);
-  lcd1.print("C");
+  //lcd.setRotation(1);
+  lcd.fillScreen(BLACK);
+  lcd.setTextColor(WHITE);
+  lcd.setCursor(0, 20);
+  lcd.println(msg);
+  lcd.setCursor(50, 230);
+  lcd.print("A");
+  lcd.setCursor(260, 230);
+  lcd.print("C");
 }
 
 // WiFi接続モードに移行した時に呼ばれるコールバック
@@ -111,6 +108,9 @@ void configModeCallback (WiFiManager *myWiFiManager) {
   Serial.println(WiFi.softAPIP());
   Serial.println(myWiFiManager->getConfigPortalSSID());
   showMessage("このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: " + myWiFiManager->getConfigPortalSSID());
+  char ConfigSSID[40];
+  sprintf(ConfigSSID, "WIFI:S:%s;T:nopass;R:1;;", myWiFiManager->getConfigPortalSSID());
+  lcd.qrcode(ConfigSSID, 105, 92, 135, 5);
 }
 
 // 起動後すぐにAボタンが押されたらWiFi設定モードに移行し、そうでなければ自動接続を行う
@@ -171,23 +171,63 @@ void setupWiFi ()
   }
 }
 
+// ECUからのデータを読み込み
+void readSerialECU() {
+  if (Serial1.available()){
+    receiveECUtime = millis();                    // ECUからデータを受信した時間に現在時刻を代入
+    String str = Serial1.readStringUntil('\n');   // Serial1から改行コード"CRLF"まで読み込む
+    str.trim();                                   // Serial1から読み込んだデータの両端の空白、改行、タブなどを取り除く
+    //Serial.println(str);
+    for (uint8_t i = 0; i < 7; i++) {
+      uint8_t check = (str.indexOf(","));         // ","の位置を探索する
+      String data = str.substring(0, check);      // ","の位置で文字列を区切る
+      data.trim();                                // 文字列の両端の空白、改行、タブなどを取り除く
+      str = str.substring(check + 1);             // 読み込まなかった次の文字列を準備する
+      if (i == 0) {tachoRpm   = data.toInt();}    // エンジンの回転数(rpm)
+      if (i == 1) {INJ_timems = data.toFloat();}  // インジェクタ噴射時間(msec)
+      if (i == 2) {IGN_CA     = data.toInt();}    // 進角角度(CA)
+      if (i == 3) {speed      = data.toInt();}    // 速度(km/h)
+      if (i == 4) {distance   = data.toInt();}    // 走行距離積算(m)
+      if (i == 5) {gasml      = data.toFloat();}  // 積算燃料消費量(ml)
+      if (i == 6) {dispergas  = data.toFloat();}  // 燃費(km/l)
+    }
+    Lapcount = distance / (goal / totallaps);     // 現在の周回数
+    if (distance == 0) {                          // 距離が0の時
+      worktime = 0;                               // 走行時間を0にする
+      starttime = 0;                              // 走行開始時間を0にする
+    } else {                                      // 距離が0ではない場合
+      if (starttime == 0) {                       // 走行時間が0の場合
+        starttime = millis();                     // 走行開始時間を現在の時間にする
+      }
+      worktime = (millis() - starttime) * 0.001;  // 走行時間を秒に変換する
+    }
+  }
+  else {
+    if ( millis() - receiveECUtime > 2000) {      // 2000msec間データの受信がなければ
+      tachoRpm   = 0;                             // エンジンの回転数(rpm)
+      INJ_timems = 0;                             // インジェクタ噴射時間(msec)
+      IGN_CA     = 0;                             // 進角角度(CA)
+      speed      = 0;                             // 速度(km/h)
+    }
+  }
+}
+
 // 位置情報を取得
 void getGNSS() {
-  while (GPS_s.available() > 0) {
-    if (gps.encode(GPS_s.read())) {
+  while (Serial2.available() > 0) {
+    if (gps.encode(Serial2.read())) {
       if (gps.location.isUpdated()) {
         // 経度緯度速度を取得
-        if (gps.location.lng() > 120) {  // 東経120度の場合
+        if (gps.location.lng() > 120) {  // 東経120度の場合(異常値を除外するため)
           la         = gps.location.lat();
           ln         = gps.location.lng();
           spd        = gps.speed.kmph();
-          alt        = gps.altitude.meters();
-          jst_day    = gps.date.day();
-          jst_month  = gps.date.month();
-          jst_year   = gps.date.year();
-          jst_hour   = gps.time.hour();
-          jst_minute = gps.time.minute();
-          jst_second = gps.time.second();
+          uint8_t jst_day    = gps.date.day();
+          uint8_t jst_month  = gps.date.month();
+          uint8_t jst_year   = gps.date.year();
+          uint8_t jst_hour   = gps.time.hour();
+          uint8_t jst_minute = gps.time.minute();
+          uint8_t jst_second = gps.time.second();
           setTime(jst_hour, jst_minute, jst_second, jst_day, jst_month, jst_year);
           // JST変換
           adjustTime(time_offset);
@@ -198,269 +238,322 @@ void getGNSS() {
   }
 
   if ( la >= 34.839027 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.543319 ) {
-    Loc = "suzuka";
+    Loc = "su";
+    totallaps = totallaps_su;
+    goal = goal_su;
+    limittime = limittime_su;
   } else if ( la >= 36.528477 && la <= 36.53735 && ln >= 140.224726 && ln <= 140.23853 ) {
-    Loc = "motegi";
+    Loc = "mo";
+    totallaps = totallaps_mo;
+    goal = goal_mo;
+    limittime = limittime_mo;
   } else {
-    Loc = "toyota";
+    Loc = "to";
   }
-  Loc.toCharArray( lobuf, Loc.length()+1 ); 
-
-  dtostrf(spd, 5, 1, spdbuf);
-  dtostrf(alt, 6, 1, altbuf);
-  dtostrf(la, 11, 7, labuf);
-  dtostrf(ln, 11, 7, lnbuf);
-
-  Serial.printf_P(PSTR("%s,%s,%s,%s,%s\n"), labuf, lnbuf, spdbuf, altbuf, lobuf);
 }
 
-// ラップタイム,周回数,走行時間を計測
-void lap_count() {
-  if (Loc == "suzuka") {
-    goal_la = goal_la_su;
-    goal_ln = goal_ln_su;
-  }
-  else if (Loc == "motegi") {
-    goal_la = goal_la_mo;
-    goal_ln = goal_ln_mo;
-  }
-  else if (Loc == "toyota") {
-    goal_la = goal_la_to;
-    goal_ln = goal_ln_to;
-  }
-  distanceTogoal = gps.distanceBetween(la, ln, goal_la, goal_ln);
-
-  if (distanceTogoal > before_distanceTogoal && distanceTogoal < 15 && LAPRADchange==0) {  // 前回よりも基準点までの距離が遠い　& 基準点まで15m以内 & ラップ記録待機
-    if (Lapcount >= 1 ) {
-      LAPtime = (millis() - BeforeLAPtime) / 1000;
-    }
-    BeforeLAPtime = millis() / 1000;
-    Lapcount++;
-    if (Lapcount == 1){  // スタート時
-      Starttime = BeforeLAPtime;  // スタート時間
-    }
-    LAPRADchange = 2;  // ラップ記録待機0 -> 2(リセット)
-  }
-  if (distanceTogoal > 15 && LAPRADchange == 2) {
-    LAPRADchange = 1;  // ラップ記録待機2 -> 1(ゴール地点から離れた)
-  }
-  if (distanceTogoal < before_distanceTogoal && distanceTogoal < 15 && LAPRADchange == 1 ){  // 前回よりも基準点までの距離が近い　& 基準点まで15m以内
-    LAPRADchange = 0;  // ラップ記録待機1 -> 0(準備)
-  }
-  if (Lapcount == 0){  // スタート前
-    Starttime = millis() / 1000;  // 現在時間
-  }
-  worktime = millis() / 1000 - Starttime;
-  workmin = worktime / 60;
-  worksec = worktime % 60;
-
-  before_distanceTogoal = distanceTogoal;
-  
-}
-
-// 地図を表示
-void drawmap() {  
-  // 緯度経度→ピクセル座標の変換計算
-  double px = int(pow(2.0, z + 7.0) * ((ln / 180.0) + 1.0));
-  double py = int(pow(2.0, z + 7.0) * (-1 * atanh(sin(pi * la / 180.0)) + atanh(sin(pi * L / 180.0))) / pi);
-  double px_goal = int(pow(2.0, z + 7.0) * ((goal_ln / 180.0) + 1.0));
-  double py_goal = int(pow(2.0, z + 7.0) * (-1 * atanh(sin(pi * goal_la / 180.0)) + atanh(sin(pi * L / 180.0))) / pi);
-  
-  // ピクセル座標→タイル座標の変換計算
-  int tx = px / 256;
-  int ty = py / 256;
-  
-  // タイル画像の中の座標を計算
-  int x = int(px) % 256;
-  int y = int(py) % 256;
-
-  // 画像9枚のファイルアドレスを用意
-  String filename[9];
-  filename[0] = String("/pale/" + String(z) + "/" + String(tx - 1) + "/" + String(ty-1) + ".png");
-  filename[1] = String("/pale/" + String(z) + "/" + String(tx) + "/" + String(ty-1) + ".png");
-  filename[2] = String("/pale/" + String(z) + "/" + String(tx + 1) + "/" + String(ty-1) + ".png");
-  filename[3] = String("/pale/" + String(z) + "/" + String(tx - 1) + "/" + String(ty) + ".png");
-  filename[4] = String("/pale/" + String(z) + "/" + String(tx) + "/" + String(ty) + ".png");
-  filename[5] = String("/pale/" + String(z) + "/" + String(tx + 1) + "/" + String(ty) + ".png");
-  filename[6] = String("/pale/" + String(z) + "/" + String(tx - 1) + "/" + String(ty+1) + ".png");
-  filename[7] = String("/pale/" + String(z) + "/" + String(tx) + "/" + String(ty+1) + ".png");
-  filename[8] = String("/pale/" + String(z) + "/" + String(tx + 1) + "/" + String(ty+1) + ".png");
-
-  /*
-  画像9枚の並びはこのようになっている
-  [0][1][2]
-  [3][4][5]
-  [6][7][8]
-  */
-
-  // Stringからchar配列に変換
-  for (int i = 0; i < 9; i++)
-  {
-    int str_len = filename[i].length() + 1;
-    char file[9][str_len];
-    filename[i].toCharArray(file[i], str_len);
-  }
-
-  // filename[4]を中心として画像を描画
-  int mainx = -1 * (x - lcd1.width()/2), mainy = -1 * (y - lcd1.height()/2);
-  int mainx_goal = px_goal - px + lcd1.width()/2, mainy_goal = py_goal - py + lcd1.height()/2;  // 基準点の画面に対する座標
-
-  lcd1_s.drawPngFile(SD, filename[4], mainx, mainy);
-  // 他8枚の画像を描画
-  if (mainx > 0 && mainy > 0) {
-    lcd1_s.drawPngFile(SD, filename[0], mainx - 256, mainy-256);
-  }
-  if (mainy > 0) {
-    lcd1_s.drawPngFile(SD, filename[1], mainx , mainy-256);
-  }
-  if (mainx + 256 < lcd1.width() && mainy >0) {
-    lcd1_s.drawPngFile(SD, filename[2], mainx + 256, mainy - 256);
-  }
-
-
-  if (mainx > 0) {
-    lcd1_s.drawPngFile(SD, filename[3], mainx - 256, mainy);
-  }
-  if (mainx + 256 < lcd1.width()) {
-    lcd1_s.drawPngFile(SD, filename[5], mainx + 256, mainy);
-  }
-
-
-  if (mainx > 0 && mainy < -26) {
-    lcd1_s.drawPngFile(SD, filename[6], mainx - 256, mainy + 256);
-  }
-  if (mainy < -26) {
-    lcd1_s.drawPngFile(SD, filename[7], mainx, mainy + 256);
-  }
-  if (mainx + 256 < lcd1.width() && mainy < -26) {
-    lcd1_s.drawPngFile(SD, filename[8], mainx + 256, mainy + 256);
-  }
-
-  // 中心に印をつける
-  lcd1_s.fillCircle(lcd1.width()/2, lcd1.height()/2, 8, TFT_CYAN);
-  lcd1_s.fillCircle(lcd1.width()/2, lcd1.height()/2, 5, TFT_BLUE);
-  if (mainx_goal >= 0 && mainx_goal <= lcd1.width() && mainy_goal >= 0 && mainy_goal <= lcd1.height()) {  // 基準点が画面内にある場合
-    lcd1_s.fillCircle(mainx_goal, mainy_goal, 2, TFT_RED);
-  }
-
-  // スプライトを表示
-  lcd1.startWrite();
-  lcd1_s.pushSprite(0, 0);
-  lcd1.endWrite();
-}
-
-// 外部ディスプレイに速度,周回数,走行時間を表示
+// ディスプレイに表示
 void drawinfo() {
-  lcd2_s.setFont(&fonts::lgfxJapanGothicP_20);
-  lcd2_s.setTextSize(1.5);
-  lcd2_s.fillScreen(BLACK);
-  lcd2_s.setTextColor(ORANGE);
+  lcd_s.fillScreen(TFT_BLACK);
 
-  lcd2_s.setCursor(0, 0);
-  lcd2_s.printf_P(PSTR("速度: %skm/h\n"), spdbuf);
-  lcd2_s.printf_P(PSTR("ラップ: %d周目\n"), Lapcount);
-  lcd2_s.printf_P(PSTR("時間: %d分%d秒\n"), workmin, worksec);
+  // ディスプレイの表示モードを設定(0:速度/周回数/走行時間 1:回転数/燃料噴射時間/進角角度 2:速度/回転数/燃費)
+  if ( M5.BtnB.isPressed() ) { dispmode = 0; }    // Bボタンを押した場合
+  if ( M5.BtnA.isPressed() ) { dispmode = 1; }    // Aボタンを押した場合
+  if ( M5.BtnC.isPressed() ) { dispmode = 2; }    // Cボタンを押した場合
+
+  // 記録ステータス表示
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);       // フォントを指定
+  lcd_s.setTextSize(1.0);                           // フォントの拡大率
+  lcd_s.setTextDatum(top_right);                    // データム(上・右)
+  if (LOGGING) {                                    // SD
+    lcd_s.drawString("SD: O", 320,  0);
+  }
+  else {
+    lcd_s.drawString("SD: x", 320,  0);
+  }
+  if (ambientpush) {
+    lcd_s.drawString("Amb: O", 320,  15);
+  }
+  else {
+    lcd_s.drawString("Amb: x", 320,  15);
+  }
+
+  // タイトル表示
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_20);       // フォントを指定
+  lcd_s.setTextSize(1);                             // フォントの拡大率
+  lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+  //lcd_s.setTextColor(TFT_WHITE);                    // 文字色を指定
+  if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
+    lcd_s.drawString("速度(km/h):", 10,  50);         // タイトルを表示
+    lcd_s.drawString("残り周回数:", 10, 130);         // タイトルを表示
+    lcd_s.drawString("走行時間:", 10,  210);          // タイトルを表示
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
+    lcd_s.drawString("回転数(rpm):", 10,  50);        // タイトルを表示
+    lcd_s.drawString("噴射時間(ms):", 10, 130);       // タイトルを表示
+    lcd_s.drawString("進角角度(CA):", 10,  210);      // タイトルを表示
+  } else if (dispmode == 2 ) {                      // ディスプレイ表示モードが2の場合
+    lcd_s.drawString("速度(km/h):", 10,  50);         // タイトルを表示
+    lcd_s.drawString("回転数(rpm):", 10, 130);        // タイトルを表示
+    lcd_s.drawString("燃費(km/l):", 10,  210);        // タイトルを表示
+  }
+
+  // 1番目の表示
+  lcd_s.setFont(&fonts::Font7);                     // フォントを指定
+  lcd_s.setTextSize(1);                             // フォントの拡大率
+  lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+  lcd_s.setCursor(140, 50);                         // 表示位置を指定
+  if (dispmode == 0 || dispmode == 2 ) {            // ディスプレイ表示モードが0,2の場合
+    lcd_s.print(speed);                               // 速度(km/h)
+    lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);        // グラフの外枠を表示
+    lcd_s.fillRect(10, 55, map(speed, 0, 45, 0, 300), 10, TFT_WHITE);
+    lcd_s.fillRect(map(speed, 0, 45, 10, 310), 55, map(speed, 0, 45, 300, 0), 10, TFT_BLACK);
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
+    lcd_s.print(tachoRpm);                            // 回転数(rpm)
+    lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);        // グラフの外枠を表示
+    lcd_s.fillRect(10, 55, map(tachoRpm, 0, 6500, 0, 300), 10, TFT_WHITE);
+    lcd_s.fillRect(map(tachoRpm, 0, 6500, 10, 310), 55, map(tachoRpm, 0, 6500, 300, 0), 10, TFT_BLACK);
+  } 
+
+  // 2番目の表示
+  if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
+    uint8_t restlaps = totallaps - Lapcount;          // 残り周回数
+    if (restlaps > 1){                                // 残り2周までの場合
+      lcd_s.setFont(&fonts::Font7);                     // フォントを指定
+      lcd_s.setTextSize(1);                             // フォントの拡大率
+      lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+      lcd_s.setCursor(140, 130);                        // 表示位置を指定
+      lcd_s.print(restlaps);                            // 残り周回数
+    }
+    else if (restlaps == 1){                          // 残り1周の場合
+      lcd_s.setFont(&fonts::lgfxJapanGothicP_20);       // フォントを指定
+      lcd_s.setTextSize(2.5);                           // フォントの拡大率
+      lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+      lcd_s.setCursor(140, 135);                        // 表示位置を指定
+      lcd_s.print(F("G"));
+    }
+    else if (restlaps < 1) {                          // 残り1周未満の場合
+      lcd_s.setFont(&fonts::lgfxJapanGothicP_20);       // フォントを指定
+      lcd_s.setTextSize(2.5);                           // フォントの拡大率
+      lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+      lcd_s.setCursor(140, 135);                        // 表示位置を指定
+      lcd_s.print(F("FINISH"));
+    }
+    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);         // グラフの外枠を表示
+    lcd_s.fillRect(10, 135, map(distance, 0, goal, 300, 0), 10, TFT_WHITE);
+    lcd_s.fillRect(map(distance, 0, goal, 310, 10), 135, map(distance, 0, goal, 0, 300), 10, TFT_BLACK);
+    for (uint8_t i = 0; i <= totallaps; i++) {          // グラフに軸を表示
+      lcd_s.setFont(&fonts::lgfxJapanGothicP_20);         // フォントを指定
+      lcd_s.setTextSize(0.6);                             // フォントの拡大率
+      lcd_s.setTextDatum(TC_DATUM);                       // データム(上・中央)
+      lcd_s.setCursor((300 * i / totallaps) + 7, 147);    // 表示位置を指定
+      lcd_s.print(i);                                     // 軸を表示
+    }
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
+    lcd_s.setFont(&fonts::Font7);                     // フォントを指定
+    lcd_s.setTextSize(1);                             // フォントの拡大率
+    lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+    lcd_s.setCursor(140, 130);                        // 表示位置を指定
+    lcd_s.print(INJ_timems, 1);                       // 燃料噴射時間(msec)
+    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);       // グラフの外枠を表示
+    lcd_s.fillRect(10, 135, map(INJ_timems, 0, 10, 0, 300), 10, TFT_WHITE);
+    lcd_s.fillRect(map(INJ_timems, 0, 10, 10, 310), 135, map(INJ_timems, 0, 10, 300, 0), 10, TFT_BLACK);
+  } else if (dispmode == 2 ) {                      // ディスプレイ表示モードが2の場合
+    lcd_s.setFont(&fonts::Font7);                     // フォントを指定
+    lcd_s.setTextSize(1);                             // フォントの拡大率
+    lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+    lcd_s.setCursor(140, 130);                        // 表示位置を指定
+    lcd_s.print(tachoRpm);                            // 回転数(rpm)
+    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);       // グラフの外枠を表示
+    lcd_s.fillRect(10, 135, map(tachoRpm, 0, 6500, 0, 300), 10, TFT_WHITE);
+    lcd_s.fillRect(map(tachoRpm, 0, 6500, 10, 310), 135, map(tachoRpm, 0, 6500, 300, 0), 10, TFT_BLACK);
+  } 
+  
+  // 3番目の表示
+  lcd_s.setFont(&fonts::Font7);                     // フォントを指定
+  lcd_s.setTextSize(1);                             // フォントの拡大率
+  lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
+  lcd_s.setCursor(140, 210);                        // 表示位置を指定
+  if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
+    uint8_t workmin = worktime / 60;                  // 走行時間を分の部分
+    uint8_t worksec = worktime % 60;                  // 走行時間の秒の部分
+    lcd_s.printf("%02d:%02d", workmin, worksec);      // 走行時間(mm:ss)
+    lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
+    lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
+    lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
+    lcd_s.print(IGN_CA);                              // 進角角度(CA)
+    lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
+    lcd_s.fillRect(10, 215, map(IGN_CA, 0, 90, 0, 300), 10, TFT_WHITE);
+    lcd_s.fillRect(map(IGN_CA, 0, 90, 10, 310), 215, map(IGN_CA, 0, 90, 300, 0), 10, TFT_BLACK);
+  } else if (dispmode == 2 ) {                      // ディスプレイ表示モードが2の場合
+    lcd_s.print(dispergas, 1);                        // 燃費(km/l)
+    lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
+    lcd_s.fillRect(10, 215, map(dispergas, 0, 2000, 0, 300), 10, TFT_WHITE);
+    lcd_s.fillRect(map(dispergas, 0, 2000, 10, 310), 215, map(dispergas, 0, 2000, 300, 0), 10, TFT_BLACK);
+  } 
 
   // スプライトを表示
-  lcd2.startWrite();
-  lcd2_s.pushSprite(5, 5);
-  lcd2.endWrite();
+  lcd.startWrite();
+  lcd_s.pushSprite(0, 0);
+  lcd.endWrite();
+}
+
+// Serial送信
+void pushSerial() {
+  Serial.print(la, 7);
+  Serial.print(F(","));
+  Serial.print(ln, 7);
+  Serial.print(F(","));
+  Serial.print(Loc);
+  Serial.print(F(","));
+  Serial.print(spd, 1);
+  Serial.print(F(","));
+  Serial.print(tachoRpm);
+  Serial.print(F(","));
+  Serial.print(speed);
+  Serial.print(F(","));
+  Serial.print(distance);
+  Serial.print(F(","));
+  Serial.print(gasml, 1);
+  Serial.print(F(","));
+  Serial.print(dispergas, 1);
+  Serial.print(F(","));
+  Serial.println(worktime);
+
+  t_Serial = millis();
 }
 
 // Ambientへ送信
 void pushAmbient() {
   if (WiFi.status() == WL_CONNECTED) {  //  Wi-Fi 接続できている場合
-    ambient.set(1, spdbuf); // 1番目のデータとして速度をセット
-    ambient.set(2, altbuf); // 2番目のデータとして標高をセット
-    ambient.set(3, Lapcount); // 3番目のデータとしてラップ数をセット
-    ambient.set(4, worktime); // 4番目のデータとして走行時間(sec)をセット
-    ambient.set(9, labuf);  // 9番目のデータとして緯度をセット
-    ambient.set(10, lnbuf); // 10番目のデータとして経度をセット
-
-    ambient.send();
+    Serial.println(F("WiFi:Connected"));
+    ambient.set(1, distance);   // 1番目のデータとして走行距離積算(m)をセット
+    //Serial.print(F("Amb:1 "));
+    ambient.set(2, Lapcount);   // 2番目のデータとしてラップ数をセット
+    //Serial.print(F("2 "));
+    ambient.set(9, la);         // 9番目のデータとして緯度をセット
+    //Serial.print(F("9 "));
+    ambient.set(10, ln);        // 10番目のデータとして経度をセット
+    //Serial.println(F("10"));
+    if (ambient.send(1)) {
+      Serial.println(F("Amb:Success!"));
+    }
+    else {
+      Serial.println(F("Amb:failure..."));
+    }
     t_amb = millis();
+  }
+  else {
+    Serial.println(F("WiFi:Disconnected..."));
+    WiFi.reconnect();           // 再接続
   }
 }
 
 // SDに保存
 void WriteSD(){
-  // ファイル名の連番を決定
-  while(1){      
-    sprintf_P(fileName, PSTR("LOG/LOG%04d.CSV"), fileNum);
-    if(!SD.exists(fileName)) {
-      Serial.println(fileName);
-      break;
-    }
-    fileNum++;
-  }
-
-  // ログファイルが無かったらヘッダを書き込む
-  if(!SD.exists(fileName)) {
-    logFile = SD.open(fileName, FILE_WRITE);
-    if (logFile){
-      logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),	,	, , ,lat,lng,"));
-    }
-  }
-
   // ログファイルに書き込み
-  logFile = SD.open(fileName, FILE_WRITE);
+  logFile = SD.open(fileName, FILE_APPEND);
   if (logFile){
-    logFile.printf_P(PSTR("%d/%d/%d %d:%d:%d"), jst_year, jst_month, jst_day, jst_hour, jst_minute, jst_second);  // 0.日時
+    logFile.printf("%d/%d/%d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());  // 0.日時
     logFile.print(F(","));
-    logFile.print(spdbuf);    // 1.速度
+    //logFile.print(spd, 1);    // 1.速度(GPS)
+    logFile.print(speed);     // 1.速度(車軸パルス)
     logFile.print(F(","));
-    logFile.print(altbuf);    // 2.標高
+    logFile.print(Lapcount);  // 2.ラップ数
     logFile.print(F(","));
-    logFile.print(Lapcount);  // 3.ラップ数
+    logFile.print(worktime);  // 3.走行時間(sec)
     logFile.print(F(","));
-    logFile.print(worktime);  // 4.走行時間(sec)
+    logFile.print(tachoRpm);  // 4.回転数(rpm)
     logFile.print(F(","));
-    logFile.print("");        // 5.
+    logFile.print(distance, 1);  // 5.走行距離積算(m)
     logFile.print(F(","));
-    logFile.print("");        // 6.
+    logFile.print(gasml, 1);     // 6.積算燃料消費量(ml)
     logFile.print(F(","));
-    logFile.print("");        // 7.
+    logFile.print(dispergas, 1); // 7.燃費(km/l)
     logFile.print(F(","));
-    logFile.print("");        // 8.
+    logFile.print(la, 7);     // 8.緯度
     logFile.print(F(","));
-    logFile.print(labuf);   // 9.緯度
-    logFile.print(F(","));
-    logFile.println(lnbuf);   // 10.経度
+    logFile.println(ln, 7);   // 9.経度
   }
   logFile.close();
 
   t_SD = millis();
 }
 
-void setup()
-{
+void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
 
-  lcd1.init();
-  lcd2.init();
-  lcd2.setRotation(3);
-  lcd1_s.createSprite(lcd1.width(), lcd1.height());
-  lcd2_s.createSprite(lcd2.width(), lcd2.height());
-  GPS_s.begin(115200);
+  Serial.begin(115200);                           // PCへのモニタリング用Serial
+  Serial1.begin(115200, SERIAL_8N1, 33, 32);      // ECUとの通信用Serial(PortA RX=G33,TX=G32)
+  Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC RX=G13,TX=G14)
+  
+  lcd.init();                                     // TFTディスプレイの初期化
+  lcd.setRotation(1);                             // 回転方向を 0～3 の4方向から設定します。(4～7を使用すると上下反転になります。)
+  lcd.setBrightness(128);                         // バックライトの輝度を 0～255 の範囲で設定します。
+  lcd.fillScreen(TFT_BLACK);                      // 背景色で塗りつぶし
 
-  lcd1.setFont(&fonts::lgfxJapanGothicP_20);
-  lcd1.setTextSize(1.0);
-  lcd1.setTextDatum( baseline_center );
+  lcd_s.setColorDepth(1);                         // 2色モード
+  lcd_s.createSprite(lcd.width(), lcd.height());  // スプライトの作成
+  lcd_s.setPaletteColor(1, TFT_WHITE);
 
-  delay(500);
+  lcd.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd.setTextSize(1);
+  lcd.setTextDatum( baseline_center );
+
   // SDカードマウント待ち
-  while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
-    Serial.println("SD Wait...");
+  if (LOGGING) {                                  // ロギング有効の場合
+    uint8_t i = 3;
+    while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
+      if (i <= 0){
+        LOGGING = false;
+        break;
+      }
+      Serial.println(F("SD Wait..."));
 
-    lcd1.clear(RED);
-    //lcd1_s.fillScreen(RED);
-    lcd1.setTextColor(BLACK);
-    lcd1.drawString("MicroSDが見つかりません", lcd1.width()/2, lcd1.height()/2);
-    //lcd1_s.pushSprite(0, 0);
+      lcd.fillScreen(TFT_RED);
+      //lcd_s.fillScreen(TFT_RED);
+      lcd.setTextColor(TFT_BLACK);
+      lcd.drawString("MicroSDが見つかりません", lcd.width()/2, lcd.height()/2-20);
+      lcd.drawNumber(i, lcd.width()/2, lcd.height()/2+20);
+      //lcd_s.pushSprite(0, 0);
 
-    delay(500);
+      delay(1000);
+      i--;
+    }
   }
+
+  if (LOGGING) {                                  // ロギング有効の場合
+    lcd.fillScreen(TFT_BLACK);
+    //lcd_s.fillScreen(TFT_BLACK);
+    lcd.setTextColor(TFT_WHITE);
+
+    // SD内にLOGディレクトリがない場合はLOGディレクトリを作成する
+    if(!SD.exists("/LOG")) {
+      if(SD.mkdir("/LOG"));
+      lcd.drawString("ログディレクトリ作成中...", lcd.width()/2, lcd.height()/2 - 10);
+    }
+    // microSD内のファイル名の連番を決定
+    lcd.drawString("ログファイル作成中...", lcd.width()/2, lcd.height()/2 + 10);
+    while(1){      
+      sprintf(fileName, "/LOG/LOG%04d.CSV", fileNum);
+      if(!SD.exists(fileName)) {
+        Serial.println(fileName);
+        logFile = SD.open(fileName, FILE_APPEND);
+        if (logFile){
+          logFile.write(0xEF);                                                  // BOMを書き込む
+          logFile.write(0xBB);                                                  // BOMを書き込む
+          logFile.write(0xBF);                                                  // BOMを書き込む
+          logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),"));
+          logFile.close();                                                      // ファイルを閉じる
+        }
+        break;
+      }
+      fileNum++;
+    }
+  }
+
+  setupWiFi();
 
   if (ambientpush) {             // ambientへの送信が有効の場合
     setupWiFi();
@@ -472,11 +565,11 @@ void setup()
         ambientpush = false;
         break;
       }
-      lcd1.clear(BLACK);
-      //lcd1_s.fillScreen(BLACK);
-      lcd1.setTextColor(WHITE);
-      lcd1.drawString("Wi-Fi接続待ち...", lcd1.width()/2, lcd1.height()/2);
-      //lcd1_s.pushSprite(0, 0);
+      lcd.clear(BLACK);
+      //lcd_s.fillScreen(BLACK);
+      lcd.setTextColor(WHITE);
+      lcd.drawString("Wi-Fi接続待ち...", lcd.width()/2, lcd.height()/2);
+      //lcd_s.pushSprite(0, 0);
       delay(100);
     }
     */
@@ -492,11 +585,11 @@ void setup()
       
       if (ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client) == false) {
         Serial.printf("Cannot get channelId. Please set DeviceKey (%s) to Ambient.\r\n", devKey);
-        lcd1.clear(BLACK);
-        lcd1.setTextColor(WHITE);
-        lcd1.setCursor(0, 20);
-        lcd1.printf_P(PSTR("AmbientでチャネルIDに紐づける\nデバイスキーを登録してください\nデバイスキー: %s"), devKey);
-        lcd1.qrcode("https://ambidata.io/ch/devKey.html",85,87,150,5);
+        lcd.clear(BLACK);
+        lcd.setTextColor(WHITE);
+        lcd.setCursor(0, 20);
+        lcd.printf_P(PSTR("AmbientでチャネルIDに紐づける\nデバイスキーを登録してください\nデバイスキー: %s"), devKey);
+        lcd.qrcode("https://ambidata.io/ch/devKey.html",85,87,150,5);
         while (ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client) == false) {
           delay(500);
           if (ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client) == true){
@@ -509,77 +602,50 @@ void setup()
       ambient.begin(channelId, writeKey, &client); // 取得したチャネルIDとライトキーでAmbientの初期化
     }
   }
-  
-  lcd1.clear(BLACK);
-  //lcd1_s.fillScreen(BLACK);
-  lcd1.setTextColor(WHITE);
-  lcd1.drawString("読み込み中...", lcd1.width()/2, lcd1.height()/2);
-  //lcd1_s.pushSprite(0, 0);
-
-  lcd2.setFont(&fonts::lgfxJapanGothicP_20);
-  lcd2.setTextSize(1.0);
-  lcd2.setTextDatum( baseline_center );
-  lcd2.clear(BLACK);
-  //lcd2_s.fillScreen(BLACK);
-  lcd2.setTextColor(WHITE);
-  lcd2.drawString("読み込み中...", lcd2.width()/2, lcd2.height()/2);
-  //lcd2_s.pushSprite(0, 0);
-
-  Serial.println(F("lat,lon,spd,alt"));
-
   t_amb = millis();
+  
+  lcd.clear(TFT_BLACK);
+  //lcd_s.fillScreen(TFT_BLACK);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("読み込み中...", lcd.width()/2, lcd.height()/2);
+
+  Serial.println(F("lat, lon, loc, km/h, rpm, km/h, km, ml, km/l, worktime"));
+
+  t_Serial = millis();
   t_SD = millis();
 
-  // タイマ割込み設定
-    /*
-  timerSemaphore = xSemaphoreCreateBinary();  //バイナリセマフォを作成(0か1のバイナリ)
-  tim0 = timerBegin(0, 80, true);             //タイマー0を80MHz/80（1us）動作ｶｳﾝﾄｱｯﾌﾟでtim0に設定
-  timerAttachInterrupt(tim0, &PushAmbient, true); //tim0割込みが発生した時に実行する処理を指定「GetGNSS」
-  timerAlarmWrite(tim0, 10000000, true);         //tim0割込み発生周期を10s（1us × 1000(ms) x 1000(s) x 10）に設定
-  timerAlarmEnable(tim0);                     //タイマー0割込みを有効化
-  */
+  lcd.clear(TFT_BLACK);
 }
 
-void loop()
-{
+void loop() {
   M5.update();
-
-  if(M5.BtnA.wasPressed()){
-    la = goal_la_su;
-    ln = goal_ln_su;
-  }
-
-  if(M5.BtnB.wasPressed()){
-    la = goal_la_mo;
-    ln = goal_ln_mo;
-  }
-
-  if(M5.BtnC.wasPressed()){
-    LAPRADchange = 0;  // ラップ記録待機0(準備)
-  }
+  
+  // ECUからのデータを読み込み・表示
+  readSerialECU();
 
   // 位置情報を取得
   getGNSS();
 
-  // ラップタイム,周回数,走行時間を計測
-  lap_count();
-
-  // 地図を表示
-  drawmap();
-
-  // 外部ディスプレイに速度と高度を表示
+  // ディスプレイに速度と高度を表示
   drawinfo();
 
+  if (millis() - t_Serial >= 1 * 1000) {      // 1秒ごとにSerial送信
+    if (Serial){
+      pushSerial();
+    }
+  }
+
   if (ambientpush) {                      // ambientへの送信が有効の場合
-    if (millis() - t_amb >= 10 * 1000) {  // 10秒ごとにAmbientへ送信
+    if (millis() - t_amb >= 10 * 1000) {    // 10秒ごとにAmbientへ送信
       pushAmbient();
     }
   }
 
-  if (millis() - t_SD >= 10 * 1000) {  // 1秒ごとにSDへ記録
-    WriteSD();
+  if (LOGGING) {                          // ロギング有効の場合
+    if (millis() - t_SD >= 1 * 1000) {      // 1秒ごとにSDへ記録
+      WriteSD();
+    }
   }
 
-
-  delay(100);
+  delay(10);  // 10msec待機
 }
