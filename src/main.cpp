@@ -21,7 +21,7 @@ WiFiManager wifiManager;
 
 // 変数の定義
 // 画面表示
-uint8_t dispmode = 0;             // ディスプレイの表示モード(0:回転数/燃料噴射時間/進角角度 1:速度/周回数/走行時間 2:速度/回転数/燃費)
+uint8_t dispmode = 0;             // ディスプレイの表示モード(0:速度/周回数/走行時間 1:回転数/燃料噴射時間/進角角度 2:速度/回転数/燃費)
 
 // ECU
 unsigned long receiveECUtime = 0; // ECUからデータを受信した時間
@@ -74,7 +74,7 @@ const char* userKey = "64bd5933d381952b59"; // ユーザーキー
 char devKey[20];
 unsigned int channelId;
 char writeKey[20];
-bool ambientpush = false;    // ambientへの送信 有効(true)/無効(false)
+bool ambientpush = true;    // ambientへの送信 有効(true)/無効(false)
 unsigned long t_amb;        // Ambientへの送信時刻
 
 // ログファイル
@@ -427,15 +427,17 @@ void pushSerial() {
 void pushAmbient() {
   if (WiFi.status() == WL_CONNECTED) {  //  Wi-Fi 接続できている場合
     Serial.println(F("WiFi:Connected"));
-    ambient.set(1, distance);   // 1番目のデータとして走行距離積算(m)をセット
-    //Serial.print(F("Amb:1 "));
-    ambient.set(2, Lapcount);   // 2番目のデータとしてラップ数をセット
-    //Serial.print(F("2 "));
+    ambient.set(1, spd);        // 1番目のデータとして速度をセット(GPS)
+    ambient.set(2, speed);      // 2番目のデータとして速度をセット(車軸パルス)
+    ambient.set(3, Lapcount);   // 3番目のデータとしてラップ数をセット
+    ambient.set(4, worktime);   // 4番目のデータとして走行時間(sec)をセット
+    ambient.set(5, tachoRpm);   // 5番目のデータとしてエンジン回転数(rpm)をセット
+    ambient.set(6, distance);   // 6番目のデータとして走行距離積算(m)をセット
+    ambient.set(7, gasml);      // 7番目のデータとして積算燃料消費量(ml)をセット
+    ambient.set(8, dispergas);  // 8番目のデータとして燃費(km/l)をセット
     ambient.set(9, la);         // 9番目のデータとして緯度をセット
-    //Serial.print(F("9 "));
     ambient.set(10, ln);        // 10番目のデータとして経度をセット
-    //Serial.println(F("10"));
-    if (ambient.send(1)) {
+    if (ambient.send(1000)) {
       Serial.println(F("Amb:Success!"));
     }
     else {
@@ -619,7 +621,7 @@ void setup() {
 
 void loop() {
   M5.update();
-  
+
   // ECUからのデータを読み込み・表示
   readSerialECU();
 
