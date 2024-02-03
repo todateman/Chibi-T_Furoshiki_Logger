@@ -412,6 +412,8 @@ void pushSerial() {
 void pushAmbient() {
   if (WiFi.status() == WL_CONNECTED) {  //  Wi-Fi 接続できている場合
     Serial.println(F("WiFi:Connected"));
+
+    char buf[16];
     ambient.set(1, spd);        // 1番目のデータとして速度をセット(GPS)
     ambient.set(2, speed);      // 2番目のデータとして速度をセット(車軸パルス)
     ambient.set(3, Lapcount);   // 3番目のデータとしてラップ数をセット
@@ -420,8 +422,10 @@ void pushAmbient() {
     ambient.set(6, distance);   // 6番目のデータとして走行距離積算(m)をセット
     ambient.set(7, gasml);      // 7番目のデータとして積算燃料消費量(ml)をセット
     ambient.set(8, dispergas);  // 8番目のデータとして燃費(km/l)をセット
-    ambient.set(9, la);         // 9番目のデータとして緯度をセット
-    ambient.set(10, ln);        // 10番目のデータとして経度をセット
+    dtostrf(la, 12, 8, buf);
+    ambient.set(9, buf);         // 9番目のデータとして緯度をセット
+    dtostrf(ln, 12, 8, buf);
+    ambient.set(10, buf);        // 10番目のデータとして経度をセット
     if (ambient.send(1000)) {
       Serial.println(F("Amb:Success!"));
     }
