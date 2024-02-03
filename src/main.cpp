@@ -487,8 +487,8 @@ void setup() {
   M5.begin(cfg);
 
   Serial.begin(115200);                           // PCへのモニタリング用Serial
-  Serial1.begin(115200, SERIAL_8N1, 19, 27);      // ECUとの通信用Serial(PortE RX=E1=G19,TX=E2=G27)
-  Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC RX=G13,TX=G14)
+  Serial1.begin(115200, SERIAL_8N1, 27, 19);      // ECUとの通信用Serial(PortE TX=E2=G27, RX=E1=G19)
+  Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC TX=G14, RX=G13)
   
   lcd.init();                                     // TFTディスプレイの初期化
   lcd.setRotation(1);                             // 回転方向を 0～3 の4方向から設定します。(4～7を使用すると上下反転になります。)
