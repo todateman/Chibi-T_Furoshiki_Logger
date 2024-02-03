@@ -42,7 +42,6 @@ const uint16_t goal_su = 17616;   // 鈴鹿の総走行距離(m)
 const uint16_t goal_mo = 16389;   // 鈴鹿の総走行距離(m)
 const uint16_t limittime_su = 2536; // 鈴鹿の規定時間(42分16秒 = 2536sec)
 const uint16_t limittime_mo = 2360; // 茂木の規定時間(39分20秒 = 2360sec)
-unsigned long starttime = 0;      // 走行開始時間(msec)
 uint16_t worktime = 0;            // 走行時間(sec)
 
 // GPS
@@ -152,18 +151,12 @@ void setupWiFi ()
       if (wifiManager.autoConnect()) {
         isWifiConfigSucceeded = true;
         Serial.println("autoConnect() connect success!");
+        showMessage("Wi-Fi接続成功.");
       }
       else {
         Serial.println("autoConnect() connect failed!");
+        showMessage("Wi-Fi接続失敗.");
       }
-    }
-  }
-
-  if (isWifiConfigSucceeded) {
-    showMessage("Wi-Fi接続.");
-  } else {
-    if (ambientpush){
-      showMessage("Wi-Fi接続失敗.");
     }
     else {
       showMessage("Wi-Fi接続無効.");
@@ -178,7 +171,7 @@ void readSerialECU() {
     String str = Serial1.readStringUntil('\n');   // Serial1から改行コード"CRLF"まで読み込む
     str.trim();                                   // Serial1から読み込んだデータの両端の空白、改行、タブなどを取り除く
     //Serial.println(str);
-    for (uint8_t i = 0; i < 7; i++) {
+    for (uint8_t i = 0; i < 8; i++) {
       uint8_t check = (str.indexOf(","));         // ","の位置を探索する
       String data = str.substring(0, check);      // ","の位置で文字列を区切る
       data.trim();                                // 文字列の両端の空白、改行、タブなどを取り除く
@@ -190,17 +183,9 @@ void readSerialECU() {
       if (i == 4) {distance   = data.toInt();}    // 走行距離積算(m)
       if (i == 5) {gasml      = data.toFloat();}  // 積算燃料消費量(ml)
       if (i == 6) {dispergas  = data.toFloat();}  // 燃費(km/l)
+      if (i == 7) {worktime   = data.toInt();}    // 走行時間(sec)
     }
     Lapcount = distance / (goal / totallaps);     // 現在の周回数
-    if (distance == 0) {                          // 距離が0の時
-      worktime = 0;                               // 走行時間を0にする
-      starttime = 0;                              // 走行開始時間を0にする
-    } else {                                      // 距離が0ではない場合
-      if (starttime == 0) {                       // 走行時間が0の場合
-        starttime = millis();                     // 走行開始時間を現在の時間にする
-      }
-      worktime = (millis() - starttime) * 0.001;  // 走行時間を秒に変換する
-    }
   }
   else {
     if ( millis() - receiveECUtime > 2000) {      // 2000msec間データの受信がなければ
@@ -554,8 +539,6 @@ void setup() {
       fileNum++;
     }
   }
-
-  setupWiFi();
 
   if (ambientpush) {             // ambientへの送信が有効の場合
     setupWiFi();
