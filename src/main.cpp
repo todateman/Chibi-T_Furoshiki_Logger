@@ -487,7 +487,7 @@ void setup() {
   M5.begin(cfg);
 
   Serial.begin(115200);                           // PCへのモニタリング用Serial
-  Serial1.begin(115200, SERIAL_8N1, 33, 32);      // ECUとの通信用Serial(PortA RX=G33,TX=G32)
+  Serial1.begin(115200, SERIAL_8N1, 19, 27);      // ECUとの通信用Serial(PortE RX=E1=G19,TX=E2=G27)
   Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC RX=G13,TX=G14)
   
   lcd.init();                                     // TFTディスプレイの初期化
