@@ -17,9 +17,9 @@
 #define pi 3.141592653589793
 
 static M5GFX lcd1;
-//static M5UnitLCD lcd2;
+static M5UnitLCD lcd2;
 static M5Canvas lcd1_s(&lcd1);
-//static M5Canvas lcd2_s(&lcd2);
+static M5Canvas lcd2_s(&lcd2);
 static M5Canvas lcd1_s_hb(&lcd1_s);
 
 WiFiClient client;
@@ -53,18 +53,17 @@ double ln = goal_ln_su;
 double spd=0.0, alt=0.0;  // 速度(km/h), 標高(m)
 char labuf[12], lnbuf[12], spdbuf[6], altbuf[7], lobuf[7], O2buf[5];
 String Loc = "";
-double L = 85.05112878;
-int z = 18;  //ズーム倍率
 float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
 unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
 uint16_t Lapcount = 1, worktime, workmin, worksec, LAPRADchange = 0;
 unsigned long t_Serial;           // Serialの送信時刻
 
 // ECU
-volatile unsigned long tachoBefore = 0;   // クランクセンサーの前回の反応時の時間
-volatile unsigned long tachoAfter = 0;    // クランクセンサーの今回の反応時の時間
-volatile unsigned long tachoWidth = 0;    // クランク一回転の時間　tachoAfter - tachoBefore
-volatile uint16_t RPM = 0;                // エンジンの回転数(0-8500rpm)
+volatile bool tachopulse = false;         // 点火パルス(=クランクパルス)のトリガー
+unsigned long tachoBefore = 0;            // 点火パルス(=クランクパルス)の前回の反応時の時間
+unsigned long tachoAfter = 0;             // 点火パルス(=クランクパルス)の今回の反応時の時間
+unsigned long tachoWidth = 0;             // 点火パルス(=クランクパルス)回転の時間　tachoAfter - tachoBefore
+uint16_t RPM = 0;                         // エンジンの回転数(0-8500rpm)
 uint16_t read_from_ads;                   // ADS1115から読んだ生値
 uint8_t Value_THL = 0;                    // スロットル開度(0-100%)
 float inputO2 = 0;                        // O2センサ出力電圧(0-1000mV)
@@ -245,11 +244,7 @@ void getGNSS() {
 
  // エンジン回転数を取得
 void getRPM() {
-  tachoAfter = micros();                                    // 現在の時刻を記録
-  tachoWidth = tachoAfter - tachoBefore;                    // 前回と今回の時間の差(カムシャフト1回転当たりの時間)を計算
-  RPM = 60000000 / tachoWidth;                            //クランクの回転数[rpm]を計算
-
-  tachoBefore = tachoAfter;                                 // 今回の値を前回の値に代入する
+  tachopulse = true;            // チャタリング防止のため、パルスONでtrue
 }
 
 // スロットル開度・空燃比を取得
@@ -334,99 +329,7 @@ void lap_count() {
   
 }
 
-// 地図を表示
-void drawmap() {  
-  // 緯度経度→ピクセル座標の変換計算
-  double px = int(pow(2.0, z + 7.0) * ((ln / 180.0) + 1.0));
-  double py = int(pow(2.0, z + 7.0) * (-1 * atanh(sin(pi * la / 180.0)) + atanh(sin(pi * L / 180.0))) / pi);
-  double px_goal = int(pow(2.0, z + 7.0) * ((goal_ln / 180.0) + 1.0));
-  double py_goal = int(pow(2.0, z + 7.0) * (-1 * atanh(sin(pi * goal_la / 180.0)) + atanh(sin(pi * L / 180.0))) / pi);
-  
-  // ピクセル座標→タイル座標の変換計算
-  int tx = px / 256;
-  int ty = py / 256;
-  
-  // タイル画像の中の座標を計算
-  int x = int(px) % 256;
-  int y = int(py) % 256;
-
-  // 画像9枚のファイルアドレスを用意
-  String filename[9];
-  filename[0] = String("/pale/" + String(z) + "/" + String(tx - 1) + "/" + String(ty-1) + ".png");
-  filename[1] = String("/pale/" + String(z) + "/" + String(tx) + "/" + String(ty-1) + ".png");
-  filename[2] = String("/pale/" + String(z) + "/" + String(tx + 1) + "/" + String(ty-1) + ".png");
-  filename[3] = String("/pale/" + String(z) + "/" + String(tx - 1) + "/" + String(ty) + ".png");
-  filename[4] = String("/pale/" + String(z) + "/" + String(tx) + "/" + String(ty) + ".png");
-  filename[5] = String("/pale/" + String(z) + "/" + String(tx + 1) + "/" + String(ty) + ".png");
-  filename[6] = String("/pale/" + String(z) + "/" + String(tx - 1) + "/" + String(ty+1) + ".png");
-  filename[7] = String("/pale/" + String(z) + "/" + String(tx) + "/" + String(ty+1) + ".png");
-  filename[8] = String("/pale/" + String(z) + "/" + String(tx + 1) + "/" + String(ty+1) + ".png");
-
-  /*
-  画像9枚の並びはこのようになっている
-  [0][1][2]
-  [3][4][5]
-  [6][7][8]
-  */
-
-  // Stringからchar配列に変換
-  for (int i = 0; i < 9; i++)
-  {
-    int str_len = filename[i].length() + 1;
-    char file[9][str_len];
-    filename[i].toCharArray(file[i], str_len);
-  }
-
-  // filename[4]を中心として画像を描画
-  int mainx = -1 * (x - lcd1.width()/2), mainy = -1 * (y - lcd1.height()/2);
-  int mainx_goal = px_goal - px + lcd1.width()/2, mainy_goal = py_goal - py + lcd1.height()/2;  // 基準点の画面に対する座標
-
-  lcd1_s.drawPngFile(SD, filename[4], mainx, mainy);
-  // 他8枚の画像を描画
-  if (mainx > 0 && mainy > 0) {
-    lcd1_s.drawPngFile(SD, filename[0], mainx - 256, mainy-256);
-  }
-  if (mainy > 0) {
-    lcd1_s.drawPngFile(SD, filename[1], mainx , mainy-256);
-  }
-  if (mainx + 256 < lcd1.width() && mainy >0) {
-    lcd1_s.drawPngFile(SD, filename[2], mainx + 256, mainy - 256);
-  }
-
-
-  if (mainx > 0) {
-    lcd1_s.drawPngFile(SD, filename[3], mainx - 256, mainy);
-  }
-  if (mainx + 256 < lcd1.width()) {
-    lcd1_s.drawPngFile(SD, filename[5], mainx + 256, mainy);
-  }
-
-
-  if (mainx > 0 && mainy < -26) {
-    lcd1_s.drawPngFile(SD, filename[6], mainx - 256, mainy + 256);
-  }
-  if (mainy < -26) {
-    lcd1_s.drawPngFile(SD, filename[7], mainx, mainy + 256);
-  }
-  if (mainx + 256 < lcd1.width() && mainy < -26) {
-    lcd1_s.drawPngFile(SD, filename[8], mainx + 256, mainy + 256);
-  }
-
-  // 中心に印をつける
-  lcd1_s.fillCircle(lcd1.width()/2, lcd1.height()/2, 8, TFT_CYAN);
-  lcd1_s.fillCircle(lcd1.width()/2, lcd1.height()/2, 5, TFT_BLUE);
-  if (mainx_goal >= 0 && mainx_goal <= lcd1.width() && mainy_goal >= 0 && mainy_goal <= lcd1.height()) {  // 基準点が画面内にある場合
-    lcd1_s.fillCircle(mainx_goal, mainy_goal, 2, TFT_RED);
-  }
-
-  // スプライトを表示
-  lcd1.startWrite();
-  lcd1_s.pushSprite(0, 0);
-  lcd1.endWrite();
-}
-
-// 外部ディスプレイに速度,周回数,走行時間を表示
-/*
+// 外部ディスプレイに概算空燃比を表示
 void drawinfo() {
   lcd2_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd2_s.setTextSize(1.5);
@@ -434,16 +337,13 @@ void drawinfo() {
   lcd2_s.setTextColor(WHITE);
 
   lcd2_s.setCursor(0, 0);
-  lcd2_s.printf_P(PSTR("速度: %skm/h\n"), spdbuf);
-  lcd2_s.printf_P(PSTR("ラップ: %d周目\n"), Lapcount);
-  lcd2_s.printf_P(PSTR("時間: %d分%d秒\n"), workmin, worksec);
+  lcd2_s.printf_P(PSTR("概算空燃比: %s%\n"), O2buf);
 
   // スプライトを表示
   lcd2.startWrite();
-  lcd2_s.pushSprite(5, 5);
+  lcd2_s.pushSprite(0, 0);
   lcd2.endWrite();
 }
-*/
 
 // M5Core2本体にエンジン回転数・スロットル開度・速度を表示
 void drawinfo_cab() {
@@ -496,7 +396,7 @@ void pushAmbient() {
     ambient.set(1, spdbuf);     // 1番目のデータとして速度をセット
     ambient.set(2, altbuf);     // 2番目のデータとして標高をセット
     ambient.set(3, Lapcount);   // 3番目のデータとしてラップ数をセット
-    ambient.set(4, worktime);    // 4番目のデータとして走行時間(sec)をセット
+    ambient.set(4, worktime);   // 4番目のデータとして走行時間(sec)をセット
     ambient.set(5, RPM);        // 5番目のデータとして回転数(rpm)をセット
     ambient.set(6, Value_THL);  // 6番目のデータとしてスロットル開度(%)をセット
     ambient.set(7, O2buf);      // 7番目のデータとして概算空燃比をセット
@@ -739,8 +639,14 @@ void loop()
   getGNSS();
 
   // エンジン回転数を取得
-  //getRPM();
-  if (micros() - tachoBefore > 60000000 / 100 ){RPM = 0;}  // 100rpm以下の時は0にする 
+  if (tachopulse){
+    tachoAfter = micros();                                    // 現在の時刻を記録
+    tachoWidth = tachoAfter - tachoBefore;                    // 前回と今回の時間の差(カムシャフト1回転当たりの時間)を計算
+    RPM = 60000000 / tachoWidth;                              // クランクの回転数[rpm]を計算
+    tachoBefore = tachoAfter;                                 // 今回の値を前回の値に代入する
+    tachopulse = false;
+  }
+  if (micros() - tachoBefore > 60000000 * 0.01 ){RPM = 0;}   // 100rpm以下の時は0にする 
 
   // スロットル開度・空燃比を取得
   getTHL_O2();
@@ -748,11 +654,8 @@ void loop()
   // ラップタイム,周回数,走行時間を計測
   lap_count();
 
-  // 地図を表示
-  // drawmap();
-
   // 外部ディスプレイに速度と高度を表示
-  // drawinfo();
+  drawinfo();
   
   if (millis() - t_Serial >= 1 * 1000) {      // 1秒ごとにSerial送信
     pushSerial();
@@ -772,5 +675,5 @@ void loop()
   }
 
 
-  delay(100);
+  delay(10);                              // 6000rpm以上は無視する
 }
