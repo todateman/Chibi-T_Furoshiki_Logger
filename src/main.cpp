@@ -459,10 +459,10 @@ void setup()
   pinMode(IGPLS_PIN, INPUT);
 
   lcd1.init();
-  //lcd2.init();
-  //lcd2.setRotation(3);
+  lcd2.init();
+  lcd2.setRotation(3);
   lcd1_s.createSprite(lcd1.width(), lcd1.height());
-  //lcd2_s.createSprite(lcd2.width(), lcd2.height());
+  lcd2_s.createSprite(lcd2.width(), lcd2.height());
   lcd1_s_hb.createSprite(10, 10);
   GPS_s.begin(115200);
 
