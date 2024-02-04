@@ -50,8 +50,10 @@ double goal_ln_to = 137.160358;  // 豊田市SENTAN
 //double goal_ln_to = 137.111857;
 double la = goal_la_su;
 double ln = goal_ln_su;
-double spd=0.0, alt=0.0;  // 速度(km/h), 標高(m)
-char labuf[12], lnbuf[12], spdbuf[6], altbuf[7], lobuf[7], O2buf[5];
+uint8_t spd = 0, spdave = 0;   // 速度(km/h)
+unsigned long spdsum = 0; // 速度総和(km/h)
+uint16_t countGNSS = 0;   // GNSS関数の実行回数
+char labuf[12], lnbuf[12], lobuf[7], O2buf[5];
 String Loc = "";
 float distanceTogoal = 0.0, before_distanceTogoal = 0.0;
 unsigned long LAPtime, BeforeLAPtime = 0, Starttime = 0;
@@ -210,7 +212,6 @@ void getGNSS() {
           la         = gps.location.lat();
           ln         = gps.location.lng();
           spd        = gps.speed.kmph();
-          alt        = gps.altitude.meters();
           jst_day    = gps.date.day();
           jst_month  = gps.date.month();
           jst_year   = gps.date.year();
@@ -223,23 +224,23 @@ void getGNSS() {
         }
         break;
       }
-    }    
+    }
+    if ( la >= 34.839027 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.543319 ) {
+      Loc = "suzuka";
+    } else if ( la >= 36.528477 && la <= 36.53735 && ln >= 140.224726 && ln <= 140.23853 ) {
+      Loc = "motegi";
+    } else {
+      Loc = "toyota";
+    }
+    Loc.toCharArray( lobuf, Loc.length()+1 ); 
+
+    dtostrf(la, 11, 7, labuf);
+    dtostrf(ln, 11, 7, lnbuf);
+
+    countGNSS++;                  // 実行回数をカウント
+    spdsum += spd;                // 速度を総和
+    spdave = spdsum / countGNSS;  // 平均速度を算出
   }
-
-  if ( la >= 34.839027 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.543319 ) {
-    Loc = "suzuka";
-  } else if ( la >= 36.528477 && la <= 36.53735 && ln >= 140.224726 && ln <= 140.23853 ) {
-    Loc = "motegi";
-  } else {
-    Loc = "toyota";
-  }
-  Loc.toCharArray( lobuf, Loc.length()+1 ); 
-
-  dtostrf(spd, 5, 1, spdbuf);
-  dtostrf(alt, 6, 1, altbuf);
-  dtostrf(la, 11, 7, labuf);
-  dtostrf(ln, 11, 7, lnbuf);
-
 }
 
  // エンジン回転数を取得
@@ -338,6 +339,7 @@ void drawinfo() {
 
   lcd2_s.setCursor(0, 0);
   lcd2_s.printf_P(PSTR("概算空燃比: %s%\n"), O2buf);
+  lcd2_s.printf_P(PSTR("平均速度: %dkm/h\n"), spdave);
 
   // スプライトを表示
   lcd2.startWrite();
@@ -361,7 +363,7 @@ void drawinfo_cab() {
   lcd1_s.drawRect(10, 130, 300, 20, WHITE);
   lcd1_s.fillRect(10, 130, map(Value_THL, 0, 100, 0, 300), 20, WHITE);
   lcd1_s.setCursor(10, 170);
-  lcd1_s.printf_P(PSTR("速度: %skm/h"), spdbuf);
+  lcd1_s.printf_P(PSTR("速度: %dkm/h"), spd);
   lcd1_s.drawRect(10, 210, 300, 20, WHITE);
   if (spd <= 10) {
     lcd1_s.fillRect(10, 210, 0, 20, WHITE);
@@ -386,15 +388,15 @@ void drawinfo_cab() {
 
 // Serial送信
 void pushSerial() {
-  Serial.printf_P(PSTR("%s,%s,%s,%s,%s\n"), labuf, lnbuf, spdbuf, altbuf, lobuf);
+  Serial.printf_P(PSTR("%s,%s,%s,%s\n"), labuf, lnbuf, spd, lobuf);
     t_Serial = millis();
 }
 
 // Ambientへ送信
 void pushAmbient() {
   if (WiFi.status() == WL_CONNECTED) {  //  Wi-Fi 接続できている場合
-    ambient.set(1, spdbuf);     // 1番目のデータとして速度をセット
-    ambient.set(2, altbuf);     // 2番目のデータとして標高をセット
+    ambient.set(1, spd);     // 1番目のデータとして速度をセット
+    ambient.set(2, spdave);     // 1番目のデータとして平均速度をセット
     ambient.set(3, Lapcount);   // 3番目のデータとしてラップ数をセット
     ambient.set(4, worktime);   // 4番目のデータとして走行時間(sec)をセット
     ambient.set(5, RPM);        // 5番目のデータとして回転数(rpm)をセット
@@ -424,9 +426,9 @@ void WriteSD(){
   if (logFile){
     logFile.printf_P(PSTR("%d/%d/%d %d:%d:%d"), year(), month(), day(), hour(), minute(), second());  // 0.日時
     logFile.print(F(","));
-    logFile.print(spdbuf);    // 1.速度
+    logFile.print(spd);    // 1.速度
     logFile.print(F(","));
-    logFile.print(altbuf);    // 2.標高
+    logFile.print(spdave);    // 2.平均速度
     logFile.print(F(","));
     logFile.print(Lapcount);  // 3.ラップ数
     logFile.print(F(","));
@@ -529,7 +531,7 @@ void setup()
           logFile.write(0xEF);                                                  // BOMを書き込む
           logFile.write(0xBB);                                                  // BOMを書き込む
           logFile.write(0xBF);                                                  // BOMを書き込む
-          logFile.println(F("created,速度(km/h),標高(m),ラップ数(周目),走行時間(秒),回転数(rpm),スロットル開度(%),概算空燃比, ,lat,lng,"));
+          logFile.println(F("created,速度(km/h),平均速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),スロットル開度(%),概算空燃比, ,lat,lng,"));
           logFile.close();                                                      // ファイルを閉じる
         }
         break;
@@ -599,7 +601,7 @@ void setup()
   //lcd2.setTextColor(WHITE);
   //lcd2.drawString("読み込み中...", lcd2.width()/2, lcd2.height()/2);
 
-  Serial.println(F("lat,lon,spd,alt"));
+  Serial.println(F("lat,lon,spd,spdave"));
 
   t_amb = millis();
   t_SD = millis();
