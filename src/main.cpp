@@ -9,6 +9,8 @@
 #include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 #define pi 3.141592653589793
 
@@ -18,6 +20,7 @@ static LGFX_Sprite lcd_s(&lcd);
 WiFiClient client;
 Ambient ambient;
 WiFiManager wifiManager;
+PubSubClient mqttclient(client);
 
 // 変数の定義
 // 画面表示
@@ -67,14 +70,25 @@ unsigned long t_Serial;           // Serialの送信時刻
 bool isWifiConfigSucceeded = false;  // WiFi設定が成功したかどうかのフラグ
 
 // ambient
+bool ambientpush = false;    // ambientへの送信 有効(true)/無効(false)
 //unsigned int channelId = 65530; // AmbientのチャネルID
 //const char* writeKey = "050985c9530d8eb0"; // ライトキー
 const char* userKey = "64bd5933d381952b59"; // ユーザーキー
 char devKey[20];
 unsigned int channelId;
 char writeKey[20];
-bool ambientpush = true;    // ambientへの送信 有効(true)/無効(false)
+
 unsigned long t_amb;        // Ambientへの送信時刻
+
+// MQTT
+bool MQTTpush = true;      // MQTT送信 有効(true)/無効(false)
+const char* mqtt_server = "furoshiki.asuscomm.com";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "Furoshiki/M5Logger";
+const char* mqtt_deviceID = "M5Core2";
+const char* mqtt_user = "todateman";
+const char* mqtt_password = "tomo8905";
+unsigned long t_MQTT;       // MQTT送信時刻
 
 // ログファイル
 bool LOGGING = true;        // ロギング有効/無効
@@ -144,7 +158,7 @@ void setupWiFi ()
     }
   }
   else {
-    if (ambientpush){
+    if (ambientpush || MQTTpush){
       showMessage("Wi-Fi接続中...");
 
       Serial.println("wifiManager.autoConnect()");
@@ -259,8 +273,11 @@ void drawinfo() {
   if (ambientpush) {
     lcd_s.drawString("Amb: O", 320,  15);
   }
-  else {
-    lcd_s.drawString("Amb: x", 320,  15);
+  if (MQTTpush) {
+    lcd_s.drawString("MQTT: O", 320,  15);
+  }
+  if(!ambientpush && !MQTTpush) {
+    lcd_s.drawString("Amb･MQTT: x", 320,  15);
   }
 
   // タイトル表示
@@ -471,6 +488,65 @@ void WriteSD(){
   t_SD = millis();
 }
 
+  // MQTT再接続
+void MQTTreconnect() {
+  uint8_t count = 0;
+  while (!mqttclient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (mqttclient.connect(mqtt_deviceID, mqtt_user, mqtt_password)) {
+      Serial.println("connected");
+      // 接続成功時にサブスクライブを設定
+      // mqttclient.subscribe("your/subscribe/topic");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttclient.state());
+      Serial.println(" try again in 5 seconds");
+
+      // 4回失敗したらMQTT送信を無効にする
+      count++;
+      if (count>=4) {
+        MQTTpush = false;
+        break;
+      }
+      delay(5000);
+    }
+  }
+}
+
+  // MQTT送信
+void pushMQTT(){
+  if (!mqttclient.connected()) {
+    MQTTreconnect();
+  }
+  if (!MQTTpush) {
+    return;
+  }
+  mqttclient.loop();
+
+  DynamicJsonDocument doc(512);
+  doc["Spd(GPS)"] = spd;
+  doc["Spd(PULSE)"] = speed;
+  doc["Lapcount"] = Lapcount;
+  doc["worktime"] = worktime;
+  doc["tachoRpm"] = tachoRpm;
+  doc["distance"] = distance;
+  doc["gasml"] = gasml;
+  doc["dispergas"] = dispergas;
+  doc["lat"] = la;
+  doc["lon"] = ln;
+
+  // JSONオブジェクトを文字列にシリアライズ
+  String jsonData;
+  serializeJson(doc, jsonData);
+
+  // MQTTでJSONデータを送信
+  if (mqttclient.connected()) {
+    mqttclient.publish(mqtt_topic, jsonData.c_str());
+  }
+
+  t_MQTT = millis();
+}
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -492,9 +568,10 @@ void setup() {
   lcd.setTextSize(1);
   lcd.setTextDatum( baseline_center );
 
-  // SDカードマウント待ち
-  if (LOGGING) {                                  // ロギング有効の場合
+  // ロギング有効の場合
+  if (LOGGING) {
     uint8_t i = 3;
+    // SDカードマウント待ち
     while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
       if (i <= 0){
         LOGGING = false;
@@ -514,7 +591,8 @@ void setup() {
     }
   }
 
-  if (LOGGING) {                                  // ロギング有効の場合
+  // ロギング有効の場合
+  if (LOGGING) {
     lcd.fillScreen(TFT_BLACK);
     //lcd_s.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
@@ -544,7 +622,8 @@ void setup() {
     }
   }
 
-  if (ambientpush) {             // ambientへの送信が有効の場合
+
+  if (ambientpush || MQTTpush){
     setupWiFi();
     /*
     WiFi.begin(ssid, password);  //  Wi-Fi APに接続
@@ -562,6 +641,10 @@ void setup() {
       delay(100);
     }
     */
+  }
+
+  // ambientへの送信が有効の場合
+  if (ambientpush) {
     if (isWifiConfigSucceeded){
       Serial.print("WiFi connected\r\nIP address: ");
       Serial.println(WiFi.localIP());
@@ -590,9 +673,21 @@ void setup() {
       
       ambient.begin(channelId, writeKey, &client); // 取得したチャネルIDとライトキーでAmbientの初期化
     }
+    else {
+      ambientpush = false;
+    }
   }
-  t_amb = millis();
-  
+
+  // MQTT送信が有効の場合
+  if(MQTTpush) {
+    if (isWifiConfigSucceeded){
+      mqttclient.setServer(mqtt_server, mqtt_port);
+    }
+    else{
+      MQTTpush = false;
+    }
+  }
+
   lcd.clear(TFT_BLACK);
   //lcd_s.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_WHITE);
@@ -602,6 +697,8 @@ void setup() {
 
   t_Serial = millis();
   t_SD = millis();
+  t_amb = millis();
+  t_MQTT = millis();
 
   lcd.clear(TFT_BLACK);
 }
@@ -621,6 +718,12 @@ void loop() {
   if (millis() - t_Serial >= 1 * 1000) {      // 1秒ごとにSerial送信
     if (Serial){
       pushSerial();
+    }
+  }
+
+  if (MQTTpush) {   
+    if (millis() - t_MQTT >= 1 * 1000) {     // 1秒ごとにMQTT送信
+      pushMQTT();
     }
   }
 
