@@ -529,6 +529,7 @@ void pushMQTT(){
   doc["dispergas"] = dispergas;
   doc["lat"] = la;
   doc["lon"] = ln;
+  doc["loc"] = loc;
 
   // JSONオブジェクトを文字列にシリアライズ
   String jsonData;
