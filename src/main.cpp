@@ -89,6 +89,7 @@ const char* mqtt_deviceID = "M5Core2";
 const char* mqtt_user = "todateman";
 const char* mqtt_password = "tomo8905";
 unsigned long t_MQTT;       // MQTT送信時刻
+#define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
 
 // ログファイル
 bool LOGGING = true;        // ロギング有効/無効
@@ -453,11 +454,11 @@ void pushAmbient() {
 }
 
 // SDに保存
-void WriteSD(){
+void WriteSD(String datetime){
   // ログファイルに書き込み
   logFile = SD.open(fileName, FILE_APPEND);
   if (logFile){
-    logFile.printf("%d/%d/%d %02d:%02d:%02d", year(), month(), day(), hour(), minute(), second());  // 0.日時
+    logFile.print(datetime);  // 0.日時
     logFile.print(F(","));
     //logFile.print(spd, 1);    // 1.速度(GPS)
     logFile.print(speed);     // 1.速度(車軸パルス)
@@ -488,7 +489,11 @@ void MQTTreconnect() {
   uint8_t count = 0;
   while (!mqttclient.connected()) {
     Serial.print("Attempting MQTT connection...");
-    if (mqttclient.connect(mqtt_deviceID, mqtt_user, mqtt_password)) {
+    char mqtt_deviceID_s[40];
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);  // Wi-FiのMACアドレスを取得する
+    sprintf(mqtt_deviceID_s, "%s_%02X%02X%02X%02X%02X%02X", mqtt_deviceID, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (mqttclient.connect(mqtt_deviceID_s, mqtt_user, mqtt_password)) {
       Serial.println("connected");
       // 接続成功時にサブスクライブを設定
       // mqttclient.subscribe("your/subscribe/topic");
@@ -509,7 +514,7 @@ void MQTTreconnect() {
 }
 
   // MQTT送信
-void pushMQTT(){
+void pushMQTT(String datetime){
   if (!mqttclient.connected()) {
     MQTTreconnect();
   }
@@ -519,6 +524,7 @@ void pushMQTT(){
   mqttclient.loop();
 
   StaticJsonDocument<512> doc;
+  doc["timestamp"] = datetime; 
   doc["Spd(GPS)"] = spd;
   doc["Spd(PULSE)"] = speed;
   doc["Lapcount"] = Lapcount;
@@ -529,7 +535,7 @@ void pushMQTT(){
   doc["dispergas"] = dispergas;
   doc["lat"] = la;
   doc["lon"] = ln;
-  doc["loc"] = loc;
+  doc["loc"] = Loc;
 
   // JSONオブジェクトを文字列にシリアライズ
   String jsonData;
@@ -677,7 +683,10 @@ void setup() {
   // MQTT送信が有効の場合
   if(MQTTpush) {
     if (isWifiConfigSucceeded){
+      mqttclient.setBufferSize(MQTT_BUFFER_SIZE);
       mqttclient.setServer(mqtt_server, mqtt_port);
+      //mqttclient.setCallback(mqttCallback);
+      pushMQTT("1970/01/01 01:01:01.00");
     }
     else{
       MQTTpush = false;
@@ -708,6 +717,10 @@ void loop() {
   // 位置情報を取得
   getGNSS();
 
+  // 日時を設定
+  char datetime[23];  // 2024/05/01 23:59:59.99
+  sprintf(datetime ,"%d/%d/%d %02d:%02d:%02d.%02d", year(), month(), day(), hour(), minute(), second(), gps.time.centisecond());
+
   // ディスプレイの表示モードを切り替えて表示
   if ( M5.BtnB.isPressed() ) { drawinfo(m_drive); }    // Bボタンを押した場合: 速度/周回数/走行時間
   if ( M5.BtnA.isPressed() ) { drawinfo(m_engine); }   // Aボタンを押した場合: 回転数/燃料噴射時間
@@ -719,21 +732,29 @@ void loop() {
     }
   }
 
-  if (MQTTpush) {   
-    if (millis() - t_MQTT >= 1 * 1000) {     // 1秒ごとにMQTT送信
-      pushMQTT();
+  if (LOGGING) {                          // ロギング有効の場合
+    if (millis() - t_SD >= 1 * 1000) {      // 1秒ごとにSDへ記録
+      WriteSD(datetime);
     }
+  }
+
+  if (MQTTpush) {
+    if (worktime == 0) {                        // 走行開始前
+      if (millis() - t_MQTT >= 10 * 1000) {       // 10秒ごとにMQTT送信
+        pushMQTT(datetime);
+      }
+    }
+    else {                                      // 走行開始後
+      if (millis() - t_MQTT >= 1 * 1000) {        // 1秒ごとにMQTT送信
+        pushMQTT(datetime);
+      }
+    }
+
   }
 
   if (ambientpush) {                      // ambientへの送信が有効の場合
     if (millis() - t_amb >= 10 * 1000) {    // 10秒ごとにAmbientへ送信
       pushAmbient();
-    }
-  }
-
-  if (LOGGING) {                          // ロギング有効の場合
-    if (millis() - t_SD >= 1 * 1000) {      // 1秒ごとにSDへ記録
-      WriteSD();
     }
   }
 
