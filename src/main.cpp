@@ -97,7 +97,8 @@ File logFile;
 char fileName[20];          // ファイル名
 int fileNum = 0;            // ファイル連番
 unsigned long t_SD;         // SDの記録時刻
-#define time_offset 32400   // UTC+9時間(60*60*9 秒）
+const int time_offset = 32400;   // UTC+9時間(60*60*9 秒）
+char datetime[23];  // 2024/05/01 23:59:59.99
 
 TinyGPSPlus gps;
 
@@ -222,15 +223,11 @@ void getGNSS() {
           la         = gps.location.lat();
           ln         = gps.location.lng();
           spd        = gps.speed.kmph();
-          uint8_t jst_day    = gps.date.day();
-          uint8_t jst_month  = gps.date.month();
-          uint8_t jst_year   = gps.date.year();
-          uint8_t jst_hour   = gps.time.hour();
-          uint8_t jst_minute = gps.time.minute();
-          uint8_t jst_second = gps.time.second();
-          setTime(jst_hour, jst_minute, jst_second, jst_day, jst_month, jst_year);
+          uint8_t csec = gps.time.centisecond();
+          setTime(gps.time.hour(), gps.time.minute(),gps.time.second(), gps.date.day(), gps.date.month(), gps.date.year());
           // JST変換
           adjustTime(time_offset);
+          sprintf(datetime ,"%d/%d/%d %02d:%02d:%02d.%02d", year(), month(), day(), hour(), minute(), second(), csec);
         }
         break;
       }
@@ -454,7 +451,7 @@ void pushAmbient() {
 }
 
 // SDに保存
-void WriteSD(String datetime){
+void WriteSD(){
   // ログファイルに書き込み
   logFile = SD.open(fileName, FILE_APPEND);
   if (logFile){
@@ -514,7 +511,7 @@ void MQTTreconnect() {
 }
 
   // MQTT送信
-void pushMQTT(String datetime){
+void pushMQTT(){
   if (!mqttclient.connected()) {
     MQTTreconnect();
   }
@@ -686,7 +683,7 @@ void setup() {
       mqttclient.setBufferSize(MQTT_BUFFER_SIZE);
       mqttclient.setServer(mqtt_server, mqtt_port);
       //mqttclient.setCallback(mqttCallback);
-      pushMQTT("1970/01/01 01:01:01.00");
+      pushMQTT();
     }
     else{
       MQTTpush = false;
@@ -717,10 +714,6 @@ void loop() {
   // 位置情報を取得
   getGNSS();
 
-  // 日時を設定
-  char datetime[23];  // 2024/05/01 23:59:59.99
-  sprintf(datetime ,"%d/%d/%d %02d:%02d:%02d.%02d", year(), month(), day(), hour(), minute(), second(), gps.time.centisecond());
-
   // ディスプレイの表示モードを切り替えて表示
   if ( M5.BtnB.isPressed() ) { drawinfo(m_drive); }    // Bボタンを押した場合: 速度/周回数/走行時間
   if ( M5.BtnA.isPressed() ) { drawinfo(m_engine); }   // Aボタンを押した場合: 回転数/燃料噴射時間
@@ -734,19 +727,19 @@ void loop() {
 
   if (LOGGING) {                          // ロギング有効の場合
     if (millis() - t_SD >= 1 * 1000) {      // 1秒ごとにSDへ記録
-      WriteSD(datetime);
+      WriteSD();
     }
   }
 
   if (MQTTpush) {
     if (worktime == 0) {                        // 走行開始前
       if (millis() - t_MQTT >= 10 * 1000) {       // 10秒ごとにMQTT送信
-        pushMQTT(datetime);
+        pushMQTT();
       }
     }
     else {                                      // 走行開始後
       if (millis() - t_MQTT >= 1 * 1000) {        // 1秒ごとにMQTT送信
-        pushMQTT(datetime);
+        pushMQTT();
       }
     }
 
