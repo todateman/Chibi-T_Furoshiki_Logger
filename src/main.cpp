@@ -97,7 +97,7 @@ File logFile;
 char fileName[20];          // ファイル名
 int fileNum = 0;            // ファイル連番
 unsigned long t_SD;         // SDの記録時刻
-const int time_offset = 32400;   // UTC+9時間(60*60*9 秒）
+const int time_offset = 9;   // UTC+9時間
 char datetime[23];  // 2024/05/01 23:59:59.99
 
 TinyGPSPlus gps;
@@ -144,6 +144,7 @@ void setupWiFi ()
     }
     else if (M5.BtnC.isPressed()) {
       ambientpush = false;
+      MQTTpush = false;
       break;
     }
     delay(10);
@@ -217,17 +218,55 @@ void readSerialECU() {
 void getGNSS() {
   while (Serial2.available() > 0) {
     if (gps.encode(Serial2.read())) {
-      if (gps.location.isUpdated()) {
+      if (gps.time.isUpdated()) {
         // 経度緯度速度を取得
         if (gps.location.lng() > 120) {  // 東経120度の場合(異常値を除外するため)
           la         = gps.location.lat();
           ln         = gps.location.lng();
           spd        = gps.speed.kmph();
-          uint8_t csec = gps.time.centisecond();
-          setTime(gps.time.hour(), gps.time.minute(),gps.time.second(), gps.date.day(), gps.date.month(), gps.date.year());
+          uint8_t gnss_day    = gps.date.day();
+          uint8_t gnss_month  = gps.date.month();
+          uint8_t gnss_year   = gps.date.year();
+          uint8_t gnss_hour   = gps.time.hour();
+          uint8_t gnss_minute = gps.time.minute();
+          uint8_t gnss_second = gps.time.second();
+          uint8_t gnss_csec = gps.time.centisecond();
+          
           // JST変換
-          adjustTime(time_offset);
-          sprintf(datetime ,"%d/%d/%d %02d:%02d:%02d.%02d", year(), month(), day(), hour(), minute(), second(), csec);
+          gnss_hour = gnss_hour + time_offset;
+          if (gnss_hour > 23) {  // 時間が日付を超える場合
+            gnss_hour -= 24;
+            gnss_day++;
+            if (gnss_month == 2){  // ２月の場合
+              if ( (gnss_year % 4) == 0 ) {
+                if(gnss_day > 28) {
+                  gnss_day = 1;
+                  gnss_month++;
+                }
+              } else {
+                if(gnss_day > 29) {
+                  gnss_day = 1;
+                  gnss_month++;
+                }              
+              }
+            }else if ((gnss_month % 2) == 0){ // ２月以外の偶数月の場合
+              if ( gnss_day > 30 ){
+                gnss_day = 1;
+                gnss_month++;
+                if ( gnss_month > 12 ){
+                  gnss_year++;
+                }
+              }      
+            }else{  //　奇数月の場合
+              if ( gnss_day > 31 ){
+                gnss_day = 1;
+                gnss_month++;          
+              }
+            }
+          }
+
+          setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
+          sprintf_P(datetime , PSTR("%d/%d/%d %02d:%02d:%02d.%02d"), year(), month(), day(), hour(), minute(), second(), gnss_csec);
         }
         break;
       }
