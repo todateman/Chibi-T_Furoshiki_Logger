@@ -23,8 +23,8 @@ WiFiManager wifiManager;
 PubSubClient mqttclient(client);
 
 // 変数の定義
-// 画面表示モード
-enum dispmode {m_drive, m_engine, m_fuel};
+// 画面表示
+uint8_t dispmode = 0;             // ディスプレイの表示モード(0:速度/周回数/走行時間 1:回転数/燃料噴射時間/進角角度 2:速度/回転数/燃費)
 
 // ECU
 unsigned long receiveECUtime = 0; // ECUからデータを受信した時間
@@ -250,8 +250,13 @@ void getGNSS() {
 }
 
 // ディスプレイに表示
-void drawinfo(enum dispmode disp) {
+void drawinfo() {
   lcd_s.fillScreen(TFT_BLACK);
+
+  // ディスプレイの表示モードを設定(0:速度/周回数/走行時間 1:回転数/燃料噴射時間/進角角度 2:速度/回転数/燃費)
+  if ( M5.BtnB.isPressed() ) { dispmode = 0; }    // Bボタンを押した場合
+  if ( M5.BtnA.isPressed() ) { dispmode = 1; }    // Aボタンを押した場合
+  if ( M5.BtnC.isPressed() ) { dispmode = 2; }    // Cボタンを押した場合
 
   // 記録ステータス表示
   lcd_s.setFont(&fonts::lgfxJapanGothicP_16);       // フォントを指定
@@ -278,15 +283,15 @@ void drawinfo(enum dispmode disp) {
   lcd_s.setTextSize(1);                             // フォントの拡大率
   lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
   //lcd_s.setTextColor(TFT_WHITE);                    // 文字色を指定
-  if (disp == m_drive ) {                           // ディスプレイ表示モードが運転画面の場合
+  if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
     lcd_s.drawString("速度(km/h):", 10,  50);         // タイトルを表示
     lcd_s.drawString("残り周回数:", 10, 130);         // タイトルを表示
     lcd_s.drawString("走行時間:", 10,  210);          // タイトルを表示
-  } else if (disp == m_engine ) {                   // ディスプレイ表示モードがエンジン画面の場合
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
     lcd_s.drawString("回転数(rpm):", 10,  50);        // タイトルを表示
     lcd_s.drawString("噴射時間(ms):", 10, 130);       // タイトルを表示
     lcd_s.drawString("進角角度(CA):", 10,  210);      // タイトルを表示
-  } else if (disp == m_fuel ) {                     // ディスプレイ表示モードが2の場合
+  } else if (dispmode == 2 ) {                      // ディスプレイ表示モードが2の場合
     lcd_s.drawString("速度(km/h):", 10,  50);         // タイトルを表示
     lcd_s.drawString("回転数(rpm):", 10, 130);        // タイトルを表示
     lcd_s.drawString("燃費(km/l):", 10,  210);        // タイトルを表示
@@ -297,12 +302,12 @@ void drawinfo(enum dispmode disp) {
   lcd_s.setTextSize(1);                             // フォントの拡大率
   lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
   lcd_s.setCursor(140, 50);                         // 表示位置を指定
-  if (disp == m_drive || disp == m_fuel ) {         // ディスプレイ表示モードが運転画面,燃費画面の場合
+  if (dispmode == 0 || dispmode == 2 ) {            // ディスプレイ表示モードが0,2の場合
     lcd_s.print(speed);                               // 速度(km/h)
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);        // グラフの外枠を表示
     lcd_s.fillRect(10, 55, map(speed, 0, 45, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(speed, 0, 45, 10, 310), 55, map(speed, 0, 45, 300, 0), 10, TFT_BLACK);
-  } else if (disp == m_engine ) {                   // ディスプレイ表示モードがエンジン画面の場合
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
     lcd_s.print(tachoRpm);                            // 回転数(rpm)
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);        // グラフの外枠を表示
     lcd_s.fillRect(10, 55, map(tachoRpm, 0, 6500, 0, 300), 10, TFT_WHITE);
@@ -310,7 +315,7 @@ void drawinfo(enum dispmode disp) {
   } 
 
   // 2番目の表示
-  if (disp == m_drive ) {                           // ディスプレイ表示モードが運転画面の場合
+  if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
     uint8_t restlaps = totallaps - Lapcount;          // 残り周回数
     if (restlaps > 1){                                // 残り2周までの場合
       lcd_s.setFont(&fonts::Font7);                     // フォントを指定
@@ -343,7 +348,7 @@ void drawinfo(enum dispmode disp) {
       lcd_s.setCursor((300 * i / totallaps) + 7, 147);    // 表示位置を指定
       lcd_s.print(i);                                     // 軸を表示
     }
-  } else if (disp == m_engine ) {                   // ディスプレイ表示モードがエンジン画面の場合
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
     lcd_s.setFont(&fonts::Font7);                     // フォントを指定
     lcd_s.setTextSize(1);                             // フォントの拡大率
     lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
@@ -352,7 +357,7 @@ void drawinfo(enum dispmode disp) {
     lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);       // グラフの外枠を表示
     lcd_s.fillRect(10, 135, map(INJ_timems, 0, 10, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(INJ_timems, 0, 10, 10, 310), 135, map(INJ_timems, 0, 10, 300, 0), 10, TFT_BLACK);
-  } else if (disp == m_fuel ) {                     // ディスプレイ表示モードが燃費画面の場合
+  } else if (dispmode == 2 ) {                      // ディスプレイ表示モードが2の場合
     lcd_s.setFont(&fonts::Font7);                     // フォントを指定
     lcd_s.setTextSize(1);                             // フォントの拡大率
     lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
@@ -368,19 +373,19 @@ void drawinfo(enum dispmode disp) {
   lcd_s.setTextSize(1);                             // フォントの拡大率
   lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
   lcd_s.setCursor(140, 210);                        // 表示位置を指定
-  if (disp == m_drive ) {                           // ディスプレイ表示モードが運転画面の場合
+  if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
     uint8_t workmin = worktime / 60;                  // 走行時間を分の部分
     uint8_t worksec = worktime % 60;                  // 走行時間の秒の部分
     lcd_s.printf("%02d:%02d", workmin, worksec);      // 走行時間(mm:ss)
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
     lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
     lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
-  } else if (disp == m_engine ) {                   // ディスプレイ表示モードが1の場合
+  } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
     lcd_s.print(IGN_CA);                              // 進角角度(CA)
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
     lcd_s.fillRect(10, 215, map(IGN_CA, 0, 90, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(IGN_CA, 0, 90, 10, 310), 215, map(IGN_CA, 0, 90, 300, 0), 10, TFT_BLACK);
-  } else if (disp == m_fuel ) {                     // ディスプレイ表示モードが2の場合
+  } else if (dispmode == 2 ) {                      // ディスプレイ表示モードが2の場合
     lcd_s.print(dispergas, 1);                        // 燃費(km/l)
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
     lcd_s.fillRect(10, 215, map(dispergas, 0, 2000, 0, 300), 10, TFT_WHITE);
@@ -714,10 +719,8 @@ void loop() {
   // 位置情報を取得
   getGNSS();
 
-  // ディスプレイの表示モードを切り替えて表示
-  if ( M5.BtnB.isPressed() ) { drawinfo(m_drive); }    // Bボタンを押した場合: 速度/周回数/走行時間
-  if ( M5.BtnA.isPressed() ) { drawinfo(m_engine); }   // Aボタンを押した場合: 回転数/燃料噴射時間
-  if ( M5.BtnC.isPressed() ) { drawinfo(m_fuel); }     // Cボタンを押した場合: 速度/回転数/燃費
+  // ディスプレイ表示
+  drawinfo();
 
   if (millis() - t_Serial >= 1 * 1000) {      // 1秒ごとにSerial送信
     if (Serial){
