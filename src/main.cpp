@@ -9,15 +9,19 @@
 #include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "secrets.h"
 
 #define pi 3.141592653589793
 
 static M5GFX lcd;
 static LGFX_Sprite lcd_s(&lcd);
 
-WiFiClient client;
+//WiFiClient client;
+WiFiClientSecure client;
 Ambient ambient;
 WiFiManager wifiManager;
 PubSubClient mqttclient(client);
@@ -65,15 +69,10 @@ String Loc = "";
 unsigned long t_Serial;           // Serialの送信時刻
 
 // Wi-Fi
-// const char* ssid = "****";  // Wi-Fi SSID
-// const char* password = "****";  // Wi-Fi Password
 bool isWifiConfigSucceeded = false;  // WiFi設定が成功したかどうかのフラグ
 
 // ambient
 bool ambientpush = false;    // ambientへの送信 有効(true)/無効(false)
-//unsigned int channelId = 65530; // AmbientのチャネルID
-//const char* writeKey = "050985c9530d8eb0"; // ライトキー
-const char* userKey = "64bd5933d381952b59"; // ユーザーキー
 char devKey[20];
 unsigned int channelId;
 char writeKey[20];
@@ -81,14 +80,12 @@ char writeKey[20];
 unsigned long t_amb;        // Ambientへの送信時刻
 
 // MQTT
-bool MQTTpush = true;      // MQTT送信 有効(true)/無効(false)
-const char* mqtt_server = "furoshiki.asuscomm.com";
-const int mqtt_port = 1883;
+bool MQTTpush = true;         // MQTT送信 有効(true)/無効(false)
+// const int mqtt_port = 1883;
+const int mqtt_port = 8883;
 const char* mqtt_topic = "Furoshiki/M5Logger";
-const char* mqtt_deviceID = "M5Core2";
-const char* mqtt_user = "todateman";
-const char* mqtt_password = "tomo8905";
-unsigned long t_MQTT;       // MQTT送信時刻
+const char* mqtt_deviceID = "M5Core2_Furoshiki";
+unsigned long t_MQTT;         // MQTT送信時刻
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
 
 // ログファイル
@@ -173,6 +170,8 @@ void setupWiFi ()
       else {
         Serial.println("autoConnect() connect failed!");
         showMessage("Wi-Fi接続失敗.");
+        ambientpush = false;
+        MQTTpush = false;
       }
     }
     else {
@@ -525,16 +524,13 @@ void WriteSD(){
   t_SD = millis();
 }
 
-  // MQTT再接続
+// MQTT再接続
 void MQTTreconnect() {
   uint8_t count = 0;
   while (!mqttclient.connected()) {
     Serial.print("Attempting MQTT connection...");
-    char mqtt_deviceID_s[40];
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);  // Wi-FiのMACアドレスを取得する
-    sprintf(mqtt_deviceID_s, "%s_%02X%02X%02X%02X%02X%02X", mqtt_deviceID, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    if (mqttclient.connect(mqtt_deviceID_s, mqtt_user, mqtt_password)) {
+    // if (mqttclient.connect(mqtt_deviceID, mqtt_user, mqtt_password)) {
+    if (mqttclient.connect(mqtt_deviceID)) {
       Serial.println("connected");
       // 接続成功時にサブスクライブを設定
       // mqttclient.subscribe("your/subscribe/topic");
@@ -554,7 +550,7 @@ void MQTTreconnect() {
   }
 }
 
-  // MQTT送信
+// MQTT送信
 void pushMQTT(){
   if (!mqttclient.connected()) {
     MQTTreconnect();
@@ -566,8 +562,8 @@ void pushMQTT(){
 
   StaticJsonDocument<512> doc;
   doc["timestamp"] = datetime; 
-  doc["Spd(GPS)"] = spd;
-  doc["Spd(PULSE)"] = speed;
+  doc["Spd_GPS"] = spd;
+  doc["Spd_PULSE"] = speed;
   doc["Lapcount"] = Lapcount;
   doc["worktime"] = worktime;
   doc["tachoRpm"] = tachoRpm;
@@ -725,12 +721,17 @@ void setup() {
   if(MQTTpush) {
     if (isWifiConfigSucceeded){
       mqttclient.setBufferSize(MQTT_BUFFER_SIZE);
+      client.setCACert(AWS_CERT_CA);
+      client.setCertificate(AWS_CERT_CRT);
+      client.setPrivateKey(AWS_CERT_PRIVATE);
       mqttclient.setServer(mqtt_server, mqtt_port);
       //mqttclient.setCallback(mqttCallback);
       pushMQTT();
     }
     else{
       MQTTpush = false;
+      showMessage("AWS IoT Core 接続失敗");
+      delay(1000);
     }
   }
 
