@@ -272,7 +272,7 @@ void getGNSS() {
     }    
   }
 
-  if ( la >= 34.839027 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.543319 ) {
+  if ( la >= 34.837989 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.544450 ) {
     Loc = "su";
     totallaps = totallaps_su;
     goal = goal_su;
