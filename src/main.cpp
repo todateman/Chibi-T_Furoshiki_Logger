@@ -14,6 +14,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "secrets.h"
+#include "SoftwareSerial.h"
 
 #define pi 3.141592653589793
 
@@ -43,6 +44,7 @@ uint16_t Lapcount = 0;            // 現在の周回数
 uint8_t totallaps = 3;            // トータル周回数
 uint16_t goal = 1000;             // 総走行距離(m)
 uint16_t limittime = 100;         // 規定時間(sec)
+float EngTemp = 0.0;              // エンジン温度(C)
 const uint8_t totallaps_su = 8;   // 鈴鹿のトータル周回数
 const uint8_t totallaps_mo = 7;   // 茂木のトータル周回数
 const uint16_t goal_su = 17616;   // 鈴鹿の総走行距離(m)
@@ -52,6 +54,7 @@ const uint16_t limittime_mo = 2360; // 茂木の規定時間(39分20秒 = 2360se
 uint16_t worktime = 0;            // 走行時間(sec)
 
 // GPS
+TinyGPSPlus gps;
 double goal_la_su = 34.842925;    // 鈴鹿サーキットスタートライン
 double goal_ln_su = 136.540692;   // 鈴鹿サーキットスタートライン
 //double goal_la_mo = 36.532770;  // ツインリンクもてぎオーバルコーススタートライン
@@ -97,7 +100,10 @@ unsigned long t_SD;         // SDの記録時刻
 const int time_offset = 9;   // UTC+9時間
 char datetime[23];  // 2024/05/01 23:59:59.99
 
-TinyGPSPlus gps;
+// SoftwareSerial
+#define rxPin 33   // SCL
+#define txPin 32   // SCA
+SoftwareSerial Serial3;
 
 
 // LCD画面にメッセージを表示する
@@ -177,6 +183,16 @@ void setupWiFi ()
     else {
       showMessage("Wi-Fi接続無効.");
     }
+  }
+}
+
+// BLEからのデータをM5NanoC6経由で読み込み・表示
+void readBLE2UART() {
+  if (Serial3.available()){
+    String str = Serial3.readStringUntil('\n');   // Serial3から改行コード"CRLF"まで読み込む
+    str.trim();                                   // Serial3から読み込んだデータの両端の空白、改行、タブなどを取り除く
+    //Serial.println(str);
+    EngTemp = str.toFloat();                      // エンジン温度(C)
   }
 }
 
@@ -456,7 +472,9 @@ void pushSerial() {
   Serial.print(F(","));
   Serial.print(dispergas, 1);
   Serial.print(F(","));
-  Serial.println(worktime);
+  Serial.print(worktime);
+  Serial.print(F(","));
+  Serial.println(EngTemp);
 
   t_Serial = millis();
 }
@@ -468,7 +486,8 @@ void pushAmbient() {
 
     char buf[16];
     ambient.set(1, spd);        // 1番目のデータとして速度をセット(GPS)
-    ambient.set(2, speed);      // 2番目のデータとして速度をセット(車軸パルス)
+    //ambient.set(2, speed);      // 2番目のデータとして速度をセット(車軸パルス)
+    ambient.set(2, EngTemp);    // 2番目のデータとしてエンジン温度をセット
     ambient.set(3, Lapcount);   // 3番目のデータとしてラップ数をセット
     ambient.set(4, worktime);   // 4番目のデータとして走行時間(sec)をセット
     ambient.set(5, tachoRpm);   // 5番目のデータとしてエンジン回転数(rpm)をセット
@@ -515,9 +534,11 @@ void WriteSD(){
     logFile.print(F(","));
     logFile.print(dispergas, 1); // 7.燃費(km/l)
     logFile.print(F(","));
-    logFile.print(la, 7);     // 8.緯度
+    logFile.print(la, 7);        // 8.緯度
     logFile.print(F(","));
-    logFile.println(ln, 7);   // 9.経度
+    logFile.print(ln, 7);        // 9.経度
+    logFile.print(F(","));
+    logFile.println(EngTemp, 2);    // 10.エンジン温度(C)
   }
   logFile.close();
 
@@ -573,6 +594,7 @@ void pushMQTT(){
   doc["lat"] = la;
   doc["lon"] = ln;
   doc["loc"] = Loc;
+  doc["Temp"] = EngTemp;
 
   // JSONオブジェクトを文字列にシリアライズ
   String jsonData;
@@ -591,8 +613,11 @@ void setup() {
   M5.begin(cfg);
 
   Serial.begin(115200);                           // PCへのモニタリング用Serial
-  Serial1.begin(115200, SERIAL_8N1, 27, 19);      // ECUとの通信用Serial(PortE TX=E2=G27, RX=E1=G19)
+  Serial1.begin(115200, SERIAL_8N1, 27, 19);      // ECUとの通信用Serial(PortE TX=E1=G19, RX=E2=G27)
   Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC TX=G14, RX=G13)
+  pinMode(rxPin, INPUT);
+  pinMode(txPin, OUTPUT);
+  Serial3.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);   // M5NanoC6からの受信用Serial(PortA TX=G32, RX=G33)
   
   lcd.init();                                     // TFTディスプレイの初期化
   lcd.setRotation(1);                             // 回転方向を 0～3 の4方向から設定します。(4～7を使用すると上下反転になります。)
@@ -652,7 +677,7 @@ void setup() {
           logFile.write(0xEF);                                                  // BOMを書き込む
           logFile.write(0xBB);                                                  // BOMを書き込む
           logFile.write(0xBF);                                                  // BOMを書き込む
-          logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),"));
+          logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),温度(C)"));
           logFile.close();                                                      // ファイルを閉じる
         }
         break;
@@ -740,7 +765,7 @@ void setup() {
   lcd.setTextColor(TFT_WHITE);
   lcd.drawString("読み込み中...", lcd.width()/2, lcd.height()/2);
 
-  Serial.println(F("lat, lon, loc, km/h, rpm, km/h, km, ml, km/l, worktime"));
+  Serial.println(F("lat, lon, loc, km/h, rpm, km/h, km, ml, km/l, worktime, temp"));
 
   t_Serial = millis();
   t_SD = millis();
@@ -752,6 +777,9 @@ void setup() {
 
 void loop() {
   M5.update();
+
+  // BLEからのデータをM5NanoC6経由で読み込み・表示
+  readBLE2UART();
 
   // ECUからのデータを読み込み・表示
   readSerialECU();
@@ -785,7 +813,6 @@ void loop() {
         pushMQTT();
       }
     }
-
   }
 
   if (ambientpush) {                      // ambientへの送信が有効の場合
