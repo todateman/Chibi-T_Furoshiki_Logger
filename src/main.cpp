@@ -3,7 +3,8 @@
 
 #include <Arduino.h>
 #include <TinyGPS++.h>
-#include "SD.h"
+#include "SdFat.h"
+#include "sdios.h"
 #include <M5UnitLCD.h>
 #include <M5Unified.h>
 #include "Ambient.h"
@@ -20,6 +21,10 @@
 
 static M5GFX lcd;
 static LGFX_Sprite lcd_s(&lcd);
+
+// SDfatの設定
+#define SPI_SPEED SD_SCK_MHZ(25) // MHz: OK 4, 10, 20, 25  ->  too much: 29, 30, 40, 50 causes errors
+#define SD_CONFIG SdSpiConfig(GPIO_NUM_4, SHARED_SPI, SPI_SPEED) // TFCARD_CS_PIN is defined in M5Stack Config.h (Pin 4)
 
 //WiFiClient client;
 WiFiClientSecure client;
@@ -92,8 +97,20 @@ unsigned long t_MQTT;         // MQTT送信時刻
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
 
 // ログファイル
+#if SDFAT_FILE_TYPE == 0
+typedef File file_t;
+#elif SDFAT_FILE_TYPE == 1
+typedef File32 file_t;
+#elif SDFAT_FILE_TYPE == 2
+typedef ExFile file_t;
+#elif SDFAT_FILE_TYPE == 3
+typedef FsFile file_t;
+#else
+#error Invalid SDFAT_FILE_TYPE
+#endif
+SdFat sd;
+file_t logFile;
 bool LOGGING = true;        // ロギング有効/無効
-File logFile;
 char fileName[20];          // ファイル名
 int fileNum = 0;            // ファイル連番
 unsigned long t_SD;         // SDの記録時刻
@@ -101,8 +118,8 @@ const int time_offset = 9;   // UTC+9時間
 char datetime[23];  // 2024/05/01 23:59:59.99
 
 // SoftwareSerial
-#define rxPin 33   // SCL
-#define txPin 32   // SCA
+#define rxPin 32   // SCA
+#define txPin 33   // SCL
 SoftwareSerial Serial3;
 
 
@@ -515,8 +532,9 @@ void pushAmbient() {
 // SDに保存
 void WriteSD(){
   // ログファイルに書き込み
-  logFile = SD.open(fileName, FILE_APPEND);
+  logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
   if (logFile){
+    logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());   // ファイル更新のタイムスタンプを設定
     logFile.print(datetime);  // 0.日時
     logFile.print(F(","));
     //logFile.print(spd, 1);    // 1.速度(GPS)
@@ -615,10 +633,8 @@ void setup() {
   Serial.begin(115200);                           // PCへのモニタリング用Serial
   Serial1.begin(115200, SERIAL_8N1, 27, 19);      // ECUとの通信用Serial(PortE TX=E1=G19, RX=E2=G27)
   Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC TX=G14, RX=G13)
-  pinMode(rxPin, INPUT);
-  pinMode(txPin, OUTPUT);
-  Serial3.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);   // M5NanoC6からの受信用Serial(PortA TX=G32, RX=G33)
-  
+  Serial3.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);   // M5NanoC6からの受信用Serial(PortA TX=G33, RX=G32)
+
   lcd.init();                                     // TFTディスプレイの初期化
   lcd.setRotation(1);                             // 回転方向を 0～3 の4方向から設定します。(4～7を使用すると上下反転になります。)
   lcd.setBrightness(128);                         // バックライトの輝度を 0～255 の範囲で設定します。
@@ -636,7 +652,7 @@ void setup() {
   if (LOGGING) {
     uint8_t i = 3;
     // SDカードマウント待ち
-    while (false == SD.begin(GPIO_NUM_4, SPI, 15000000)) {
+    while (false == sd.begin(SD_CONFIG)) {
       if (i <= 0){
         LOGGING = false;
         break;
@@ -662,18 +678,19 @@ void setup() {
     lcd.setTextColor(TFT_WHITE);
 
     // SD内にLOGディレクトリがない場合はLOGディレクトリを作成する
-    if(!SD.exists("/LOG")) {
-      if(SD.mkdir("/LOG"));
+    if(!sd.exists("/LOG")) {
+      if(sd.mkdir("/LOG"));
       lcd.drawString("ログディレクトリ作成中...", lcd.width()/2, lcd.height()/2 - 10);
     }
     // microSD内のファイル名の連番を決定
     lcd.drawString("ログファイル作成中...", lcd.width()/2, lcd.height()/2 + 10);
-    while(1){      
-      sprintf(fileName, "/LOG/LOG%04d.CSV", fileNum);
-      if(!SD.exists(fileName)) {
+    while(1){  
+      snprintf(fileName, sizeof(fileName), "/LOG/LOG%04d.CSV", fileNum);    
+      if(!sd.exists(fileName)) {
         Serial.println(fileName);
-        logFile = SD.open(fileName, FILE_APPEND);
+        logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
         if (logFile){
+          logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59); // ファイル作成のタイムスタンプを設定
           logFile.write(0xEF);                                                  // BOMを書き込む
           logFile.write(0xBB);                                                  // BOMを書き込む
           logFile.write(0xBF);                                                  // BOMを書き込む
