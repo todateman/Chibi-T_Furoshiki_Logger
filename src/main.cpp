@@ -118,8 +118,8 @@ const int time_offset = 9;   // UTC+9時間
 char datetime[23];  // 2024/05/01 23:59:59.99
 
 // SoftwareSerial
-#define rxPin 33   // SCL
-#define txPin 32   // SCA
+#define rxPin 32   // SCA
+#define txPin 33   // SCL
 SoftwareSerial Serial3;
 
 
@@ -633,10 +633,8 @@ void setup() {
   Serial.begin(115200);                           // PCへのモニタリング用Serial
   Serial1.begin(115200, SERIAL_8N1, 27, 19);      // ECUとの通信用Serial(PortE TX=E1=G19, RX=E2=G27)
   Serial2.begin(115200);                          // GNSSからの受信用Serial(PortC TX=G14, RX=G13)
-  pinMode(rxPin, INPUT);
-  pinMode(txPin, OUTPUT);
-  Serial3.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);   // M5NanoC6からの受信用Serial(PortA TX=G32, RX=G33)
-  
+  Serial3.begin(115200, SWSERIAL_8N1, rxPin, txPin , false, 256);   // M5NanoC6からの受信用Serial(PortA TX=G33, RX=G32)
+
   lcd.init();                                     // TFTディスプレイの初期化
   lcd.setRotation(1);                             // 回転方向を 0～3 の4方向から設定します。(4～7を使用すると上下反転になります。)
   lcd.setBrightness(128);                         // バックライトの輝度を 0～255 の範囲で設定します。
