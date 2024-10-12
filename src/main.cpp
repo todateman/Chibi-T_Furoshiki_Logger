@@ -310,7 +310,7 @@ void getGNSS() {
     totallaps = totallaps_su;
     goal = goal_su;
     limittime = limittime_su;
-  } else if ( la >= 36.528477 && la <= 36.53735 && ln >= 140.224726 && ln <= 140.23853 ) {
+  } else if ( la >= 36.528477 && la <= 36.538522 && ln >= 140.2192761 && ln <= 140.23853 ) {
     Loc = "mo";
     totallaps = totallaps_mo;
     goal = goal_mo;
