@@ -455,19 +455,19 @@ void drawinfo() {
   if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
     uint8_t workmin = worktime / 60;                  // 走行時間を分の部分
     uint8_t worksec = worktime % 60;                  // 走行時間の秒の部分
-    if ( map(distance, 0, goal, 300, 0) < map(worktime, 0, limittime, 300, 0) ) {   // 時間切れの恐れがなければ
+    if ( map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0) ) {   // 時間切れの恐れがなければ
       lcd_s.setTextColor(TFT_WHITE);
     }
     else {                                                                          // 時間切れの恐れがあれば
-      lcd_s.setTextColor(TFT_RED);
+      lcd_s.setTextColor(TFT_MAGENTA);
     }
     lcd_s.printf("%02d:%02d", workmin, worksec);      // 走行時間(mm:ss)
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
-    if ( map(distance, 0, goal, 300, 0) < map(worktime, 0, limittime, 300, 0) ) {   // 時間切れの恐れがなければ
+    if ( map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0) ) {   // 時間切れの恐れがなければ
       lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
     }
     else {                                                                          // 時間切れの恐れがあれば
-      lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_RED);
+      lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_MAGENTA);
     }
     lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
   } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
@@ -659,10 +659,8 @@ void setup() {
   lcd.setBrightness(128);                         // バックライトの輝度を 0～255 の範囲で設定します。
   lcd.fillScreen(TFT_BLACK);                      // 背景色で塗りつぶし
 
-  lcd_s.setColorDepth(2);                         // 2色モード
-  lcd_s.createSprite(lcd.width(), lcd.height());  // スプライトの作成
-  lcd_s.setPaletteColor(1, TFT_WHITE);            // カラーパレット1番を白に設定
-  lcd_s.setPaletteColor(2, TFT_RED);              // カラーパレット2番を赤に設定     
+  lcd_s.setColorDepth(8);                         // 8bitモード
+  lcd_s.createSprite(lcd.width(), lcd.height());  // スプライトの作成     
 
   lcd.setFont(&fonts::lgfxJapanGothicP_20);
   lcd.setTextSize(1);
