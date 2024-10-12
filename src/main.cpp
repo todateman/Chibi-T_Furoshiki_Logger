@@ -205,11 +205,19 @@ void setupWiFi ()
 
 // BLEからのデータをM5NanoC6経由で読み込み・表示
 void readBLE2UART() {
+  static int EngTempLost = 0;
   if (Serial3.available()){
     String str = Serial3.readStringUntil('\n');   // Serial3から改行コード"CRLF"まで読み込む
     str.trim();                                   // Serial3から読み込んだデータの両端の空白、改行、タブなどを取り除く
     //Serial.println(str);
     EngTemp = str.toFloat();                      // エンジン温度(C)
+    EngTempLost = 0;
+  }
+  else {
+    EngTempLost++;
+    if (EngTempLost > 10) {
+      EngTemp = 0.0;
+    }
   }
 }
 
@@ -323,6 +331,7 @@ void getGNSS() {
 // ディスプレイに表示
 void drawinfo() {
   lcd_s.fillScreen(TFT_BLACK);
+  lcd_s.setTextColor(TFT_WHITE);
 
   // ディスプレイの表示モードを設定(0:速度/周回数/走行時間 1:回転数/燃料噴射時間/進角角度 2:速度/回転数/燃費)
   if ( M5.BtnB.isPressed() ) { dispmode = 0; }    // Bボタンを押した場合
@@ -353,7 +362,6 @@ void drawinfo() {
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);       // フォントを指定
   lcd_s.setTextSize(1);                             // フォントの拡大率
   lcd_s.setTextDatum(BL_DATUM);                     // データム(下・左)
-  //lcd_s.setTextColor(TFT_WHITE);                    // 文字色を指定
   if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
     lcd_s.drawString("速度(km/h):", 10,  50);         // タイトルを表示
     lcd_s.drawString("残り周回数:", 10, 130);         // タイトルを表示
@@ -447,9 +455,20 @@ void drawinfo() {
   if (dispmode == 0 ) {                             // ディスプレイ表示モードが0の場合
     uint8_t workmin = worktime / 60;                  // 走行時間を分の部分
     uint8_t worksec = worktime % 60;                  // 走行時間の秒の部分
+    if ( map(distance, 0, goal, 300, 0) < map(worktime, 0, limittime, 300, 0) ) {   // 時間切れの恐れがなければ
+      lcd_s.setTextColor(TFT_WHITE);
+    }
+    else {                                                                          // 時間切れの恐れがあれば
+      lcd_s.setTextColor(TFT_RED);
+    }
     lcd_s.printf("%02d:%02d", workmin, worksec);      // 走行時間(mm:ss)
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);       // グラフの外枠を表示
-    lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
+    if ( map(distance, 0, goal, 300, 0) < map(worktime, 0, limittime, 300, 0) ) {   // 時間切れの恐れがなければ
+      lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
+    }
+    else {                                                                          // 時間切れの恐れがあれば
+      lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_RED);
+    }
     lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
   } else if (dispmode == 1 ) {                      // ディスプレイ表示モードが1の場合
     lcd_s.print(IGN_CA);                              // 進角角度(CA)
@@ -640,9 +659,10 @@ void setup() {
   lcd.setBrightness(128);                         // バックライトの輝度を 0～255 の範囲で設定します。
   lcd.fillScreen(TFT_BLACK);                      // 背景色で塗りつぶし
 
-  lcd_s.setColorDepth(1);                         // 2色モード
+  lcd_s.setColorDepth(2);                         // 2色モード
   lcd_s.createSprite(lcd.width(), lcd.height());  // スプライトの作成
-  lcd_s.setPaletteColor(1, TFT_WHITE);
+  lcd_s.setPaletteColor(1, TFT_WHITE);            // カラーパレット1番を白に設定
+  lcd_s.setPaletteColor(2, TFT_RED);              // カラーパレット2番を赤に設定     
 
   lcd.setFont(&fonts::lgfxJapanGothicP_20);
   lcd.setTextSize(1);
