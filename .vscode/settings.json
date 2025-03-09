@@ -14,5 +14,6 @@
         "chrono": "cpp",
         "algorithm": "cpp",
         "sstream": "cpp"
-    }
+    },
+    "cmake.sourceDirectory": "C:/Users/todat/vscode/PlatformIO/Chibi-T_Furoshiki_Logger/.pio/libdeps/m5stack-core2/M5Unified"
 }

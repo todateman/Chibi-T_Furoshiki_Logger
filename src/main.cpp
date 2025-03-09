@@ -205,19 +205,32 @@ void setupWiFi ()
 
 // BLEからのデータをM5NanoC6経由で読み込み・表示
 void readBLE2UART() {
-  static int EngTempLost = 0;
-  if (Serial3.available()){
-    String str = Serial3.readStringUntil('\n');   // Serial3から改行コード"CRLF"まで読み込む
-    str.trim();                                   // Serial3から読み込んだデータの両端の空白、改行、タブなどを取り除く
-    //Serial.println(str);
-    EngTemp = str.toFloat();                      // エンジン温度(C)
-    EngTempLost = 0;
-  }
-  else {
-    EngTempLost++;
-    if (EngTempLost > 10) {
-      EngTemp = 0.0;
+  static String inputBuffer = "";
+  static unsigned long lastReceiveTime = 0;
+  
+  // Serial3に受信データがあればすべて読み出す
+  while (Serial3.available() > 0) {
+    char c = Serial3.read();
+    inputBuffer += c;
+    lastReceiveTime = millis();
+    
+    // 改行が来たら１行分のデータとして処理
+    if (c == '\n') {
+      inputBuffer.trim(); // 両端の余分な空白・改行などを除去
+      if (inputBuffer.length() > 0) {
+        EngTemp = inputBuffer.toFloat();  // 完全な文字列からfloatに変換
+      }
+      inputBuffer = "";
     }
+  }
+  
+  // 一定時間（例：100ms）受信がなければ、改行がなくても残っているデータを処理する
+  if (millis() - lastReceiveTime > 100 && inputBuffer.length() > 0) {
+    inputBuffer.trim();
+    if (inputBuffer.length() > 0) {
+      EngTemp = inputBuffer.toFloat();
+    }
+    inputBuffer = "";
   }
 }
 
