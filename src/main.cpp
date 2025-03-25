@@ -129,6 +129,20 @@ uint8_t dispmode = 0;
 
 //==================== 各種関数 =====================
 
+// LCD画面にメッセージを表示する
+void showMessage(String msg)
+{
+  // lcd.setRotation(1);
+  // lcd.fillScreen(BLACK);
+  // lcd.setTextColor(WHITE);
+  lcd.setCursor(0, 20);
+  lcd.println(msg);
+  lcd.setCursor(50, 230);
+  lcd.print("A");
+  lcd.setCursor(260, 230);
+  lcd.print("C");
+}
+
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
 void updateBLE() {
   static String bleBuffer = "";
@@ -202,11 +216,37 @@ void updateGNSS() {
           uint8_t gnss_minute = gps.time.minute();
           uint8_t gnss_second = gps.time.second();
           uint8_t gnss_csec = gps.time.centisecond();
-          // JST変換（簡易的な処理）
-          gnss_hour += time_offset;
-          if (gnss_hour > 23) {
+          // JST変換
+          gnss_hour = gnss_hour + time_offset;
+          if (gnss_hour > 23) {  // 時間が日付を超える場合
             gnss_hour -= 24;
             gnss_day++;
+            if (gnss_month == 2){  // ２月の場合
+              if ( (gnss_year % 4) == 0 ) {
+                if(gnss_day > 28) {
+                  gnss_day = 1;
+                  gnss_month++;
+                }
+              } else {
+                if(gnss_day > 29) {
+                  gnss_day = 1;
+                  gnss_month++;
+                }              
+              }
+            }else if ((gnss_month % 2) == 0){ // ２月以外の偶数月の場合
+              if ( gnss_day > 30 ){
+                gnss_day = 1;
+                gnss_month++;
+                if ( gnss_month > 12 ){
+                  gnss_year++;
+                }
+              }      
+            }else{  //　奇数月の場合
+              if ( gnss_day > 31 ){
+                gnss_day = 1;
+                gnss_month++;          
+              }
+            }
           }
           setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
           sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
@@ -411,7 +451,7 @@ void updateMQTT() {
   mqttclient.loop();
   StaticJsonDocument<512> doc;
   doc["timestamp"] = datetime;
-  doc["Spd_GPS"]   = spd;
+  //doc["Spd_GPS"]   = spd;
   doc["Spd_PULSE"] = speed;
   doc["Lapcount"]  = Lapcount;
   doc["worktime"]  = worktime;
@@ -422,7 +462,7 @@ void updateMQTT() {
   doc["lat"]       = la;
   doc["lon"]       = ln;
   doc["loc"]       = Loc;
-  doc["Temp"]      = EngTemp;
+  doc["temp"]      = EngTemp;
   String jsonData;
   serializeJson(doc, jsonData);
   mqttclient.publish(mqtt_topic, jsonData.c_str());
@@ -485,32 +525,38 @@ void setup() {
   lcd.setTextSize(1);
   lcd.setTextDatum(baseline_center);
   
-  // SDカード初期化（最大5秒待機）
+  // SDカード初期化（最大3秒待機）
   unsigned long sdStart = millis();
   bool sdInitialized = false;
-  while (!sdInitialized && (millis() - sdStart < 5000)) {
+  while (!sdInitialized && (millis() - sdStart < 3000)) {
     if (sd.begin(SD_CONFIG)) { sdInitialized = true; break; }
     M5.update();
+
+    Serial.println(F("SD Wait..."));
+    lcd.fillScreen(TFT_RED);
+    lcd.setTextColor(TFT_BLACK);
+    showMessage(FPSTR(MSG_NO_SD));
+    lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
+
+    delay(1000);
   }
   if (!sdInitialized) {
     LOGGING = false;
-    Serial.println("SD init failed");
-    lcd.fillScreen(TFT_RED);
-    lcd.setTextColor(TFT_BLACK);
-    lcd.drawString(FPSTR(MSG_NO_SD), lcd.width()/2, lcd.height()/2);
+    Serial.println("SD init failed");  
   } else {
     if (!sd.exists("/LOG")) {
       sd.mkdir("/LOG");
-      lcd.drawString(FPSTR(MSG_LOG_DIR_CREATE), lcd.width()/2, lcd.height()/2 - 10);
+      showMessage(FPSTR(MSG_LOG_DIR_CREATE));
     }
     while (true) {
       snprintf(fileName, sizeof(fileName), "/LOG/LOG%04d.CSV", fileNum);
+      showMessage(FPSTR(MSG_LOG_FILE_CREATE));
       if (!sd.exists(fileName)) {
         logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
         if (logFile) {
           logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
           logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-          logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lng,温度"));
+          logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
           logFile.close();
         }
         break;
@@ -525,13 +571,15 @@ void setup() {
     String portalSSID = mgr->getConfigPortalSSID();
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
-    lcd.drawString(String(FPSTR(MSG_WIFI_CONFIG)) + portalSSID, 0, 20);
-    // ※QRコード生成などの追加処理も可能
+    showMessage(String(FPSTR(MSG_WIFI_CONFIG)) + portalSSID);
+    char ConfigSSID[40];
+    sprintf(ConfigSSID, "WIFI:S:%s;T:nopass;R:1;;", portalSSID);
+    lcd.qrcode(ConfigSSID, 105, 92, 135, 5);
   });
   
   bool doManualConfig = false;
   lcd.fillScreen(TFT_BLACK);
-  lcd.drawString("A: WiFi設定\nC: WiFi無効", lcd.width()/2, lcd.height()/2);
+  showMessage("Aボタンを押してWi-Fi設定\nCボタンを押してWi-Fi無効化");
   unsigned long btnStart = millis();
   while (millis() - btnStart < 5000) {
     M5.update();
@@ -548,7 +596,7 @@ void setup() {
   } else {
     if (ambientpush || MQTTpush) {
       lcd.fillScreen(TFT_BLACK);
-      lcd.drawString(FPSTR(MSG_WIFI_CONNECTING), lcd.width()/2, lcd.height()/2);
+      showMessage(FPSTR(MSG_WIFI_CONNECTING));
       if (wifiManager.autoConnect()) { isWifiConfigSucceeded = true; }
       else { isWifiConfigSucceeded = false; ambientpush = false; MQTTpush = false; }
     } else {
@@ -583,7 +631,7 @@ void setup() {
   }
   
   lcd.fillScreen(TFT_BLACK);
-  lcd.drawString(FPSTR(MSG_LOADING), lcd.width()/2, lcd.height()/2);
+  showMessage(FPSTR(MSG_LOADING));
   Serial.println(F("lat, lon, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
   
   t_Serial = millis();
