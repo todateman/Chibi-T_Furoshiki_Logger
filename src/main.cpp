@@ -160,11 +160,17 @@ void updateBLE() {
       bleBuffer = "";
     }
   }
-  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {
+  /*
+  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {   // タイムアウト処理(100ミリ秒以上経過)
     bleBuffer.trim();
     if (bleBuffer.length() > 0) {
       EngTemp = bleBuffer.toFloat();
     }
+    bleBuffer = "";
+  }
+  */
+  if (millis() - lastBLETime > 10000) {   // タイムアウト処理(10秒以上経過)
+    EngTemp = 0.0;  // エンジン温度をリセット
     bleBuffer = "";
   }
 }
