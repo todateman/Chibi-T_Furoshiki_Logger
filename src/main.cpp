@@ -155,7 +155,14 @@ void updateBLE() {
     if (c == '\n') {
       bleBuffer.trim();
       if (bleBuffer.length() > 0) {
-        EngTemp = bleBuffer.toFloat();
+        // データ完整性チェック: 数値として有効かつ妥当な範囲内かを確認
+        float tempValue = bleBuffer.toFloat();
+        // 温度として妥当な範囲（20～150℃）かつ、toFloat()が有効な変換を行ったかチェック
+        if ((tempValue != 0.0 || bleBuffer == "0" || bleBuffer == "0.0") && 
+            tempValue >= 20.0 && tempValue <= 150.0) {
+          EngTemp = tempValue;
+        }
+        // 不正なデータの場合は前回値を保持（更新しない）
       }
       bleBuffer = "";
     }
