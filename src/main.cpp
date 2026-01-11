@@ -109,7 +109,8 @@ float EngTemp = 0.0;
 
 // GPS用
 TinyGPSPlus gps;
-double la, ln;
+double la = 34.990768;    // KMMF2026の緯度経度初期値
+double ln = 137.010875;   // KMMF2026の緯度経度初期値
 double spd = 0.0;
 String Loc = "";
 // サーキットごとの設定
@@ -123,6 +124,9 @@ const int time_offset = 9;  // JST
 
 // 時刻表示用バッファ
 char datetime[23];
+
+// NTP同期フラグ（GPS受信後は更新しない）
+bool ntpSyncDone = false;
 
 // ディスプレイ表示モード
 uint8_t dispmode = 0;
@@ -262,6 +266,7 @@ void updateGNSS() {
             }
           }
           setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
+          ntpSyncDone = true;  // GPS時刻受信後はNTP同期不要（GPS優先）
           sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
                     year(), month(), day(), hour(), minute(), second(), gnss_csec);
         }
@@ -641,6 +646,35 @@ void setup() {
     client.setPrivateKey(AWS_CERT_PRIVATE);
     mqttclient.setServer(mqtt_server, mqtt_port);
     updateMQTT();
+  }
+  
+  // NTP同期（Wi-Fi接続成功時、GPS時刻受信前）
+  if (isWifiConfigSucceeded && !ntpSyncDone) {
+    configTime(9 * 3600, 0, "pool.ntp.org");  // JST (UTC+9)
+    Serial.println("NTP sync started");
+    // NTP同期待機（最大10秒）
+    unsigned long ntpStart = millis();
+    while (millis() - ntpStart < 10000) {
+      time_t now = time(nullptr);
+      struct tm* timeinfo = localtime(&now);
+      if (timeinfo->tm_year > 70) {  // 1970年以降になったかチェック
+        ntpSyncDone = true;
+        // TimeLibの時刻を更新（datetime バッファ用）
+        setTime(timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec,
+                timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900);
+        // datetime バッファを更新
+        sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.00"),
+                  year(), month(), day(), hour(), minute(), second());
+        Serial.print("NTP sync succeeded: ");
+        Serial.println(asctime(timeinfo));
+        break;
+      }
+      M5.update();
+      delay(100);
+    }
+    if (!ntpSyncDone) {
+      Serial.println("NTP sync timeout");
+    }
   }
   
   lcd.fillScreen(TFT_BLACK);

@@ -1,0 +1,1120 @@
+﻿@startuml システム全体概要
+title Chibi-T Furoshiki Logger - システム全体フロー
+
+start
+
+:M5Stack Core2 起動;
+
+partition "初期化フェーズ (setup)" {
+    :M5.begin()
+    各種シリアル初期化
+    - Serial (デバッグ)
+    - Serial1 (ECU)
+    - Serial2 (GNSS)
+    - SerialBLE (温度センサ);
+    
+    :LCD初期化
+    スプライト作成;
+    
+    :SDカード初期化
+    (最大3秒待機);
+    
+    if (SD初期化成功?) then (yes)
+        :LOGGING = true
+        /LOG ディレクトリ確認/作成
+        ログファイル作成;
+    else (no)
+        :LOGGING = false;
+    endif
+    
+    :WiFi設定フロー
+    (5秒間ボタン待機);
+    
+    note right
+        Aボタン: 手動設定
+        Cボタン: WiFi無効
+        無操作: 自動接続
+    end note
+    
+    if (WiFi有効?) then (yes)
+        if (接続成功?) then (yes)
+            :isWifiConfigSucceeded = true;
+            
+            if (Ambient有効?) then (yes)
+                :チャネル情報取得
+                Ambient初期化;
+            endif
+            
+            if (MQTT有効?) then (yes)
+                :証明書設定
+                MQTTサーバー設定;
+            endif
+        else (no)
+            :WiFi機能無効化;
+        endif
+    else (no)
+        :ambientpush = false
+        MQTTpush = false;
+    endif
+    
+    :タイマー初期化
+    t_Serial, t_SD, t_MQTT, t_amb;
+}
+
+partition "メインループ (loop)" {
+    repeat
+        :M5.update();
+        
+        :データ収集;
+        note right
+            updateBLE()
+            updateECU()
+            updateGNSS()
+        end note
+        
+        :updateDisplay()
+        表示モード切替
+        画面描画;
+        
+        if (t_Serial間隔経過?) then (yes)
+            :updateSerialOutput()
+            CSV形式でシリアル出力;
+        endif
+        
+        if (LOGGING && t_SD間隔経過?) then (yes)
+            :updateSDLog()
+            SDカードへ記録;
+        endif
+        
+        if (MQTTpush?) then (yes)
+            if (走行前?) then (yes)
+                if (t_MQTT >= 10秒?) then (yes)
+                    :updateMQTT()
+                    JSON送信;
+                endif
+            else (走行中)
+                if (t_MQTT >= 1秒?) then (yes)
+                    :updateMQTT()
+                    JSON送信;
+                endif
+            endif
+        endif
+        
+        if (ambientpush && t_amb間隔経過?) then (yes)
+            :updateAmbient()
+            データ送信;
+        endif
+        
+        :delay(10);
+        
+    repeat while (システム稼働中)
+}
+
+stop
+
+@enduml
+
+@startuml setup詳細フロー
+title setup() - 初期化処理詳細
+
+start
+
+partition "ハードウェア初期化" {
+    :M5.begin(cfg)
+    M5.update();
+    
+    :Serial.begin(115200)
+    デバッグ用;
+    
+    :Serial1.begin(115200, SERIAL_8N1, 27, 19)
+    ECU接続;
+    
+    :Serial2.begin(115200)
+    GNSS接続;
+    
+    if (USE_HARDWARE_BLE?) then (1)
+        :SerialBLE.begin(115200, SERIAL_8N1, 32, 33)
+        UART2使用;
+    else (0)
+        :SerialBLE.begin(115200)
+        SoftwareSerial使用;
+    endif
+}
+
+partition "LCD初期化" {
+    :lcd.init()
+    lcd.setRotation(1)
+    lcd.setBrightness(128)
+    lcd.fillScreen(TFT_BLACK);
+    
+    :lcd_s.setColorDepth(8)
+    lcd_s.createSprite(width, height)
+    スプライト作成;
+    
+    :フォント・テキスト設定;
+}
+
+partition "SDカード初期化" {
+    :sdStart = millis();
+    :sdInitialized = false;
+    
+    repeat
+        if (sd.begin(SD_CONFIG)?) then (yes)
+            :sdInitialized = true;
+            break;
+        endif
+        
+        :M5.update();
+        
+        :画面に警告表示
+        "MicroSDが見つかりません"
+        残り時間カウントダウン;
+        
+        :delay(1000);
+        
+    repeat while (millis() - sdStart < 3000)
+    
+    if (sdInitialized?) then (yes)
+        if (/LOG ディレクトリ存在?) then (no)
+            :sd.mkdir("/LOG")
+            画面メッセージ表示;
+        endif
+        
+        repeat
+            :fileName生成
+            /LOG/LOG%04d.CSV;
+            
+        repeat while (ファイル既存?) is (yes)
+        ->no;
+        
+        :logFile.open()
+        BOM書き込み (UTF-8)
+        CSVヘッダ書き込み;
+        
+        :logFile.close();
+        
+    else (no)
+        :LOGGING = false
+        エラーログ出力;
+    endif
+}
+
+partition "WiFi設定" {
+    :APコールバック設定
+    (QRコード表示);
+    
+    :画面表示
+    "Aボタン: WiFi設定"
+    "Cボタン: WiFi無効化";
+    
+    :doManualConfig = false
+    btnStart = millis();
+    
+    repeat
+        :M5.update();
+        
+        if (BtnA.isPressed?) then (yes)
+            :doManualConfig = true;
+            break;
+        endif
+        
+        if (BtnC.isPressed?) then (yes)
+            :ambientpush = false
+            MQTTpush = false;
+            break;
+        endif
+        
+        :delay(10);
+        
+    repeat while (millis() - btnStart < 5000)
+    
+    if (doManualConfig?) then (yes)
+        :wifiManager.startConfigPortal();
+        
+        if (成功?) then (yes)
+            :isWifiConfigSucceeded = true;
+        else (no)
+            :isWifiConfigSucceeded = false;
+        endif
+        
+    else (no)
+        if (ambientpush || MQTTpush?) then (yes)
+            :画面表示
+            "Wi-Fi接続中...";
+            
+            :wifiManager.autoConnect();
+            
+            if (成功?) then (yes)
+                :isWifiConfigSucceeded = true;
+            else (no)
+                :isWifiConfigSucceeded = false
+                ambientpush = false
+                MQTTpush = false;
+            endif
+        else (no)
+            :画面表示
+            "Wi-Fi無効";
+        endif
+    endif
+}
+
+partition "Ambient設定" {
+    if (ambientpush && isWifiConfigSucceeded?) then (yes)
+        :MACアドレス取得
+        devKey生成;
+        
+        :ambient.getchannel()
+        チャネルID・writeKey取得;
+        
+        repeat
+            :M5.update();
+            :delay(500);
+        repeat while (チャネル取得失敗?) is (yes)
+        ->no;
+        
+        :ambient.begin()
+        初期化完了;
+    endif
+}
+
+partition "MQTT設定" {
+    if (MQTTpush && isWifiConfigSucceeded?) then (yes)
+        :mqttclient.setBufferSize(512);
+        
+        :client.setCACert(AWS_CERT_CA)
+        client.setCertificate(AWS_CERT_CRT)
+        client.setPrivateKey(AWS_CERT_PRIVATE)
+        証明書設定;
+        
+        :mqttclient.setServer(mqtt_server, mqtt_port)
+        サーバー接続先設定;
+        
+        :updateMQTT()
+        初回接続試行;
+    endif
+}
+
+partition "最終準備" {
+    :画面表示
+    "読み込み中...";
+    
+    :デバッグ用ヘッダ出力
+    Serial.println();
+    
+    :タイマー初期化
+    t_Serial = millis()
+    t_SD = millis()
+    t_MQTT = millis()
+    t_amb = millis();
+}
+
+stop
+
+@enduml
+
+@startuml loop詳細フロー
+title loop() - メインループ処理詳細
+
+start
+
+:M5.update()
+ボタン状態更新;
+
+partition "データ収集フェーズ" {
+    :updateBLE()
+    BLE温度データ受信;
+    note right
+        詳細は次ページ
+        「データ収集詳細」参照
+    end note
+    
+    :updateECU()
+    ECU走行データ受信;
+    note right
+        詳細は次ページ
+        「データ収集詳細」参照
+    end note
+    
+    :updateGNSS()
+    GNSS位置・時刻受信;
+    note right
+        詳細は次ページ
+        「データ収集詳細」参照
+    end note
+}
+
+partition "表示更新" {
+    :updateDisplay()
+    LCD画面更新;
+    note right
+        - ボタンで表示モード切替
+        - 接続状況表示
+        - 走行データ表示
+        - バーグラフ描画
+    end note
+}
+
+partition "定期出力処理 (タイミング制御)" {
+    if (millis() - t_Serial >= 1000ms?) then (yes)
+        :updateSerialOutput()
+        CSV形式でシリアル出力;
+        :t_Serial = millis();
+    else (no)
+    endif
+    
+    if (LOGGING?) then (yes)
+        if (millis() - t_SD >= 1000ms?) then (yes)
+            :updateSDLog()
+            SDカードへCSV記録;
+            :t_SD = millis();
+        else (no)
+        endif
+    else (no)
+    endif
+    
+    if (MQTTpush?) then (yes)
+        if (worktime == 0?) then (yes: 走行前)
+            if (millis() - t_MQTT >= 10000ms?) then (yes)
+                :updateMQTT()
+                JSON送信 (10秒間隔);
+                :t_MQTT = millis();
+            else (no)
+            endif
+        else (no: 走行中)
+            if (millis() - t_MQTT >= 1000ms?) then (yes)
+                :updateMQTT()
+                JSON送信 (1秒間隔);
+                :t_MQTT = millis();
+            else (no)
+            endif
+        endif
+    else (no)
+    endif
+    
+    if (ambientpush?) then (yes)
+        if (millis() - t_amb >= 10000ms?) then (yes)
+            :updateAmbient()
+            データ送信;
+            :t_amb = millis();
+        else (no)
+        endif
+    else (no)
+    endif
+}
+
+:delay(10)
+ループ調整;
+
+note right
+    ループは継続的に実行され、
+    各処理は設定された間隔で実行される
+end note
+
+stop
+
+@enduml
+
+@startuml データ収集詳細
+title データ収集と送信のタイミング制御詳細
+
+|BLE温度センサー|
+start
+
+partition "updateBLE() - BLE温度データ受信" {
+    :static変数
+    bleBuffer = ""
+    lastBLETime = 0;
+    
+    while (SerialBLE.available() > 0?) is (yes)
+        :c = SerialBLE.read()
+        1文字読み取り;
+        
+        :bleBuffer += c
+        lastBLETime = millis();
+        
+        if (c == '\n'?) then (yes)
+            :bleBuffer.trim()
+            前後空白除去;
+            
+            if (bleBuffer.length() > 0?) then (yes)
+                :tempValue = bleBuffer.toFloat()
+                文字列を浮動小数点に変換;
+                
+                if (データ妥当性チェック?) then (yes: valid)
+                    note right
+                        - toFloat()が有効な変換を実施
+                        - 温度範囲: 20～150℃
+                    end note
+                    :EngTemp = tempValue
+                    温度更新;
+                else (no: invalid)
+                    :前回値を保持
+                    (更新しない);
+                endif
+            endif
+            
+            :bleBuffer = ""
+            バッファクリア;
+        endif
+    endwhile (no)
+    
+    if (millis() - lastBLETime > 10000?) then (yes: タイムアウト)
+        :EngTemp = 0.0
+        温度リセット;
+        :bleBuffer = ""
+        バッファクリア;
+    else (no)
+    endif
+}
+
+stop
+
+|ECU|
+start
+
+partition "updateECU() - ECU走行データ受信" {
+    if (Serial1.available()?) then (yes)
+        :receiveECUtime = millis()
+        受信時刻記録;
+        
+        :str = Serial1.readStringUntil('\n')
+        1行読み取り;
+        
+        :str.trim()
+        前後空白除去;
+        
+        :i = 0;
+        
+        repeat
+            :commaIndex = str.indexOf(",")
+            カンマ位置検索;
+            
+            :data = str.substring(0, commaIndex)
+            データ抽出;
+            
+            :data.trim()
+            前後空白除去;
+            
+            :str = str.substring(commaIndex + 1)
+            残り文字列更新;
+            
+            switch (i)
+            case (0)
+                :tachoRpm = data.toInt()
+                回転数;
+            case (1)
+                :INJ_timems = data.toFloat()
+                噴射時間;
+            case (2)
+                :IGN_CA = data.toInt()
+                進角角度;
+            case (3)
+                :speed = data.toInt()
+                速度;
+            case (4)
+                :distance = data.toInt()
+                走行距離;
+            case (5)
+                :gasml = data.toFloat()
+                積算燃料;
+            case (6)
+                :dispergas = data.toFloat()
+                燃費;
+            case (7)
+                :worktime = data.toInt()
+                走行時間;
+            endswitch
+            
+            :i++;
+            
+        repeat while (i < 8)
+        
+        :Lapcount = distance / (goal / totallaps)
+        周回数計算;
+        
+    else (no: データなし)
+        if (millis() - receiveECUtime > 2000?) then (yes: タイムアウト)
+            :tachoRpm = 0
+            INJ_timems = 0
+            IGN_CA = 0
+            speed = 0
+            データリセット;
+        else (no)
+        endif
+    endif
+}
+
+stop
+
+|GNSS|
+start
+
+partition "updateGNSS() - GNSS位置・時刻受信" {
+    while (Serial2.available() > 0?) is (yes)
+        :byte = Serial2.read()
+        1バイト読み取り;
+        
+        if (gps.encode(byte)?) then (yes: 完全な文完成)
+            if (gps.time.isUpdated()?) then (yes)
+                if (gps.location.lng() > 120?) then (yes: 異常値除外)
+                    :la = gps.location.lat()
+                    ln = gps.location.lng()
+                    spd = gps.speed.kmph()
+                    位置・速度取得;
+                    
+                    :日時データ取得
+                    gnss_day, month, year
+                    gnss_hour, minute, second
+                    gnss_csec;
+                    
+                    :gnss_hour += 9
+                    JST変換 (UTC+9);
+                    
+                    if (gnss_hour > 23?) then (yes)
+                        :gnss_hour -= 24
+                        gnss_day++
+                        日付繰り上げ;
+                        
+                        if (月末判定?) then (yes: 月末超過)
+                            :gnss_day = 1
+                            gnss_month++
+                            月繰り上げ;
+                            
+                            if (gnss_month > 12?) then (yes)
+                                :gnss_year++
+                                年繰り上げ;
+                            else (no)
+                            endif
+                        else (no)
+                        endif
+                    else (no)
+                    endif
+                    
+                    :setTime()
+                    システム時刻設定;
+                    
+                    :sprintf_P(datetime, ...)
+                    日時文字列生成;
+                    
+                    break;
+                endif
+            endif
+        endif
+    endwhile (no)
+    
+    partition "ロケーション判定" {
+        if (鈴鹿範囲内?) then (yes)
+            :Loc = "su"
+            totallaps = 8
+            goal = 17616
+            limittime = 2536;
+        elseif (茂木範囲内?) then (yes)
+            :Loc = "mo"
+            totallaps = 7
+            goal = 16389
+            limittime = 2360;
+        else (その他)
+            :Loc = "to"
+            デフォルト値維持;
+        endif
+    }
+}
+
+stop
+
+|タイミング制御|
+start
+
+partition "定期送信タイミング制御" {
+    :現在時刻 = millis();
+    
+    floating note left
+        各タイマー変数:
+        - t_Serial: シリアル出力
+        - t_SD: SDログ
+        - t_MQTT: MQTT送信
+        - t_amb: Ambient送信
+    end note
+    
+    fork
+        partition "Serial出力 (1秒間隔)" {
+            if (millis() - t_Serial >= 1000?) then (yes)
+                :updateSerialOutput()
+                CSV形式でSerial出力;
+                :t_Serial = millis()
+                タイマーリセット;
+            else (no)
+            endif
+        }
+    fork again
+        partition "SDログ (1秒間隔)" {
+            if (LOGGING?) then (yes)
+                if (millis() - t_SD >= 1000?) then (yes)
+                    :updateSDLog()
+                    SDカードへCSV記録;
+                    :t_SD = millis()
+                    タイマーリセット;
+                else (no)
+                endif
+            else (no)
+            endif
+        }
+    fork again
+        partition "MQTT送信 (可変間隔)" {
+            if (MQTTpush?) then (yes)
+                if (worktime == 0?) then (yes: 走行前)
+                    :送信間隔 = 10秒;
+                    
+                    if (millis() - t_MQTT >= 10000?) then (yes)
+                        :updateMQTT()
+                        JSON送信;
+                        :t_MQTT = millis()
+                        タイマーリセット;
+                    else (no)
+                    endif
+                else (no: 走行中)
+                    :送信間隔 = 1秒;
+                    
+                    if (millis() - t_MQTT >= 1000?) then (yes)
+                        :updateMQTT()
+                        JSON送信;
+                        :t_MQTT = millis()
+                        タイマーリセット;
+                    else (no)
+                    endif
+                endif
+            else (no)
+            endif
+        }
+    fork again
+        partition "Ambient送信 (10秒間隔)" {
+            if (ambientpush?) then (yes)
+                if (millis() - t_amb >= 10000?) then (yes)
+                    :updateAmbient()
+                    10フィールド送信;
+                    :t_amb = millis()
+                    タイマーリセット;
+                else (no)
+                endif
+            else (no)
+            endif
+        }
+    end fork
+}
+
+note right
+    全ての送信処理は非同期で動作し、
+    それぞれ独立したタイマーで管理される
+    
+    MQTT送信のみ走行状態により
+    送信間隔が動的に変化する
+end note
+
+stop
+
+@enduml
+
+@startuml MQTT送信詳細
+title updateMQTT() - MQTT送信処理詳細
+
+start
+
+if (mqttclient.connected()?) then (no: 未接続)
+    :static lastReconnectAttempt = 0;
+    
+    if (millis() - lastReconnectAttempt > 5000?) then (yes: 5秒経過)
+        :lastReconnectAttempt = millis();
+        
+        :mqttclient.connect(mqtt_deviceID)
+        接続試行;
+        
+        if (接続成功?) then (yes)
+            :Serial.println("MQTT connected")
+            成功ログ出力;
+        else (no)
+            :Serial.print("MQTT reconnect failed")
+            Serial.println(mqttclient.state())
+            失敗ログ出力;
+        endif
+    endif
+    
+    stop
+    
+else (yes: 接続中)
+    :mqttclient.loop()
+    接続維持処理;
+    
+    partition "JSONペイロード作成" {
+        :StaticJsonDocument<512> doc
+        JSONオブジェクト作成;
+        
+        :doc["timestamp"] = datetime
+        日時;
+        
+        :doc["Spd_PULSE"] = speed
+        速度;
+        
+        :doc["Lapcount"] = Lapcount
+        周回数;
+        
+        :doc["worktime"] = worktime
+        走行時間;
+        
+        :doc["tachoRpm"] = tachoRpm
+        回転数;
+        
+        :doc["distance"] = distance
+        走行距離;
+        
+        :doc["gasml"] = gasml
+        積算燃料;
+        
+        :doc["dispergas"] = dispergas
+        燃費;
+        
+        :doc["lat"] = la
+        緯度;
+        
+        :doc["lon"] = ln
+        経度;
+        
+        :doc["loc"] = Loc
+        ロケーション;
+        
+        :doc["temp"] = EngTemp
+        エンジン温度;
+        
+        :String jsonData
+        serializeJson(doc, jsonData)
+        JSON文字列化;
+    }
+    
+    :mqttclient.publish(mqtt_topic, jsonData.c_str())
+    トピックへ送信;
+    
+    note right
+        QoS: 0 (デフォルト)
+        Retain: false
+        バッファサイズ: 512バイト
+    end note
+    
+    stop
+endif
+
+@enduml
+
+@startuml SDログ詳細
+title updateSDLog() - SDカードログ記録処理詳細
+
+start
+
+partition "updateSDLog() - SDカードログ記録" {
+    :logFile = sd.open(fileName, 
+    O_WRITE | O_CREAT | O_APPEND)
+    追記モードでファイルオープン;
+    
+    if (logFile?) then (yes: オープン成功)
+        :logFile.timestamp(T_WRITE, 
+        year(), month(), day(),
+        hour(), minute(), second())
+        ファイル更新日時設定;
+        
+        :CSVデータ書き込み
+        datetime, speed, Lapcount,
+        worktime, tachoRpm, distance,
+        gasml, dispergas, la, ln, EngTemp;
+        
+        note right
+            形式: CSV (カンマ区切り)
+            エンコード: UTF-8 BOM付き
+            小数点桁数:
+            - 座標: 7桁
+            - 温度: 2桁
+            - その他: 1桁
+        end note
+        
+        :logFile.close()
+        ファイルクローズ;
+        
+    else (no: オープン失敗)
+        :Serial.println("SD Log open failed!")
+        エラーログ出力;
+    endif
+}
+
+stop
+
+@enduml
+
+@startuml Ambient送信詳細
+title updateAmbient() - Ambient送信処理詳細
+
+start
+
+partition "updateAmbient() - Ambient送信" {
+    if (WiFi接続中?) then (yes: WL_CONNECTED)
+        :char buf[16]
+        バッファ準備;
+        
+        :ambient.set(1, spd)
+        フィールド1: GPS速度;
+        
+        :ambient.set(2, EngTemp)
+        フィールド2: エンジン温度;
+        
+        :ambient.set(3, Lapcount)
+        フィールド3: 周回数;
+        
+        :ambient.set(4, worktime)
+        フィールド4: 走行時間;
+        
+        :ambient.set(5, tachoRpm)
+        フィールド5: 回転数;
+        
+        :ambient.set(6, distance)
+        フィールド6: 走行距離;
+        
+        :ambient.set(7, gasml)
+        フィールド7: 積算燃料;
+        
+        :ambient.set(8, dispergas)
+        フィールド8: 燃費;
+        
+        :dtostrf(la, 12, 8, buf)
+        ambient.set(9, buf)
+        フィールド9: 緯度(文字列);
+        
+        :dtostrf(ln, 12, 8, buf)
+        ambient.set(10, buf)
+        フィールド10: 経度(文字列);
+        
+        if (ambient.send(1000)?) then (yes: 送信成功)
+            :Serial.println("Ambient: Success!")
+            成功ログ;
+        else (no: 送信失敗)
+            :Serial.println("Ambient: failure...")
+            失敗ログ;
+        endif
+        
+    else (no: WiFi切断)
+        :Serial.println("WiFi disconnected")
+        エラーログ出力;
+        
+        :WiFi.reconnect()
+        再接続試行;
+    endif
+}
+
+stop
+
+@enduml
+
+@startuml 表示モード詳細
+title updateDisplay() - 表示モード切替と画面描画
+
+start
+
+:lcd_s.fillScreen(TFT_BLACK)
+画面クリア;
+
+:lcd_s.setTextColor(TFT_WHITE)
+文字色設定;
+
+partition "表示モード切替" {
+    if (M5.BtnB.isPressed?) then (yes)
+        :dispmode = 0
+        速度/周回/時間モード;
+    endif
+    
+    if (M5.BtnA.isPressed?) then (yes)
+        :dispmode = 1
+        回転数/噴射/進角モード;
+    endif
+    
+    if (M5.BtnC.isPressed?) then (yes)
+        :dispmode = 2
+        速度/回転数/燃費モード;
+    endif
+}
+
+partition "接続状況表示 (右上)" {
+    :lcd_s.setFont(&fonts::lgfxJapanGothicP_16)
+    lcd_s.setTextSize(1)
+    lcd_s.setTextDatum(top_right);
+    
+    if (LOGGING?) then (yes)
+        :lcd_s.drawString("SD: O", 320, 0);
+    else (no)
+        :lcd_s.drawString("SD: x", 320, 0);
+    endif
+    
+    if (ambientpush?) then (yes)
+        :lcd_s.drawString("Amb: O", 320, 15);
+    elseif (MQTTpush?) then (yes)
+        :lcd_s.drawString("MQTT: O", 320, 15);
+    else (両方無効)
+        :lcd_s.drawString("Amb･MQTT: x", 320, 15);
+    endif
+}
+
+partition "タイトル表示" {
+    :lcd_s.setFont(&fonts::lgfxJapanGothicP_20)
+    lcd_s.setTextSize(1)
+    lcd_s.setTextDatum(BL_DATUM);
+    
+    switch (dispmode)
+    case (0: 速度/周回/時間)
+        :lcd_s.drawString("速度(km/h):", 10, 50)
+        lcd_s.drawString("残り周回数:", 10, 130)
+        lcd_s.drawString("走行時間:", 10, 210);
+    case (1: 回転数/噴射/進角)
+        :lcd_s.drawString("回転数(rpm):", 10, 50)
+        lcd_s.drawString("噴射時間(ms):", 10, 130)
+        lcd_s.drawString("進角角度(CA):", 10, 210);
+    case (2: 速度/回転数/燃費)
+        :lcd_s.drawString("速度(km/h):", 10, 50)
+        lcd_s.drawString("回転数(rpm):", 10, 130)
+        lcd_s.drawString("燃費(km/l):", 10, 210);
+    endswitch
+}
+
+partition "第1表示行 (速度 or 回転数)" {
+    :lcd_s.setFont(&fonts::Font7)
+    lcd_s.setTextSize(1)
+    lcd_s.setTextDatum(BL_DATUM)
+    lcd_s.setCursor(140, 50);
+    
+    if (dispmode == 0 || dispmode == 2?) then (yes: 速度表示)
+        :lcd_s.print(speed)
+        速度値表示;
+        
+        :lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE)
+        バー枠描画;
+        
+        :barLength = map(speed, 0, 45, 0, 300)
+        バー長計算;
+        
+        :lcd_s.fillRect(10, 55, barLength, 10, TFT_WHITE)
+        バー描画 (白);
+        
+        :lcd_s.fillRect(残り部分, TFT_BLACK)
+        バー残り部分 (黒);
+        
+    else (no: 回転数表示)
+        :lcd_s.print(tachoRpm)
+        回転数値表示;
+        
+        :lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE)
+        バー枠描画;
+        
+        :barLength = map(tachoRpm, 0, 6500, 0, 300)
+        バー長計算;
+        
+        :lcd_s.fillRect(10, 55, barLength, 10, TFT_WHITE)
+        バー描画 (白);
+        
+        :lcd_s.fillRect(残り部分, TFT_BLACK)
+        バー残り部分 (黒);
+    endif
+}
+
+partition "第2表示行 (周回 or 噴射 or 回転数)" {
+    switch (dispmode)
+    case (0: 周回数表示)
+        :restlaps = totallaps - Lapcount
+        残り周回計算;
+        
+        :lcd_s.setCursor(140, 130);
+        
+        if (restlaps > 1?) then (yes)
+            :lcd_s.print(restlaps)
+            残り周回数;
+        elseif (restlaps == 1?) then (yes)
+            :lcd_s.print("G")
+            ゴール周回表示;
+        else (0以下)
+            :lcd_s.print("FINISH")
+            完走表示;
+        endif
+        
+        :バー描画 (距離進行度)
+        周回ラベル表示;
+        
+    case (1: 噴射時間表示)
+        :lcd_s.setCursor(140, 130)
+        lcd_s.print(INJ_timems, 1)
+        噴射時間値表示;
+        
+        :バー描画
+        map(INJ_timems, 0, 10, 0, 300);
+        
+    case (2: 回転数表示)
+        :lcd_s.setCursor(140, 130)
+        lcd_s.print(tachoRpm)
+        回転数値表示;
+        
+        :バー描画
+        map(tachoRpm, 0, 6500, 0, 300);
+    endswitch
+}
+
+partition "第3表示行 (時間 or 進角 or 燃費)" {
+    :lcd_s.setFont(&fonts::Font7)
+    lcd_s.setTextSize(1)
+    lcd_s.setTextDatum(BL_DATUM)
+    lcd_s.setCursor(140, 210);
+    
+    switch (dispmode)
+    case (0: 走行時間表示)
+        :workmin = worktime / 60
+        worksec = worktime % 60
+        分・秒計算;
+        
+        if (距離進行 <= 時間進行?) then (yes: ペース順調)
+            :lcd_s.setTextColor(TFT_WHITE)
+            白色表示;
+        else (no: ペース遅れ)
+            :lcd_s.setTextColor(TFT_MAGENTA)
+            マゼンタ表示;
+        endif
+        
+        :lcd_s.printf("%02d:%02d", workmin, worksec)
+        時間表示;
+        
+        :バー描画 (色分け)
+        map(worktime, 0, limittime, 300, 0);
+        
+    case (1: 進角角度表示)
+        :lcd_s.print(IGN_CA)
+        進角値表示;
+        
+        :バー描画
+        map(IGN_CA, 0, 90, 0, 300);
+        
+    case (2: 燃費表示)
+        :lcd_s.print(dispergas, 1)
+        燃費値表示;
+        
+        :バー描画
+        map(dispergas, 0, 2000, 0, 300);
+    endswitch
+}
+
+:lcd.startWrite()
+lcd_s.pushSprite(0, 0)
+lcd.endWrite()
+スプライトをLCDへ転送;
+
+stop
+
+note bottom
+    表示モード:
+    0: 速度/残周回/走行時間 (デフォルト)
+    1: 回転数/噴射時間/進角角度 (セッティング)
+    2: 速度/回転数/燃費 (燃費確認)
+    
+    各モードで3段の情報を表示し、
+    それぞれバーグラフで視覚化
+end note
+
+@enduml
