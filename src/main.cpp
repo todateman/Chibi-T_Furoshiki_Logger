@@ -173,16 +173,20 @@ void updateBLE() {
       bleBuffer = "";
     }
   }
-  /*
-  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {   // タイムアウト処理(100ミリ秒以上経過)
+  // 不完全なデータの部分タイムアウト処理(100ミリ秒以上経過)
+  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {
     bleBuffer.trim();
     if (bleBuffer.length() > 0) {
-      EngTemp = bleBuffer.toFloat();
+      float tempValue = bleBuffer.toFloat();
+      if ((tempValue != 0.0 || bleBuffer == "0" || bleBuffer == "0.0") && 
+          tempValue >= 20.0 && tempValue <= 150.0) {
+        EngTemp = tempValue;
+      }
     }
     bleBuffer = "";
   }
-  */
-  if (millis() - lastBLETime > 10000) {   // タイムアウト処理(10秒以上経過)
+  // データ受信完全ロス時のリセット処理(2秒以上経過)
+  if (millis() - lastBLETime > 2000) {
     EngTemp = 0.0;  // エンジン温度をリセット
     bleBuffer = "";
   }
@@ -531,7 +535,8 @@ void setup() {
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
   #else
-    SerialBLE.begin(115200);
+    // バッファサイズを512バイトに拡大してデータロス対策
+    SerialBLE.begin(115200, SWSERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN, false, 512);
   #endif
   
   // LCD初期化
