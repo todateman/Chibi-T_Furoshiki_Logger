@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include "SdFat.h"
@@ -109,8 +110,9 @@ float EngTemp = 0.0;
 
 // GPS用
 TinyGPSPlus gps;
-double la = 34.990768;    // KMMF2026の緯度経度初期値
-double ln = 137.010875;   // KMMF2026の緯度経度初期値
+double la, ln;
+// double la = 34.990768;    // KMMF2026の緯度経度初期値
+// double ln = 137.010875;   // KMMF2026の緯度経度初期値
 double spd = 0.0;
 String Loc = "";
 // サーキットごとの設定
