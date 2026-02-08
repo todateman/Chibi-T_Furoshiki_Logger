@@ -96,7 +96,7 @@ SoftwareSerial SerialBLE(BLE_RX_PIN, BLE_TX_PIN);
 uint16_t tachoRpm = 0;
 float INJ_timems = 0.0;
 uint8_t IGN_CA = 0;
-uint8_t speed = 0;
+float speed = 0.0;
 uint16_t distance = 0;
 float gasml = 0.0;
 float dispergas = 0.0;
@@ -196,7 +196,7 @@ void updateECU() {
       if (i == 0) { tachoRpm = data.toInt(); }
       if (i == 1) { INJ_timems = data.toFloat(); }
       if (i == 2) { IGN_CA = data.toInt(); }
-      if (i == 3) { speed = data.toInt(); }
+      if (i == 3) { speed = data.toFloat(); }
       if (i == 4) { distance = data.toInt(); }
       if (i == 5) { gasml = data.toFloat(); }
       if (i == 6) { dispergas = data.toFloat(); }
@@ -208,7 +208,7 @@ void updateECU() {
       tachoRpm = 0;
       INJ_timems = 0;
       IGN_CA = 0;
-      speed = 0;
+      speed = 0.0;
     }
   }
 }
@@ -302,7 +302,7 @@ void updateDisplay() {
   lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
   if (ambientpush) lcd_s.drawString("Amb: O", 320, 15);
   if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 15);
-  if (!ambientpush && !MQTTpush) lcd_s.drawString("Amb･MQTT: x", 320, 15);
+  if (!ambientpush && !MQTTpush) {lcd_s.drawString("Amb: x", 320, 15); lcd_s.drawString("MQTT: x", 320, 30);}
   
   // タイトル表示（表示モードごと）
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
@@ -328,11 +328,11 @@ void updateDisplay() {
   lcd_s.setTextDatum(BL_DATUM);
   lcd_s.setCursor(140, 50);
   if (dispmode == 0 || dispmode == 2) {
-    lcd_s.print(speed);
+    lcd_s.print(speed, 1);
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);
-    int barLength = map(speed, 0, 45, 0, 300);
+    int barLength = (int)((constrain(speed, 0.0, 45.0) / 45.0) * 300.0);
     lcd_s.fillRect(10, 55, barLength, 10, TFT_WHITE);
-    lcd_s.fillRect(map(speed, 0, 45, 10, 310), 55, map(speed, 0, 45, 300, 0), 10, TFT_BLACK);
+    lcd_s.fillRect(10 + barLength, 55, 300 - barLength, 10, TFT_BLACK);
   } else if (dispmode == 1) {
     lcd_s.print(tachoRpm);
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);
@@ -416,7 +416,7 @@ void updateSerialOutput() {
   Serial.print(Loc);   Serial.print(",");
   Serial.print(spd, 1); Serial.print(",");
   Serial.print(tachoRpm); Serial.print(",");
-  Serial.print(speed);    Serial.print(",");
+  Serial.print(speed, 1);    Serial.print(",");
   Serial.print(distance); Serial.print(",");
   Serial.print(gasml, 1); Serial.print(",");
   Serial.print(dispergas, 1); Serial.print(",");
@@ -430,7 +430,7 @@ void updateSDLog() {
   if (logFile) {
     logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
     logFile.print(datetime); logFile.print(",");
-    logFile.print(speed);    logFile.print(",");
+    logFile.print(speed, 1);    logFile.print(",");
     logFile.print(Lapcount); logFile.print(",");
     logFile.print(worktime); logFile.print(",");
     logFile.print(tachoRpm); logFile.print(",");
