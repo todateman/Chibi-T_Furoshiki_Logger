@@ -159,14 +159,22 @@ void updateBLE() {
     bleBuffer += c;
     lastBLETime = millis();
     if (c == '\n') {
+      // 改行と制御文字を明示的に除去
+      while (bleBuffer.length() > 0 && (bleBuffer[bleBuffer.length() - 1] == '\n' || 
+                                         bleBuffer[bleBuffer.length() - 1] == '\r')) {
+        bleBuffer.remove(bleBuffer.length() - 1);
+      }
       bleBuffer.trim();
+      
       if (bleBuffer.length() > 0) {
-        // データ完整性チェック: 数値として有効かつ妥当な範囲内かを確認
         float tempValue = bleBuffer.toFloat();
-        // 温度として妥当な範囲（20～150℃）かつ、toFloat()が有効な変換を行ったかチェック
+        // データ完整性チェック: 数値として有効かつ妥当な範囲内かを確認
         if ((tempValue != 0.0 || bleBuffer == "0" || bleBuffer == "0.0") && 
-            tempValue >= 20.0 && tempValue <= 150.0) {
+            tempValue >= 10.0 && tempValue <= 150.0) {
           EngTemp = tempValue;
+          Serial.printf("[BLE] RX: %s -> %.2f°C\n", bleBuffer.c_str(), EngTemp);
+        } else {
+          Serial.printf("[BLE] OUT OF RANGE or INVALID: %s -> %.2f\n", bleBuffer.c_str(), tempValue);
         }
         // 不正なデータの場合は前回値を保持（更新しない）
       }
@@ -175,12 +183,21 @@ void updateBLE() {
   }
   // 不完全なデータの部分タイムアウト処理(100ミリ秒以上経過)
   if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {
+    // 改行と制御文字を明示的に除去
+    while (bleBuffer.length() > 0 && (bleBuffer[bleBuffer.length() - 1] == '\n' || 
+                                       bleBuffer[bleBuffer.length() - 1] == '\r')) {
+      bleBuffer.remove(bleBuffer.length() - 1);
+    }
     bleBuffer.trim();
+    
     if (bleBuffer.length() > 0) {
       float tempValue = bleBuffer.toFloat();
       if ((tempValue != 0.0 || bleBuffer == "0" || bleBuffer == "0.0") && 
-          tempValue >= 20.0 && tempValue <= 150.0) {
+          tempValue >= 10.0 && tempValue <= 150.0) {
         EngTemp = tempValue;
+        Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", bleBuffer.c_str(), EngTemp);
+      } else {
+        Serial.printf("[BLE TIMEOUT] OUT OF RANGE or INVALID: %s -> %.2f\n", bleBuffer.c_str(), tempValue);
       }
     }
     bleBuffer = "";
