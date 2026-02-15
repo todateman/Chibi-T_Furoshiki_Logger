@@ -546,19 +546,22 @@ void setup() {
   lcd.setTextDatum(baseline_center);
   
   // SDカード初期化（最大3秒待機）
-  unsigned long sdStart = millis();
-  bool sdInitialized = false;
-  while (!sdInitialized && (millis() - sdStart < 3000)) {
-    if (sd.begin(SD_CONFIG)) { sdInitialized = true; break; }
-    M5.update();
+  bool sdInitialized = sd.begin(SD_CONFIG);
+  if (!sdInitialized) {
+    unsigned long sdStart = millis();
+    while (!sdInitialized && (millis() - sdStart < 3000)) {
+      sdInitialized = sd.begin(SD_CONFIG);
+      if (sdInitialized) { break; }
+      M5.update();
 
-    Serial.println(F("SD Wait..."));
-    lcd.fillScreen(TFT_RED);
-    lcd.setTextColor(TFT_BLACK);
-    showMessage(FPSTR(MSG_NO_SD));
-    lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
+      Serial.println(F("SD Wait..."));
+      lcd.fillScreen(TFT_RED);
+      lcd.setTextColor(TFT_BLACK);
+      showMessage(FPSTR(MSG_NO_SD));
+      lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
 
-    delay(1000);
+      delay(1000);
+    }
   }
   if (!sdInitialized) {
     LOGGING = false;
