@@ -110,6 +110,7 @@ float EngTemp = 0.0;
 // GPS用
 TinyGPSPlus gps;
 double la, ln;
+double alt = 0.0;
 double spd = 0.0;
 String Loc = "";
 // サーキットごとの設定
@@ -218,6 +219,10 @@ void updateGNSS() {
   while (Serial2.available() > 0) {
     if (gps.encode(Serial2.read())) {
       if (gps.time.isUpdated()) {
+        double rawAlt = gps.altitude.meters();
+        if (rawAlt > -500 && rawAlt < 10000.0) { // 標高的に妥当な範囲内かを確認
+          alt = rawAlt;
+        }
         if (gps.location.lng() > 120) {  // 異常値除外
           la = gps.location.lat();
           ln = gps.location.lng();
@@ -303,6 +308,8 @@ void updateDisplay() {
   if (ambientpush) lcd_s.drawString("Amb: O", 320, 15);
   if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 15);
   if (!ambientpush && !MQTTpush) {lcd_s.drawString("Amb: x", 320, 15); lcd_s.drawString("MQTT: x", 320, 30);}
+  // 標高表示
+  lcd_s.drawString("標高:" + String(alt, 1) + "m", 320, 85);
   
   // タイトル表示（表示モードごと）
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
@@ -413,6 +420,7 @@ void updateDisplay() {
 void updateSerialOutput() {
   Serial.print(la, 7); Serial.print(",");
   Serial.print(ln, 7); Serial.print(",");
+  Serial.print(alt, 1); Serial.print(",");
   Serial.print(Loc);   Serial.print(",");
   Serial.print(spd, 1); Serial.print(",");
   Serial.print(tachoRpm); Serial.print(",");
@@ -439,6 +447,7 @@ void updateSDLog() {
     logFile.print(dispergas, 1); logFile.print(",");
     logFile.print(la, 7);      logFile.print(",");
     logFile.print(ln, 7);      logFile.print(",");
+    logFile.print(alt, 1);     logFile.print(","); // 高度追加
     logFile.println(EngTemp, 2);
     logFile.close();
   } else {
@@ -474,6 +483,7 @@ void updateMQTT() {
   doc["dispergas"] = dispergas;
   doc["lat"]       = la;
   doc["lon"]       = ln;
+  doc["altitude"]  = alt;
   doc["loc"]       = Loc;
   doc["temp"]      = EngTemp;
   String jsonData;
@@ -497,6 +507,7 @@ void updateAmbient() {
     ambient.set(9, buf);
     dtostrf(ln, 12, 8, buf);
     ambient.set(10, buf);
+    ambient.set(11, alt); // 高度追加 (フィールド11を使用、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
     if (ambient.send(1000)) {
       Serial.println("Ambient: Success!");
     } else {
@@ -569,7 +580,7 @@ void setup() {
         if (logFile) {
           logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
           logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-          logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
+          logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,高度(m),温度"));
           logFile.close();
         }
         break;
