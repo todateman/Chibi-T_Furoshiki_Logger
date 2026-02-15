@@ -483,7 +483,7 @@ void updateMQTT() {
   doc["dispergas"] = dispergas;
   doc["lat"]       = la;
   doc["lon"]       = ln;
-  doc["altitude"]  = alt;
+  doc["alt"]       = alt;
   doc["loc"]       = Loc;
   doc["temp"]      = EngTemp;
   String jsonData;
@@ -495,7 +495,7 @@ void updateMQTT() {
 void updateAmbient() {
   if (WiFi.status() == WL_CONNECTED) {
     char buf[16];
-    ambient.set(1, spd);
+    ambient.set(1, speed);
     ambient.set(2, EngTemp);
     ambient.set(3, Lapcount);
     ambient.set(4, worktime);
@@ -507,7 +507,7 @@ void updateAmbient() {
     ambient.set(9, buf);
     dtostrf(ln, 12, 8, buf);
     ambient.set(10, buf);
-    ambient.set(11, alt); // 高度追加 (フィールド11を使用、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
+    // ambient.set(11, alt); // 高度追加 (フィールド11は使用上無いのでコメントアウト、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
     if (ambient.send(1000)) {
       Serial.println("Ambient: Success!");
     } else {
