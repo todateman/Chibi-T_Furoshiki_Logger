@@ -149,6 +149,86 @@ void showMessage(String msg)
   lcd.print("C");
 }
 
+bool isBLEValueChar(char c)
+{
+  return (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-';
+}
+
+bool tryParseBLETemperature(const String& raw, float& outTemp)
+{
+  if (raw.length() == 0) {
+    return false;
+  }
+
+  bool hasDigit = false;
+  for (size_t i = 0; i < raw.length(); i++) {
+    char c = raw[i];
+    if (isBLEValueChar(c)) {
+      if (c >= '0' && c <= '9') {
+        hasDigit = true;
+      }
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      continue;
+    }
+    return false;
+  }
+
+  if (!hasDigit) {
+    return false;
+  }
+
+  char* endPtr = nullptr;
+  float parsed = strtof(raw.c_str(), &endPtr);
+  if (endPtr == raw.c_str()) {
+    return false;
+  }
+  while (*endPtr != '\0') {
+    if (*endPtr != ' ' && *endPtr != '\t' && *endPtr != '\r' && *endPtr != '\n') {
+      return false;
+    }
+    endPtr++;
+  }
+
+  outTemp = parsed;
+  return true;
+}
+
+void processBLEPayload(String& payload, bool timeoutPath)
+{
+  while (payload.length() > 0 && (payload[payload.length() - 1] == '\n' || payload[payload.length() - 1] == '\r')) {
+    payload.remove(payload.length() - 1);
+  }
+  payload.trim();
+  if (payload.length() == 0) {
+    return;
+  }
+
+  float tempValue = 0.0;
+  if (!tryParseBLETemperature(payload, tempValue)) {
+    payload = "";
+    return;
+  }
+
+  if (tempValue >= 10.0 && tempValue <= 150.0) {
+    EngTemp = tempValue;
+    if (timeoutPath) {
+      Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);
+    } else {
+      Serial.printf("[BLE] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);
+    }
+  } else {
+    if (timeoutPath) {
+      Serial.printf("[BLE TIMEOUT] OUT OF RANGE: %s -> %.2f\n", payload.c_str(), tempValue);
+    } else {
+      Serial.printf("[BLE] OUT OF RANGE: %s -> %.2f\n", payload.c_str(), tempValue);
+    }
+  }
+
+  payload = "";
+}
+
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
 void updateBLE() {
   static String bleBuffer = "";
@@ -156,33 +236,31 @@ void updateBLE() {
   
   while (SerialBLE.available() > 0) {
     char c = SerialBLE.read();
-    bleBuffer += c;
     lastBLETime = millis();
+
     if (c == '\n') {
-      bleBuffer.trim();
-      if (bleBuffer.length() > 0) {
-        // データ完整性チェック: 数値として有効かつ妥当な範囲内かを確認
-        float tempValue = bleBuffer.toFloat();
-        // 温度として妥当な範囲（20～150℃）かつ、toFloat()が有効な変換を行ったかチェック
-        if ((tempValue != 0.0 || bleBuffer == "0" || bleBuffer == "0.0") && 
-            tempValue >= 20.0 && tempValue <= 150.0) {
-          EngTemp = tempValue;
-        }
-        // 不正なデータの場合は前回値を保持（更新しない）
+      processBLEPayload(bleBuffer, false);
+      continue;
+    }
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (isBLEValueChar(c)) {
+      bleBuffer += c;
+      if (bleBuffer.length() > 15) {
+        bleBuffer = "";
       }
-      bleBuffer = "";
     }
   }
-  /*
-  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {   // タイムアウト処理(100ミリ秒以上経過)
-    bleBuffer.trim();
-    if (bleBuffer.length() > 0) {
-      EngTemp = bleBuffer.toFloat();
-    }
-    bleBuffer = "";
+
+  // 不完全なデータの部分タイムアウト処理(100ミリ秒以上経過)
+  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {
+    processBLEPayload(bleBuffer, true);
   }
-  */
-  if (millis() - lastBLETime > 10000) {   // タイムアウト処理(10秒以上経過)
+  // データ受信完全ロス時のリセット処理(2秒以上経過)
+  if (millis() - lastBLETime > 2000) {
     EngTemp = 0.0;  // エンジン温度をリセット
     bleBuffer = "";
   }
@@ -531,7 +609,8 @@ void setup() {
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
   #else
-    SerialBLE.begin(115200);
+    // バッファサイズを512バイトに拡大してデータロス対策
+    SerialBLE.begin(115200, SWSERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN, false, 512);
   #endif
   
   // LCD初期化
