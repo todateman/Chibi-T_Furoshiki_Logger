@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include "SdFat.h"
@@ -61,8 +62,10 @@ SdFat sd;
 #endif
 file_t logFile;
 bool LOGGING = true;
-char fileName[20];
-int fileNum = 0;
+char fileName[20];  // ログファイル名（例: /LOG/LOG0000.CSV）
+int fileNum = 0;    // ログファイル番号（例: LOG0000.CSVの0000部分）
+bool logFileInitialized = false;  // ログファイルが初期化されているか（ヘッダ書き込み済みか）
+const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイル番号を保存するファイル
 
 // WiFi, MQTT, Ambient
 WiFiManager wifiManager;
@@ -109,8 +112,9 @@ float EngTemp = 0.0;
 
 // GPS用
 TinyGPSPlus gps;
-double la = 34.990768;    // KMMF2026の緯度経度初期値
-double ln = 137.010875;   // KMMF2026の緯度経度初期値
+double la, ln;
+// double la = 34.990768;    // KMMF2026の緯度経度初期値
+// double ln = 137.010875;   // KMMF2026の緯度経度初期値
 double spd = 0.0;
 String Loc = "";
 // サーキットごとの設定
@@ -145,6 +149,36 @@ void showMessage(String msg)
   lcd.print("A");
   lcd.setCursor(260, 230);
   lcd.print("C");
+}
+
+// 次回ログ番号の読み書き（起動時の採番高速化用）
+int loadNextLogIndex() {
+  file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_READ);
+  if (!indexFile) {
+    return 0;
+  }
+
+  char buf[16] = {0};
+  int len = indexFile.read(buf, sizeof(buf) - 1);
+  indexFile.close();
+  if (len <= 0) {
+    return 0;
+  }
+
+  int nextIndex = atoi(buf);
+  if (nextIndex < 0) {
+    return 0;
+  }
+  return nextIndex;
+}
+
+void saveNextLogIndex(int nextIndex) {
+  file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_WRITE | O_CREAT | O_TRUNC);
+  if (!indexFile) {
+    return;
+  }
+  indexFile.print(nextIndex);
+  indexFile.close();
 }
 
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
@@ -431,8 +465,23 @@ void updateSerialOutput() {
 
 // SDカードへのログ書き出し
 void updateSDLog() {
+  bool isNewFile = false;
+  if (!logFileInitialized) {
+    isNewFile = !sd.exists(fileName);
+  }
+
   logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
   if (logFile) {
+    if (!logFileInitialized) {
+      if (isNewFile) {
+        logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
+        logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
+        saveNextLogIndex(fileNum + 1);
+      }
+      logFileInitialized = true;
+    }
+
     logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
     logFile.print(datetime); logFile.print(",");
     logFile.print(speed);    logFile.print(",");
@@ -544,19 +593,22 @@ void setup() {
   lcd.setTextDatum(baseline_center);
   
   // SDカード初期化（最大3秒待機）
-  unsigned long sdStart = millis();
-  bool sdInitialized = false;
-  while (!sdInitialized && (millis() - sdStart < 3000)) {
-    if (sd.begin(SD_CONFIG)) { sdInitialized = true; break; }
-    M5.update();
+  bool sdInitialized = sd.begin(SD_CONFIG);
+  if (!sdInitialized) {
+    unsigned long sdStart = millis();
+    while (!sdInitialized && (millis() - sdStart < 3000)) {
+      sdInitialized = sd.begin(SD_CONFIG);
+      if (sdInitialized) { break; }
+      M5.update();
 
-    Serial.println(F("SD Wait..."));
-    lcd.fillScreen(TFT_RED);
-    lcd.setTextColor(TFT_BLACK);
-    showMessage(FPSTR(MSG_NO_SD));
-    lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
+      Serial.println(F("SD Wait..."));
+      lcd.fillScreen(TFT_RED);
+      lcd.setTextColor(TFT_BLACK);
+      showMessage(FPSTR(MSG_NO_SD));
+      lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
 
-    delay(1000);
+      delay(1000);
+    }
   }
   if (!sdInitialized) {
     LOGGING = false;
@@ -566,17 +618,19 @@ void setup() {
       sd.mkdir("/LOG");
       showMessage(FPSTR(MSG_LOG_DIR_CREATE));
     }
+
+    // ログが消去されている場合はインデックスファイルを使わず先頭から採番
+    if (!sd.exists("/LOG/LOG0000.CSV")) {
+      fileNum = 0;
+    } else {
+      fileNum = loadNextLogIndex();
+    }
+
+    showMessage(FPSTR(MSG_LOG_FILE_CREATE));
     while (true) {
       snprintf(fileName, sizeof(fileName), "/LOG/LOG%04d.CSV", fileNum);
-      showMessage(FPSTR(MSG_LOG_FILE_CREATE));
       if (!sd.exists(fileName)) {
-        logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
-        if (logFile) {
-          logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
-          logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-          logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
-          logFile.close();
-        }
+        logFileInitialized = false;
         break;
       }
       fileNum++;
