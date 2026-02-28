@@ -99,7 +99,7 @@ SoftwareSerial SerialBLE(BLE_RX_PIN, BLE_TX_PIN);
 uint16_t tachoRpm = 0;
 float INJ_timems = 0.0;
 uint8_t IGN_CA = 0;
-uint8_t speed = 0;
+float speed = 0.0;
 uint16_t distance = 0;
 float gasml = 0.0;
 float dispergas = 0.0;
@@ -115,6 +115,7 @@ TinyGPSPlus gps;
 double la, ln;
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
+double alt = 0.0;
 double spd = 0.0;
 String Loc = "";
 // サーキットごとの設定
@@ -325,7 +326,7 @@ void updateECU() {
       if (i == 0) { tachoRpm = data.toInt(); }
       if (i == 1) { INJ_timems = data.toFloat(); }
       if (i == 2) { IGN_CA = data.toInt(); }
-      if (i == 3) { speed = data.toInt(); }
+      if (i == 3) { speed = data.toFloat(); }
       if (i == 4) { distance = data.toInt(); }
       if (i == 5) { gasml = data.toFloat(); }
       if (i == 6) { dispergas = data.toFloat(); }
@@ -337,7 +338,7 @@ void updateECU() {
       tachoRpm = 0;
       INJ_timems = 0;
       IGN_CA = 0;
-      speed = 0;
+      speed = 0.0;
     }
   }
 }
@@ -347,6 +348,10 @@ void updateGNSS() {
   while (Serial2.available() > 0) {
     if (gps.encode(Serial2.read())) {
       if (gps.time.isUpdated()) {
+        double rawAlt = gps.altitude.meters();
+        if (rawAlt > -500 && rawAlt < 10000.0) { // 標高的に妥当な範囲内かを確認
+          alt = rawAlt;
+        }
         if (gps.location.lng() > 120) {  // 異常値除外
           la = gps.location.lat();
           ln = gps.location.lng();
@@ -431,7 +436,9 @@ void updateDisplay() {
   lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
   if (ambientpush) lcd_s.drawString("Amb: O", 320, 15);
   if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 15);
-  if (!ambientpush && !MQTTpush) lcd_s.drawString("Amb･MQTT: x", 320, 15);
+  if (!ambientpush && !MQTTpush) {lcd_s.drawString("Amb: x", 320, 15); lcd_s.drawString("MQTT: x", 320, 30);}
+  // 標高表示（デバッグ用）
+  // lcd_s.drawString("標高:" + String(alt, 1) + "m", 320, 85);
   
   // タイトル表示（表示モードごと）
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
@@ -457,11 +464,11 @@ void updateDisplay() {
   lcd_s.setTextDatum(BL_DATUM);
   lcd_s.setCursor(140, 50);
   if (dispmode == 0 || dispmode == 2) {
-    lcd_s.print(speed);
+    lcd_s.print(speed, 1);
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);
-    int barLength = map(speed, 0, 45, 0, 300);
+    int barLength = (int)((constrain(speed, 0.0, 45.0) / 45.0) * 300.0);
     lcd_s.fillRect(10, 55, barLength, 10, TFT_WHITE);
-    lcd_s.fillRect(map(speed, 0, 45, 10, 310), 55, map(speed, 0, 45, 300, 0), 10, TFT_BLACK);
+    lcd_s.fillRect(10 + barLength, 55, 300 - barLength, 10, TFT_BLACK);
   } else if (dispmode == 1) {
     lcd_s.print(tachoRpm);
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);
@@ -542,10 +549,11 @@ void updateDisplay() {
 void updateSerialOutput() {
   Serial.print(la, 7); Serial.print(",");
   Serial.print(ln, 7); Serial.print(",");
+  Serial.print(alt, 1); Serial.print(",");
   Serial.print(Loc);   Serial.print(",");
   Serial.print(spd, 1); Serial.print(",");
   Serial.print(tachoRpm); Serial.print(",");
-  Serial.print(speed);    Serial.print(",");
+  Serial.print(speed, 1);    Serial.print(",");
   Serial.print(distance); Serial.print(",");
   Serial.print(gasml, 1); Serial.print(",");
   Serial.print(dispergas, 1); Serial.print(",");
@@ -568,7 +576,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,温度"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -576,7 +584,7 @@ void updateSDLog() {
 
     logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
     logFile.print(datetime); logFile.print(",");
-    logFile.print(speed);    logFile.print(",");
+    logFile.print(speed, 1);    logFile.print(",");
     logFile.print(Lapcount); logFile.print(",");
     logFile.print(worktime); logFile.print(",");
     logFile.print(tachoRpm); logFile.print(",");
@@ -585,6 +593,7 @@ void updateSDLog() {
     logFile.print(dispergas, 1); logFile.print(",");
     logFile.print(la, 7);      logFile.print(",");
     logFile.print(ln, 7);      logFile.print(",");
+    logFile.print(alt, 1);     logFile.print(","); // 高度追加
     logFile.println(EngTemp, 2);
     logFile.close();
   } else {
@@ -622,6 +631,7 @@ void updateMQTT() {
   doc["dispergas"] = dispergas;
   doc["lat"]       = la;
   doc["lon"]       = ln;
+  doc["alt"]       = alt;
   doc["loc"]       = Loc;
   doc["temp"]      = EngTemp;
   String jsonData;
@@ -633,7 +643,7 @@ void updateMQTT() {
 void updateAmbient() {
   if (WiFi.status() == WL_CONNECTED) {
     char buf[16];
-    ambient.set(1, spd);
+    ambient.set(1, speed);
     ambient.set(2, EngTemp);
     ambient.set(3, Lapcount);
     ambient.set(4, worktime);
@@ -645,6 +655,7 @@ void updateAmbient() {
     ambient.set(9, buf);
     dtostrf(ln, 12, 8, buf);
     ambient.set(10, buf);
+    // ambient.set(11, alt); // 高度追加 (フィールド11は使用上無いのでコメントアウト、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
     if (ambient.send(1000)) {
       Serial.println("Ambient: Success!");
     } else {
