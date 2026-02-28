@@ -132,6 +132,17 @@ char datetime[23];
 // NTP同期フラグ（GPS受信後は更新しない）
 bool ntpSyncDone = false;
 
+// 日時バッファ更新（必要に応じてセンチ秒を指定）
+void refreshDatetime(uint8_t csec = 255) {
+  uint8_t displayCsec = csec;
+  if (displayCsec > 99) {
+    displayCsec = (millis() / 10) % 100;  // センチ秒が指定されていない場合は現在のミリ秒から算出して表示（00-99）
+  }
+
+  sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
+            year(), month(), day(), hour(), minute(), second(), displayCsec);
+}
+
 // ディスプレイ表示モード
 uint8_t dispmode = 0;
 
@@ -381,8 +392,7 @@ void updateGNSS() {
           }
           setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
           ntpSyncDone = true;  // GPS時刻受信後はNTP同期不要（GPS優先）
-          sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
-                    year(), month(), day(), hour(), minute(), second(), gnss_csec);
+          refreshDatetime(gnss_csec);  // デバッグ用Serial出力
         }
         break;
       }
@@ -545,6 +555,8 @@ void updateSerialOutput() {
 
 // SDカードへのログ書き出し
 void updateSDLog() {
+  refreshDatetime();  // MQTT送信前に日時を更新
+
   bool isNewFile = false;
   if (!logFileInitialized) {
     isNewFile = !sd.exists(fileName);
@@ -582,6 +594,8 @@ void updateSDLog() {
 
 // MQTT送信（非同期リトライ）
 void updateMQTT() {
+  refreshDatetime();  // MQTT送信前に日時を更新
+
   if (!mqttclient.connected()) {
     static unsigned long lastReconnectAttempt = 0;
     if (millis() - lastReconnectAttempt > 5000) {
@@ -798,8 +812,7 @@ void setup() {
         setTime(timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec,
                 timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900);
         // datetime バッファを更新
-        sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.00"),
-                  year(), month(), day(), hour(), minute(), second());
+        refreshDatetime(0);
         Serial.print("NTP sync succeeded: ");
         Serial.println(asctime(timeinfo));
         break;
