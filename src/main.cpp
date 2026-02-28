@@ -62,9 +62,10 @@ SdFat sd;
 #endif
 file_t logFile;
 bool LOGGING = true;
-char fileName[20];
-int fileNum = 0;
-const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";
+char fileName[20];  // ログファイル名（例: /LOG/LOG0000.CSV）
+int fileNum = 0;    // ログファイル番号（例: LOG0000.CSVの0000部分）
+bool logFileInitialized = false;  // ログファイルが初期化されているか（ヘッダ書き込み済みか）
+const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイル番号を保存するファイル
 
 // WiFi, MQTT, Ambient
 WiFiManager wifiManager;
@@ -544,8 +545,23 @@ void updateSerialOutput() {
 
 // SDカードへのログ書き出し
 void updateSDLog() {
+  bool isNewFile = false;
+  if (!logFileInitialized) {
+    isNewFile = !sd.exists(fileName);
+  }
+
   logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
   if (logFile) {
+    if (!logFileInitialized) {
+      if (isNewFile) {
+        logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
+        logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
+        saveNextLogIndex(fileNum + 1);
+      }
+      logFileInitialized = true;
+    }
+
     logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
     logFile.print(datetime); logFile.print(",");
     logFile.print(speed);    logFile.print(",");
@@ -695,14 +711,7 @@ void setup() {
     while (true) {
       snprintf(fileName, sizeof(fileName), "/LOG/LOG%04d.CSV", fileNum);
       if (!sd.exists(fileName)) {
-        logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
-        if (logFile) {
-          logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
-          logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-          logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
-          logFile.close();
-          saveNextLogIndex(fileNum + 1);
-        }
+        logFileInitialized = false;
         break;
       }
       fileNum++;
