@@ -64,6 +64,7 @@ file_t logFile;
 bool LOGGING = true;
 char fileName[20];
 int fileNum = 0;
+const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";
 
 // WiFi, MQTT, Ambient
 WiFiManager wifiManager;
@@ -147,6 +148,36 @@ void showMessage(String msg)
   lcd.print("A");
   lcd.setCursor(260, 230);
   lcd.print("C");
+}
+
+// 次回ログ番号の読み書き（起動時の採番高速化用）
+int loadNextLogIndex() {
+  file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_READ);
+  if (!indexFile) {
+    return 0;
+  }
+
+  char buf[16] = {0};
+  int len = indexFile.read(buf, sizeof(buf) - 1);
+  indexFile.close();
+  if (len <= 0) {
+    return 0;
+  }
+
+  int nextIndex = atoi(buf);
+  if (nextIndex < 0) {
+    return 0;
+  }
+  return nextIndex;
+}
+
+void saveNextLogIndex(int nextIndex) {
+  file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_WRITE | O_CREAT | O_TRUNC);
+  if (!indexFile) {
+    return;
+  }
+  indexFile.print(nextIndex);
+  indexFile.close();
 }
 
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
@@ -571,9 +602,17 @@ void setup() {
       sd.mkdir("/LOG");
       showMessage(FPSTR(MSG_LOG_DIR_CREATE));
     }
+
+    // ログが消去されている場合はインデックスファイルを使わず先頭から採番
+    if (!sd.exists("/LOG/LOG0000.CSV")) {
+      fileNum = 0;
+    } else {
+      fileNum = loadNextLogIndex();
+    }
+
+    showMessage(FPSTR(MSG_LOG_FILE_CREATE));
     while (true) {
       snprintf(fileName, sizeof(fileName), "/LOG/LOG%04d.CSV", fileNum);
-      showMessage(FPSTR(MSG_LOG_FILE_CREATE));
       if (!sd.exists(fileName)) {
         logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
         if (logFile) {
@@ -581,6 +620,7 @@ void setup() {
           logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
           logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
           logFile.close();
+          saveNextLogIndex(fileNum + 1);
         }
         break;
       }
