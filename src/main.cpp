@@ -64,6 +64,7 @@ file_t logFile;
 bool LOGGING = true;
 char fileName[20];
 int fileNum = 0;
+const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";
 
 // WiFi, MQTT, Ambient
 WiFiManager wifiManager;
@@ -149,27 +150,28 @@ void showMessage(String msg)
   lcd.print("C");
 }
 
+// BLEから受信した文字が温度データとして有効な文字かどうかを判定する
 bool isBLEValueChar(char c)
 {
   return (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-';
 }
 
-bool tryParseBLETemperature(const String& raw, float& outTemp)
-{
-  if (raw.length() == 0) {
+// BLEから受信した文字列が有効な温度データかどうかを判定し変換する
+bool tryParseBLETemperature(const String& raw, float& outTemp) {
+  if (raw.length() == 0) {                      // 空文字は無効
     return false;
   }
 
   bool hasDigit = false;
-  for (size_t i = 0; i < raw.length(); i++) {
+  for (size_t i = 0; i < raw.length(); i++) {   // 有効な文字以外が混入していないかチェック
     char c = raw[i];
-    if (isBLEValueChar(c)) {
+    if (isBLEValueChar(c)) {                      // 有効な文字の場合は数字が含まれているかもチェック
       if (c >= '0' && c <= '9') {
         hasDigit = true;
       }
       continue;
     }
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {  // 空白文字は無視
       continue;
     }
     return false;
@@ -179,13 +181,13 @@ bool tryParseBLETemperature(const String& raw, float& outTemp)
     return false;
   }
 
-  char* endPtr = nullptr;
-  float parsed = strtof(raw.c_str(), &endPtr);
-  if (endPtr == raw.c_str()) {
+  char* endPtr = nullptr;                       // 変換後の文字列の末尾を指すポインタ
+  float parsed = strtof(raw.c_str(), &endPtr);  // 文字列をfloatに変換
+  if (endPtr == raw.c_str()) {                  // 変換できなかった場合は無効
     return false;
   }
-  while (*endPtr != '\0') {
-    if (*endPtr != ' ' && *endPtr != '\t' && *endPtr != '\r' && *endPtr != '\n') {
+  while (*endPtr != '\0') {                     // 変換後の文字列の末尾以降に有効な文字が混入していないかチェック
+    if (*endPtr != ' ' && *endPtr != '\t' && *endPtr != '\r' && *endPtr != '\n') {  // 空白文字以外が混入している場合は無効
       return false;
     }
     endPtr++;
@@ -195,28 +197,28 @@ bool tryParseBLETemperature(const String& raw, float& outTemp)
   return true;
 }
 
-void processBLEPayload(String& payload, bool timeoutPath)
-{
-  while (payload.length() > 0 && (payload[payload.length() - 1] == '\n' || payload[payload.length() - 1] == '\r')) {
-    payload.remove(payload.length() - 1);
+// BLEから受信した文字列を処理してエンジン温度に変換する
+void processBLEPayload(String& payload, bool timeoutPath) { 
+  while (payload.length() > 0 && (payload[payload.length() - 1] == '\n' || payload[payload.length() - 1] == '\r')) {  // 末尾の改行コードを削除
+    payload.remove(payload.length() - 1);   // これにより、改行コードが複数重なっている場合でもすべて削除される
   }
-  payload.trim();
+  payload.trim();                         // 前後の空白を削除
   if (payload.length() == 0) {
     return;
   }
 
-  float tempValue = 0.0;
-  if (!tryParseBLETemperature(payload, tempValue)) {
+  float tempValue = 0.0;                  // 変換後の温度値を格納する変数
+  if (!tryParseBLETemperature(payload, tempValue)) {  // 文字列が有効な温度データでない場合はエラーとして処理
     payload = "";
     return;
   }
 
-  if (tempValue >= 10.0 && tempValue <= 150.0) {
-    EngTemp = tempValue;
-    if (timeoutPath) {
-      Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);
+  if (tempValue >= 10.0 && tempValue <= 150.0) {  // 有効な温度範囲内かチェック
+    EngTemp = tempValue;                          // グローバル変数にエンジン温度を保存
+    if (timeoutPath) {                            // タイムアウト経路で受信したデータはログに残す
+      Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);  // タイムアウト経路で受信したデータはログに残す（SDカードに記録されるため）
     } else {
-      Serial.printf("[BLE] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);
+      Serial.printf("[BLE] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);          // 通常経路で受信したデータはログに残さない（SDカードに記録されるため）
     }
   } else {
     if (timeoutPath) {
@@ -227,6 +229,37 @@ void processBLEPayload(String& payload, bool timeoutPath)
   }
 
   payload = "";
+}
+
+// 次回ログ番号の読み込み（起動時の採番高速化用）
+int loadNextLogIndex() {
+  file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_READ);  // インデックスファイルを開く
+  if (!indexFile) {
+    return 0;
+  }
+
+  char buf[16] = {0};
+  int len = indexFile.read(buf, sizeof(buf) - 1);  // インデックスファイルからデータを読み込む
+  indexFile.close();
+  if (len <= 0) {
+    return 0;
+  }
+
+  int nextIndex = atoi(buf);          // 読み込んだ文字列を整数に変換
+  if (nextIndex < 0) {
+    return 0;
+  }
+  return nextIndex;
+}
+
+// 次回ログ番号の書き込み（起動時の採番高速化用）
+void saveNextLogIndex(int nextIndex) {
+  file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_WRITE | O_CREAT | O_TRUNC);  // インデックスファイルを開く
+  if (!indexFile) {
+    return;
+  }
+  indexFile.print(nextIndex);         // 次回ログ番号を書き込む
+  indexFile.close();                  // インデックスファイルを閉じる
 }
 
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
@@ -625,19 +658,22 @@ void setup() {
   lcd.setTextDatum(baseline_center);
   
   // SDカード初期化（最大3秒待機）
-  unsigned long sdStart = millis();
-  bool sdInitialized = false;
-  while (!sdInitialized && (millis() - sdStart < 3000)) {
-    if (sd.begin(SD_CONFIG)) { sdInitialized = true; break; }
-    M5.update();
+  bool sdInitialized = sd.begin(SD_CONFIG);
+  if (!sdInitialized) {
+    unsigned long sdStart = millis();
+    while (!sdInitialized && (millis() - sdStart < 3000)) {
+      sdInitialized = sd.begin(SD_CONFIG);
+      if (sdInitialized) { break; }
+      M5.update();
 
-    Serial.println(F("SD Wait..."));
-    lcd.fillScreen(TFT_RED);
-    lcd.setTextColor(TFT_BLACK);
-    showMessage(FPSTR(MSG_NO_SD));
-    lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
+      Serial.println(F("SD Wait..."));
+      lcd.fillScreen(TFT_RED);
+      lcd.setTextColor(TFT_BLACK);
+      showMessage(FPSTR(MSG_NO_SD));
+      lcd.drawNumber(int((3000 - (millis() - sdStart)) / 1000), lcd.width()/2, lcd.height()/2+20);
 
-    delay(1000);
+      delay(1000);
+    }
   }
   if (!sdInitialized) {
     LOGGING = false;
@@ -647,9 +683,17 @@ void setup() {
       sd.mkdir("/LOG");
       showMessage(FPSTR(MSG_LOG_DIR_CREATE));
     }
+
+    // ログが消去されている場合はインデックスファイルを使わず先頭から採番
+    if (!sd.exists("/LOG/LOG0000.CSV")) {
+      fileNum = 0;
+    } else {
+      fileNum = loadNextLogIndex();
+    }
+
+    showMessage(FPSTR(MSG_LOG_FILE_CREATE));
     while (true) {
       snprintf(fileName, sizeof(fileName), "/LOG/LOG%04d.CSV", fileNum);
-      showMessage(FPSTR(MSG_LOG_FILE_CREATE));
       if (!sd.exists(fileName)) {
         logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
         if (logFile) {
@@ -657,6 +701,7 @@ void setup() {
           logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
           logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度"));
           logFile.close();
+          saveNextLogIndex(fileNum + 1);
         }
         break;
       }
