@@ -9,9 +9,112 @@
 #include <TimeLib.h>
 #include <WiFiClientSecure.h>
 #include <WiFiClient.h>
+#include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "AltitudeEKF.h"
 #include "secrets.h"
+
+// M5.In_I2C を使う BMP280 ミニドライバ
+struct BMP280Driver {
+  static constexpr uint8_t ADDR = 0x76;
+  static constexpr uint32_t FREQ = 400000;
+  uint16_t digT1 = 0;
+  int16_t digT2 = 0;
+  int16_t digT3 = 0;
+  uint16_t digP1 = 0;
+  int16_t digP2 = 0;
+  int16_t digP3 = 0;
+  int16_t digP4 = 0;
+  int16_t digP5 = 0;
+  int16_t digP6 = 0;
+  int16_t digP7 = 0;
+  int16_t digP8 = 0;
+  int16_t digP9 = 0;
+  int32_t tFine = 0;
+
+  bool begin() {
+    uint8_t id = 0;
+    if (!M5.In_I2C.readRegister(ADDR, 0xD0, &id, 1, FREQ)) {
+      return false;
+    }
+    if (id != 0x58) {
+      return false;
+    }
+    uint8_t calib[24] = {0};
+    if (!M5.In_I2C.readRegister(ADDR, 0x88, calib, sizeof(calib), FREQ)) {
+      return false;
+    }
+
+    digT1 = (uint16_t)(calib[1] << 8 | calib[0]);
+    digT2 = (int16_t)(calib[3] << 8 | calib[2]);
+    digT3 = (int16_t)(calib[5] << 8 | calib[4]);
+    digP1 = (uint16_t)(calib[7] << 8 | calib[6]);
+    digP2 = (int16_t)(calib[9] << 8 | calib[8]);
+    digP3 = (int16_t)(calib[11] << 8 | calib[10]);
+    digP4 = (int16_t)(calib[13] << 8 | calib[12]);
+    digP5 = (int16_t)(calib[15] << 8 | calib[14]);
+    digP6 = (int16_t)(calib[17] << 8 | calib[16]);
+    digP7 = (int16_t)(calib[19] << 8 | calib[18]);
+    digP8 = (int16_t)(calib[21] << 8 | calib[20]);
+    digP9 = (int16_t)(calib[23] << 8 | calib[22]);
+
+    uint8_t ctrlMeas = 0x27;  // temp x1, press x1, normal mode
+    uint8_t config = 0xA0;    // standby 1000ms, IIR x4
+    if (!M5.In_I2C.writeRegister8(ADDR, 0xF4, ctrlMeas, FREQ)) {
+      return false;
+    }
+    if (!M5.In_I2C.writeRegister8(ADDR, 0xF5, config, FREQ)) {
+      return false;
+    }
+    return true;
+  }
+
+  bool readPressurePa(float& pressurePa) {
+    uint8_t buf[6] = {0};
+    if (!M5.In_I2C.readRegister(ADDR, 0xF7, buf, sizeof(buf), FREQ)) {
+      return false;
+    }
+
+    int32_t adcP = (int32_t)((buf[0] << 12) | (buf[1] << 4) | (buf[2] >> 4));
+    int32_t adcT = (int32_t)((buf[3] << 12) | (buf[4] << 4) | (buf[5] >> 4));
+    if (adcP == 0x80000 || adcT == 0x80000) {
+      return false;
+    }
+
+    int32_t var1 = ((((adcT >> 3) - ((int32_t)digT1 << 1))) * ((int32_t)digT2)) >> 11;
+    int32_t var2 = (((((adcT >> 4) - ((int32_t)digT1)) * ((adcT >> 4) - ((int32_t)digT1))) >> 12) * ((int32_t)digT3)) >> 14;
+    tFine = var1 + var2;
+
+    int64_t pvar1 = ((int64_t)tFine) - 128000;
+    int64_t pvar2 = pvar1 * pvar1 * (int64_t)digP6;
+    pvar2 = pvar2 + ((pvar1 * (int64_t)digP5) << 17);
+    pvar2 = pvar2 + (((int64_t)digP4) << 35);
+    pvar1 = ((pvar1 * pvar1 * (int64_t)digP3) >> 8) + ((pvar1 * (int64_t)digP2) << 12);
+    pvar1 = (((((int64_t)1) << 47) + pvar1) * ((int64_t)digP1)) >> 33;
+    if (pvar1 == 0) {
+      return false;
+    }
+
+    int64_t p = 1048576 - adcP;
+    p = (((p << 31) - pvar2) * 3125) / pvar1;
+    pvar1 = (((int64_t)digP9) * (p >> 13) * (p >> 13)) >> 25;
+    pvar2 = (((int64_t)digP8) * p) >> 19;
+    p = ((p + pvar1 + pvar2) >> 8) + (((int64_t)digP7) << 4);
+
+    pressurePa = (float)p / 256.0f;
+    return pressurePa > 0.0f;
+  }
+
+  bool readAltitude(float seaLevelHpa, float& altitudeM) {
+    float pressurePa = 0.0f;
+    if (!readPressurePa(pressurePa)) {
+      return false;
+    }
+    altitudeM = AltitudeMath::pressureToAltitudeMeters(pressurePa, seaLevelHpa);
+    return true;
+  }
+};
 
 //==================== 定数・マクロ ====================
 #define pi 3.141592653589793
@@ -32,6 +135,15 @@
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
+
+// 高度推定設定
+static constexpr float SEA_LEVEL_HPA = 1013.25f;
+// 実走想定: 野外・水平移動・1-80km/h (路面振動/風圧の影響を見込んだ設定)
+static constexpr float R_BARO = 0.36f;          // baro sigma ~0.6m
+static constexpr float R_GNSS = 36.0f;          // abs altitude sigma ~6.0m (GNSS fallback時)
+static constexpr float EKF_PROCESS_SIGMA_A = 1.2f; // IMU vertical accel noise sigma [m/s^2]
+static constexpr uint32_t GNSS_BAUD = 38400;
+static constexpr unsigned long GSI_ELEVATION_INTERVAL = 10000;
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -96,35 +208,51 @@ SoftwareSerial SerialBLE(BLE_RX_PIN, BLE_TX_PIN);
 #endif
 
 // ECU受信データ
-uint16_t tachoRpm = 0;
-float INJ_timems = 0.0;
-uint8_t IGN_CA = 0;
-float speed = 0.0;
-uint16_t distance = 0;
-float gasml = 0.0;
-float dispergas = 0.0;
-uint16_t worktime = 0;
-uint16_t Lapcount = 0;
-uint8_t totallaps = 3;
-uint16_t goal = 1000;
-uint16_t limittime = 100;
-float EngTemp = 0.0;
+uint16_t tachoRpm = 0;  // エンジン回転数 [rpm]
+float INJ_timems = 0.0; // 燃料噴射時間 [ms]（燃料噴射量の指標として利用）
+uint8_t IGN_CA = 0;     // 点火時期 [°CA]（クランク角度）
+float speed = 0.0;      // 車軸パルスから算出した車速 [km/h]
+uint16_t distance = 0;  // 走行距離 [m]
+float gasml = 0.0;      // 燃料消費量 [ml]（燃料噴射時間から推定）※あくまで目安で、実際の消費量とは異なる可能性が高い
+float dispergas = 0.0;  // 燃料消費率 [ml/km]（燃料消費量 / 走行距離）※あくまで目安で、実際の消費率とは異なる可能性が高い
+uint16_t worktime = 0;  // 走行時間 [s]（エンジン始動以降の時間を累積）
+uint16_t Lapcount = 0;  // 周回数
+uint8_t totallaps = 3;  // 周回数（サーキットごとに設定値を上書き）
+uint16_t goal = 1000;   // 走行距離 [m]（サーキットごとに設定値を上書き）
+uint16_t limittime = 100; // 制限時間 [s]（サーキットごとに設定値を上書き）
+float EngTemp = 0.0;    // エンジン温度 [°C]
 
 // GPS用
 TinyGPSPlus gps;
-double la, ln;
+BMP280Driver bmp;
+AltitudeEKF altitudeEkf;
+double la, ln;              // 緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
-double alt = 0.0;
-double spd = 0.0;
-String Loc = "";
+double alt = 0.0;           // GPS高度（GNSS）
+double altGNSS = 0.0;       // GPS高度（GNSS）フィルタリング後
+double altBaro = 0.0;       // 気圧高度（Baro）
+double spd = 0.0;           // GPS速度
+String Loc = "";            // 位置情報（緯度経度）文字列
+bool gnssAltValid = false;  // GNSS高度が有効かどうか
+bool gnssAltUpdated = false;  // GNSS高度が更新されたかどうか（EKFの更新に利用）
+bool positionValid = false; // 位置情報が有効かどうか（GNSS高度の更新に利用）
+double altGSI = 0.0;        // 国土地理院API(https://maps.gsi.go.jp/development/elevation_s.html)から取得した標高
+bool gsiAltValid = false;   // 国土地理院APIから取得した標高が有効かどうか
+bool gsiAltUpdated = false; // 国土地理院APIから取得した標高が更新されたかどうか（EKFの更新に利用）
+unsigned long lastGsiRequestMs = 0; // 最後に国土地理院APIにリクエストを送った時刻（EKFの更新に利用）
+bool bmpReady = false;      // BMP280が正常に初期化されているかどうか
+bool baroValid = false;     // 気圧高度が有効かどうか（EKFの更新に利用）
+bool baroCalibrated = false;  // 気圧高度がキャリブレーションされているかどうか（EKFの更新に利用）
+float baroOffset = 0.0f;    // 気圧高度のオフセット値（キャリブレーションに利用）
+unsigned long lastAltFusionMs = 0;  // 最後に高度融合を行った時刻（EKFの更新に利用）
 // サーキットごとの設定
-const uint8_t totallaps_su = 8;
-const uint8_t totallaps_mo = 7;
-const uint16_t goal_su = 17616;
-const uint16_t goal_mo = 16389;
-const uint16_t limittime_su = 2536;
-const uint16_t limittime_mo = 2360;
+const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの周回数
+const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの周回数
+const uint16_t goal_su = 17616; // 鈴鹿サーキット東コースの走行距離 [m]
+const uint16_t goal_mo = 16389; // ツインリンクもてぎオーバルコースの走行距離 [m]
+const uint16_t limittime_su = 2536; // 鈴鹿サーキット東コースの制限時間 [s]
+const uint16_t limittime_mo = 2360; // ツインリンクもてぎオーバルコースの制限時間 [s]
 const int time_offset = 9;  // JST
 
 // 時刻表示用バッファ
@@ -275,6 +403,86 @@ void saveNextLogIndex(int nextIndex) {
   indexFile.close();                  // インデックスファイルを閉じる
 }
 
+// 国土地理院APIから標高を取得する（成功時 true）
+bool fetchGsiElevation(double lat, double lon, double& outElevation) {
+  WiFiClientSecure httpsClient;
+  httpsClient.setInsecure();
+
+  char url[192];
+  snprintf(url, sizeof(url),
+           "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon=%.7f&lat=%.7f&outtype=JSON",
+           lon, lat);
+
+  HTTPClient http;
+  http.setTimeout(2000);
+  if (!http.begin(httpsClient, url)) {
+    return false;
+  }
+
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    return false;
+  }
+
+  JsonVariant elevation = doc["elevation"];
+  if (elevation.is<float>() || elevation.is<double>() || elevation.is<int>() || elevation.is<long>()) {
+    outElevation = elevation.as<double>();
+    return true;
+  }
+
+  if (elevation.is<const char*>()) {
+    const char* elevStr = elevation.as<const char*>();
+    if (elevStr != nullptr && strcmp(elevStr, "-----") != 0) {
+      char* endPtr = nullptr;
+      double parsed = strtod(elevStr, &endPtr);
+      if (endPtr != elevStr) {
+        outElevation = parsed;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// インターネット利用可能時はGSI標高を定期取得
+void updateGsiElevation() {
+  gsiAltUpdated = false;
+
+  if (WiFi.status() != WL_CONNECTED || !positionValid) {
+    gsiAltValid = false;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastGsiRequestMs < GSI_ELEVATION_INTERVAL) {
+    return;
+  }
+  lastGsiRequestMs = now;
+
+  double gsiElevation = 0.0;
+  if (fetchGsiElevation(la, ln, gsiElevation)) {
+    if (gsiElevation > -500.0 && gsiElevation < 10000.0) {
+      altGSI = gsiElevation;
+      gsiAltValid = true;
+      gsiAltUpdated = true;
+    }
+  } else {
+    // API取得不可時はGNSSへフォールバックできるよう無効化
+    gsiAltValid = false;
+  }
+}
+
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
 void updateBLE() {
   static String bleBuffer = "";
@@ -345,16 +553,20 @@ void updateECU() {
 
 // GNSSからの位置・時刻読み取り
 void updateGNSS() {
+  gnssAltUpdated = false;
   while (Serial2.available() > 0) {
     if (gps.encode(Serial2.read())) {
       if (gps.time.isUpdated()) {
         double rawAlt = gps.altitude.meters();
         if (rawAlt > -500 && rawAlt < 10000.0) { // 標高的に妥当な範囲内かを確認
-          alt = rawAlt;
+          altGNSS = rawAlt;
+          gnssAltValid = true;
+          gnssAltUpdated = true;
         }
         if (gps.location.lng() > 120) {  // 異常値除外
           la = gps.location.lat();
           ln = gps.location.lng();
+          positionValid = true;
           spd = gps.speed.kmph();
           uint8_t gnss_day = gps.date.day();
           uint8_t gnss_month = gps.date.month();
@@ -404,12 +616,12 @@ void updateGNSS() {
     }
   }
   // ロケーション判定
-  if (la >= 34.837989 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.544450) {
+  if (positionValid && la >= 34.837989 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.544450) {
     Loc = "su";
     totallaps = totallaps_su;
     goal = goal_su;
     limittime = limittime_su;
-  } else if (la >= 36.528477 && la <= 36.538522 && ln >= 140.2192761 && ln <= 140.23853) {
+  } else if (positionValid && la >= 36.528477 && la <= 36.538522 && ln >= 140.2192761 && ln <= 140.23853) {
     Loc = "mo";
     totallaps = totallaps_mo;
     goal = goal_mo;
@@ -417,6 +629,73 @@ void updateGNSS() {
   } else {
     Loc = "to";
   }
+}
+
+// GNSS + BMP280 + IMU で高度を融合
+void updateAltitudeFusion() {
+  unsigned long now = millis();
+  if (lastAltFusionMs == 0) {
+    lastAltFusionMs = now;
+    return;
+  }
+
+  float dt = (now - lastAltFusionMs) * 0.001f;
+  if (dt <= 0.0f) {
+    return;
+  }
+  if (dt > 0.2f) {
+    dt = 0.2f;
+  }
+  lastAltFusionMs = now;
+
+  float ax = 0.0f;
+  float ay = 0.0f;
+  float az = 0.0f;
+  M5.Imu.getAccel(&ax, &ay, &az);
+  // Y軸加速度を用いて重力成分を除去
+  const float ayInertial = -(ay + 1.0f) * 9.80665f;
+
+  bool baroUpdated = false;
+  float rawBaroAlt = 0.0f;
+  const bool absAltValid = gsiAltValid || gnssAltValid;
+  const bool absAltUpdated = gsiAltValid ? gsiAltUpdated : gnssAltUpdated;
+  const double absAlt = gsiAltValid ? altGSI : altGNSS;
+
+  if (bmpReady && bmp.readAltitude(SEA_LEVEL_HPA, rawBaroAlt)) {
+    if (absAltValid && absAltUpdated) {
+      if (!baroCalibrated) {
+        baroOffset = (float)absAlt - rawBaroAlt;
+        baroCalibrated = true;
+      } else {
+        baroOffset += 0.01f * (((float)absAlt - rawBaroAlt) - baroOffset);
+      }
+    }
+    altBaro = rawBaroAlt + baroOffset;
+    baroValid = true;
+    baroUpdated = true;
+  } else {
+    baroValid = false;
+  }
+
+  if (!altitudeEkf.isInitialized()) {
+    if (baroUpdated) {
+      altitudeEkf.init((float)altBaro);
+      alt = altBaro;
+    } else if (absAltValid) {
+      altitudeEkf.init((float)absAlt);
+      alt = absAlt;
+    }
+    return;
+  }
+
+  altitudeEkf.predict(ayInertial, dt);
+  if (baroUpdated) {
+    altitudeEkf.update((float)altBaro, R_BARO);
+  }
+  if (absAltValid && absAltUpdated) {
+    altitudeEkf.update((float)absAlt, R_GNSS);
+  }
+  alt = altitudeEkf.altitude();
 }
 
 // ディスプレイ更新（表示モードごとに分岐）
@@ -481,21 +760,22 @@ void updateDisplay() {
   if (dispmode == 0) {
     uint8_t restlaps = totallaps - Lapcount;
     lcd_s.setCursor(140, 130);
-    if (restlaps > 1)
+    if (restlaps > 1) {
       lcd_s.print(restlaps);
-    else if (restlaps == 1)
+    } else if (restlaps == 1) {
       lcd_s.print("G");
-    else
+    } else {
       lcd_s.print("FINISH");
-    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
-    lcd_s.fillRect(10, 135, map(distance, 0, goal, 300, 0), 10, TFT_WHITE);
-    lcd_s.fillRect(map(distance, 0, goal, 310, 10), 135, map(distance, 0, goal, 0, 300), 10, TFT_BLACK);
-    for (uint8_t i = 0; i <= totallaps; i++) {
-      lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
-      lcd_s.setTextSize(0.6);
-      lcd_s.setTextDatum(TC_DATUM);
-      lcd_s.setCursor((300 * i / totallaps) + 7, 147);
-      lcd_s.print(i);
+      lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
+      lcd_s.fillRect(10, 135, map(distance, 0, goal, 300, 0), 10, TFT_WHITE);
+      lcd_s.fillRect(map(distance, 0, goal, 310, 10), 135, map(distance, 0, goal, 0, 300), 10, TFT_BLACK);
+      for (uint8_t i = 0; i <= totallaps; i++) {
+        lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+        lcd_s.setTextSize(0.6);
+        lcd_s.setTextDatum(TC_DATUM);
+        lcd_s.setCursor((300 * i / totallaps) + 7, 147);
+        lcd_s.print(i);
+      }
     }
   } else if (dispmode == 1) {
     lcd_s.setCursor(140, 130);
@@ -522,11 +802,12 @@ void updateDisplay() {
     lcd_s.setTextColor((map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0)) ? TFT_WHITE : TFT_MAGENTA);
     lcd_s.printf("%02d:%02d", workmin, worksec);
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
-    if (map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0))
+    if (map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0)) {
       lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
-    else
+    } else {
       lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_MAGENTA);
-    lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
+      lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
+    }
   } else if (dispmode == 1) {
     lcd_s.print(IGN_CA);
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
@@ -576,7 +857,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,温度"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -593,7 +874,8 @@ void updateSDLog() {
     logFile.print(dispergas, 1); logFile.print(",");
     logFile.print(la, 7);      logFile.print(",");
     logFile.print(ln, 7);      logFile.print(",");
-    logFile.print(alt, 1);     logFile.print(","); // 高度追加
+    logFile.print(alt, 1);     logFile.print(",");
+    logFile.print(Loc);        logFile.print(",");
     logFile.println(EngTemp, 2);
     logFile.close();
   } else {
@@ -619,7 +901,7 @@ void updateMQTT() {
     return;
   }
   mqttclient.loop();
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   doc["timestamp"] = datetime;
   //doc["Spd_GPS"]   = spd;
   doc["Spd_PULSE"] = speed;
@@ -678,7 +960,13 @@ void setup() {
   Serial.begin(115200);
   // ECU, GNSS初期化
   Serial1.begin(115200, SERIAL_8N1, 27, 19);
-  Serial2.begin(115200);  
+  Serial2.begin(GNSS_BAUD);
+  M5.Imu.init();
+  altitudeEkf.setProcessAccelSigma(EKF_PROCESS_SIGMA_A);
+  altitudeEkf.setInitialCovariance(100.0f, 10.0f);
+  bmpReady = bmp.begin();
+  baroValid = false;
+  Serial.println(bmpReady ? "BMP280: OK" : "BMP280: NG");
   // BLE初期化
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
@@ -838,7 +1126,7 @@ void setup() {
   
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
-  Serial.println(F("lat, lon, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
+  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
   
   t_Serial = millis();
   t_SD = millis();
@@ -853,6 +1141,8 @@ void loop() {
   updateBLE();
   updateECU();
   updateGNSS();
+  updateGsiElevation();
+  updateAltitudeFusion();
   updateDisplay();
   
   if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {

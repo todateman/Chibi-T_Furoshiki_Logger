@@ -608,7 +608,7 @@ partition "updateGNSS() - GNSS位置・時刻受信" {
             totallaps = 8
             goal = 17616
             limittime = 2536;
-        elseif (茂木範囲内?) then (yes)
+        elseif (もてぎ範囲内?) then (yes)
             :Loc = "mo"
             totallaps = 7
             goal = 16389
