@@ -266,8 +266,9 @@ const int time_offset = 9;  // JST
 // 時刻表示用バッファ
 char datetime[23];
 
-// NTP同期フラグ（GPS受信後は更新しない）
-bool ntpSyncDone = false;
+// 時刻同期フラグ
+bool ntpSyncDone = false;     // NTP同期が完了したかどうか
+bool gpsTimeLocked = false;   // GNSS時刻を反映しているかどうか（GPSから時刻を一度反映したら、以降はNTP同期で時刻を更新しても逆行しないようにするためのフラグ）
 
 // 日時バッファ更新（必要に応じてセンチ秒を指定）
 void refreshDatetime(uint8_t csec = 255) {
@@ -723,7 +724,11 @@ void updateGNSS() {
               }
             }
           }
-          setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
+          // GPSから時刻を一度反映したら、以降はNTP同期で時刻を更新しても逆行しないようにする
+          if (!gpsTimeLocked) {
+            setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
+            gpsTimeLocked = true;
+          }
           ntpSyncDone = true;  // GPS時刻受信後はNTP同期不要（GPS優先）
           refreshDatetime(gnss_csec);  // デバッグ用Serial出力
         }
@@ -1260,10 +1265,11 @@ void setup() {
   showMessage(FPSTR(MSG_LOADING));
   Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
   
-  t_Serial = millis();
-  t_SD = millis();
-  t_MQTT = millis();
-  t_amb = millis();
+  // タイマー初期化
+  t_Serial = millis() + SERIAL_OUT_INTERVAL;
+  t_SD = millis() + SD_LOG_INTERVAL;
+  t_MQTT = millis();                          
+  t_amb = millis() + AMBIENT_INTERVAL;
 }
 
 //==================== loop() =====================
@@ -1277,14 +1283,22 @@ void loop() {
   updateAltitudeFusion();
   updateDisplay();
   
-  if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
+  // Serial出力（デバッグ用）
+  if ((long)(millis() - t_Serial) >= 0) {
     updateSerialOutput();
-    t_Serial = millis();
+    t_Serial += SERIAL_OUT_INTERVAL;      // 出力間隔を維持するために次回予定を加算
+    if ((long)(millis() - t_Serial) >= 0) {
+      t_Serial = millis() + SERIAL_OUT_INTERVAL;
+    }
   }
   
-  if (LOGGING && (millis() - t_SD >= SD_LOG_INTERVAL)) {
+  // SDカードへのログ書き出し
+  if (LOGGING && (long)(millis() - t_SD) >= 0) {
     updateSDLog();
-    t_SD = millis();
+    t_SD += SD_LOG_INTERVAL;              // ログ書き出し間隔を維持するために次回予定を加算
+    if ((long)(millis() - t_SD) >= 0) {
+      t_SD = millis() + SD_LOG_INTERVAL;
+    }
   }
   
   if (MQTTpush) {
@@ -1301,9 +1315,12 @@ void loop() {
     }
   }
   
-  if (ambientpush && (millis() - t_amb >= AMBIENT_INTERVAL)) {
+  if (ambientpush && (long)(millis() - t_amb) >= 0) {
     updateAmbient();
-    t_amb = millis();
+    t_amb += AMBIENT_INTERVAL;
+    if ((long)(millis() - t_amb) >= 0) {
+      t_amb = millis() + AMBIENT_INTERVAL;
+    }
   }
   
   delay(10);
