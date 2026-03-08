@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include "SdFat.h"
@@ -126,6 +125,9 @@ struct BMP280Driver {
 #define BLE_TX_PIN 33
 #define USE_HARDWARE_BLE 0
 
+// GNSSのPPSピン
+#define PPS_PIN 34
+
 // 各タスクの更新間隔（ミリ秒）
 #define SERIAL_OUT_INTERVAL 1000
 #define SD_LOG_INTERVAL     1000
@@ -152,6 +154,8 @@ static constexpr float LOW_SPEED_FREEZE_KMPH = 3.0f; // 低速時はIMU鉛直加
 static constexpr uint32_t GNSS_BAUD = 38400;    // GNSSモジュールのシリアル通信速度
 static constexpr unsigned long GSI_ELEVATION_INTERVAL = 10000;  // 国土地理院APIから標高を取得する間隔（ミリ秒）
 static constexpr uint16_t GSI_HTTP_TIMEOUT_MS = 5000; // 国土地理院APIへのHTTPリクエストのタイムアウト時間（ミリ秒）
+static constexpr uint32_t GSI_TASK_POLL_MS = 20;    // 国土地理院APIリクエスト処理タスクのポーリング間隔（ミリ秒）
+static constexpr uint32_t GSI_TASK_STACK_SIZE = 8192; // 国土地理院APIリクエスト処理タスクのスタックサイズ（バイト）
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -249,6 +253,15 @@ double altGSI = 0.0;        // 国土地理院API(https://maps.gsi.go.jp/develop
 bool gsiAltValid = false;   // 国土地理院APIから取得した標高が有効かどうか
 bool gsiAltUpdated = false; // 国土地理院APIから取得した標高が更新されたかどうか（EKFの更新に利用）
 unsigned long lastGsiRequestMs = 0; // 最後に国土地理院APIにリクエストを送った時刻（EKFの更新に利用）
+TaskHandle_t gsiTaskHandle = nullptr; // 国土地理院APIリクエスト処理タスクのハンドル
+portMUX_TYPE gsiMutex = portMUX_INITIALIZER_UNLOCKED; // 国土地理院APIリクエスト処理タスクとEKF更新タスクで標高データの整合性を保つためのミューテックス
+volatile bool gsiRequestPending = false;  // 国土地理院APIへのリクエストが保留されているかどうか（EKFの更新タスクからリクエストを出すときに設定し、国土地理院APIリクエスト処理タスクが処理開始時に確認してクリアするフラグ）
+volatile bool gsiWorkerBusy = false;  // 国土地理院APIリクエスト処理タスクが現在リクエストを処理中かどうか（EKFの更新タスクから新たにリクエストを出すときに確認するフラグ。これがtrueのときは前のリクエストの処理が終わるまで待つ）
+volatile bool gsiResponseReady = false; // 国土地理院APIからのレスポンスが処理されてEKFの更新に利用できる状態かどうか（国土地理院APIリクエスト処理タスクがレスポンスを受け取って標高データを更新したときにtrueになり、EKFの更新タスクが更新された標高データを利用してEKFを更新した後にfalseにするフラグ）
+volatile bool gsiResponseSuccess = false; // 国土地理院APIからのレスポンスが成功だったかどうか（国土地理院APIリクエスト処理タスクがレスポンスを受け取って標高データを更新したときに設定するフラグ。EKFの更新タスクはこれがtrueのときはgsiResponseElevationの値を信頼してEKFを更新し、falseのときはgsiResponseElevationの値を無視してEKFの更新を行う）
+double gsiRequestLat = 0.0; // 国土地理院APIにリクエストを出すときの緯度（EKFの更新タスクがリクエストを出すときに設定する値。国土地理院APIリクエスト処理タスクはこれを使ってリクエストを送る）
+double gsiRequestLon = 0.0; // 国土地理院APIにリクエストを出すときの経度（EKFの更新タスクがリクエストを出すときに設定する値。国土地理院APIリクエスト処理タスクはこれを使ってリクエストを送る）
+double gsiResponseElevation = 0.0;  // 国土地理院APIからのレスポンスで得られた標高（国土地理院APIリクエスト処理タスクがレスポンスを受け取って処理したときに設定する値。EKFの更新タスクはgsiResponseSuccessがtrueのときはこれを信頼してEKFを更新し、falseのときはこれを無視してEKFの更新を行う）
 bool bmpReady = false;      // BMP280が正常に初期化されているかどうか
 bool baroValid = false;     // 気圧高度が有効かどうか（EKFの更新に利用）
 bool baroCalibrated = false;  // 気圧高度がキャリブレーションされているかどうか（EKFの更新に利用）
@@ -270,6 +283,16 @@ char datetime[23];
 bool ntpSyncDone = false;     // NTP同期が完了したかどうか
 bool gpsTimeLocked = false;   // GNSS時刻を反映しているかどうか（GPSから時刻を一度反映したら、以降はNTP同期で時刻を更新しても逆行しないようにするためのフラグ）
 
+// 1PPS同期用状態
+volatile bool ppsPulsePending = false;      // PPS割り込みが発生して処理待ちの状態かどうか
+volatile unsigned long ppsLastIsrMs = 0;    // PPS割り込みが最後に発生したときの millis() の値
+volatile uint32_t ppsPulseCount = 0;        // PPS割り込みが発生した回数（デバッグ用）
+bool ppsSyncEnabled = false;                // GNSS時刻が有効なときのみ true
+bool ppsSignalAlive = false;                // 直近でPPSが入力されているか
+unsigned long lastGnssTimeUpdateMs = 0;     // GNSS時刻を最後に受信した時刻
+time_t latestGnssEpochJst = 0;              // 最新のGNSS時刻（JST）
+bool latestGnssEpochValid = false;          // 最新のGNSS時刻が有効かどうか（GNSSから時刻を一度でも受信したらtrueになるフラグ。これがfalseのときはPPS割り込みがあっても時刻同期を行わないようにするためのフラグ）
+
 // 日時バッファ更新（必要に応じてセンチ秒を指定）
 void refreshDatetime(uint8_t csec = 255) {
   uint8_t displayCsec = csec;
@@ -279,6 +302,79 @@ void refreshDatetime(uint8_t csec = 255) {
 
   sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
             year(), month(), day(), hour(), minute(), second(), displayCsec);
+}
+
+// PPS割り込みハンドラ
+void IRAM_ATTR onPpsRise() {
+  ppsLastIsrMs = millis();
+  ppsPulseCount++;
+  ppsPulsePending = true;
+}
+
+// システム時刻の逆行を防ぎ、必要なときだけ前進補正する
+bool syncTimeForwardOnly(time_t candidateEpoch, long forwardThresholdSec = 0) {
+  const time_t currentEpoch = now();
+
+  if (candidateEpoch < currentEpoch) {
+    return false;
+  }
+
+  const long diff = (long)(candidateEpoch - currentEpoch);
+  if (diff < forwardThresholdSec) {
+    return false;
+  }
+
+  setTime(candidateEpoch);
+  return true;
+}
+
+// PPSの最終入力からの経過時間をミリ秒で取得
+unsigned long getPpsAgeMs() {
+  noInterrupts();
+  const unsigned long lastMs = ppsLastIsrMs;
+  interrupts();
+
+  return millis() - lastMs;
+}
+
+// PPS同期の状態を更新し、必要に応じてシステム時刻をGNSS時刻に合わせる
+void updatePpsDiscipline() {
+  static bool prevLocked = false;
+
+  const unsigned long ppsAgeMs = getPpsAgeMs();
+  ppsSignalAlive = (ppsAgeMs <= 1500);
+  const bool lockedNow = ppsSyncEnabled && ppsSignalAlive;
+  if (lockedNow != prevLocked) {
+    Serial.println(lockedNow ? "[PPS] lock" : "[PPS] signal lost");
+    prevLocked = lockedNow;
+  }
+
+  if (!ppsSyncEnabled) {
+    return;
+  }
+
+  // GNSS時刻が一定時間更新されていない場合はPPS同期を一時停止
+  if (millis() - lastGnssTimeUpdateMs > 3000) {
+    ppsSyncEnabled = false;
+    return;
+  }
+
+  if (!ppsPulsePending) {
+    return;
+  }
+
+  noInterrupts();
+  ppsPulsePending = false;
+  interrupts();
+
+  // TimeLibは内部で秒を進めるため、PPSごとに+1すると二重加算になる。
+  // PPS到来時はGNSS時刻との差が大きい場合のみ再同期する。
+  if (latestGnssEpochValid) {
+    const long secDiff = (long)(latestGnssEpochJst - now());
+    if (secDiff > 2) {
+      syncTimeForwardOnly((time_t)latestGnssEpochJst, 2);
+    }
+  }
 }
 
 // ディスプレイ表示モード
@@ -491,6 +587,7 @@ bool parseGsiElevationPayload(const String& payload, double& outElevation) {
   return true;
 }
 
+// 国土地理院APIから標高を取得する（成功時 true）
 bool fetchGsiElevation(double lat, double lon, double& outElevation) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
@@ -563,9 +660,70 @@ bool fetchGsiElevation(double lat, double lon, double& outElevation) {
   return false;
 }
 
+// 国土地理院APIからの標高取得をバックグラウンドで処理するタスク
+void gsiFetchTask(void* pvParameters) {
+  (void)pvParameters;
+
+  for (;;) {
+    bool shouldFetch = false;
+    double lat = 0.0;
+    double lon = 0.0;
+
+    portENTER_CRITICAL(&gsiMutex);
+    if (gsiRequestPending && !gsiWorkerBusy) {
+      gsiWorkerBusy = true;
+      gsiRequestPending = false;
+      lat = gsiRequestLat;
+      lon = gsiRequestLon;
+      shouldFetch = true;
+    }
+    portEXIT_CRITICAL(&gsiMutex);
+
+    if (shouldFetch) {
+      double elevation = 0.0;
+      bool ok = fetchGsiElevation(lat, lon, elevation);
+
+      portENTER_CRITICAL(&gsiMutex);
+      gsiResponseElevation = elevation;
+      gsiResponseSuccess = ok;
+      gsiResponseReady = true;
+      gsiWorkerBusy = false;
+      portEXIT_CRITICAL(&gsiMutex);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(GSI_TASK_POLL_MS));
+  }
+}
+
 // インターネット利用可能時はGSI標高を定期取得
 void updateGsiElevation() {
   gsiAltUpdated = false;
+
+  bool hasResponse = false;
+  bool responseSuccess = false;
+  double responseElevation = 0.0;
+  portENTER_CRITICAL(&gsiMutex);
+  if (gsiResponseReady) {
+    hasResponse = true;
+    responseSuccess = gsiResponseSuccess;
+    responseElevation = gsiResponseElevation;
+    gsiResponseReady = false;
+  }
+  portEXIT_CRITICAL(&gsiMutex);
+
+  if (hasResponse) {
+    if (responseSuccess && responseElevation > -500.0 && responseElevation < 10000.0) {
+      altGSI = responseElevation;
+      gsiAltValid = true;
+      gsiAltUpdated = true;
+      Serial.printf("[GSI] elevation=%.2f m (lat=%.7f, lon=%.7f)\n", responseElevation, la, ln);
+    } else {
+      gsiAltValid = false;
+      if (responseSuccess) {
+        Serial.printf("[GSI] invalid elevation range: %.2f\n", responseElevation);
+      }
+    }
+  }
 
   if (WiFi.status() != WL_CONNECTED || !positionValid) {
     gsiAltValid = false;
@@ -581,22 +739,18 @@ void updateGsiElevation() {
   if (now - lastGsiRequestMs < GSI_ELEVATION_INTERVAL) {
     return;
   }
-  lastGsiRequestMs = now;
+  bool canQueue = false;
+  portENTER_CRITICAL(&gsiMutex);
+  if (!gsiRequestPending && !gsiWorkerBusy) {
+    gsiRequestLat = la;
+    gsiRequestLon = ln;
+    gsiRequestPending = true;
+    canQueue = true;
+  }
+  portEXIT_CRITICAL(&gsiMutex);
 
-  double gsiElevation = 0.0;
-  if (fetchGsiElevation(la, ln, gsiElevation)) {
-    if (gsiElevation > -500.0 && gsiElevation < 10000.0) {
-      altGSI = gsiElevation;
-      gsiAltValid = true;
-      gsiAltUpdated = true;
-      Serial.printf("[GSI] elevation=%.2f m (lat=%.7f, lon=%.7f)\n", gsiElevation, la, ln);
-    } else {
-      gsiAltValid = false;
-      Serial.printf("[GSI] invalid elevation range: %.2f\n", gsiElevation);
-    }
-  } else {
-    // API取得不可時はGNSSへフォールバックできるよう無効化
-    gsiAltValid = false;
+  if (canQueue) {
+    lastGsiRequestMs = now;
   }
 }
 
@@ -638,40 +792,90 @@ void updateBLE() {
 }
 
 // ECUからのデータ読み取り
-void updateECU() {
-  if (Serial1.available()) {
-    receiveECUtime = millis();
-    String str = Serial1.readStringUntil('\n');
-    str.trim();
-    for (uint8_t i = 0; i < 8; i++) {
-      int commaIndex = str.indexOf(",");
-      String data = str.substring(0, commaIndex);
-      data.trim();
+bool parseEcuCsvLine(const String& line) {
+  String str = line;
+  str.trim();
+  if (str.length() == 0) {
+    return false;
+  }
+
+  // ECUデータは8項目固定。カンマ不足の不完全行は破棄する。
+  int commaCount = 0;
+  for (size_t i = 0; i < str.length(); i++) {
+    if (str[i] == ',') {
+      commaCount++;
+    }
+  }
+  if (commaCount < 7) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < 8; i++) {
+    int commaIndex = str.indexOf(',');
+    String data;
+    if (commaIndex >= 0) {
+      data = str.substring(0, commaIndex);
       str = str.substring(commaIndex + 1);
-      if (i == 0) { tachoRpm = data.toInt(); }
-      if (i == 1) { INJ_timems = data.toFloat(); }
-      if (i == 2) { IGN_CA = data.toInt(); }
-      if (i == 3) { speed = data.toFloat(); }
-      if (i == 4) { distance = data.toInt(); }
-      if (i == 5) { gasml = data.toFloat(); }
-      if (i == 6) { dispergas = data.toFloat(); }
-      if (i == 7) { worktime = data.toInt(); }
+    } else {
+      data = str;
+      str = "";
     }
-    Lapcount = distance / (goal / totallaps);
-  } else {
-    if (millis() - receiveECUtime > 2000) {
-      tachoRpm = 0;
-      INJ_timems = 0;
-      IGN_CA = 0;
-      speed = 0.0;
+    data.trim();
+
+    if (i == 0) { tachoRpm = data.toInt(); }
+    if (i == 1) { INJ_timems = data.toFloat(); }
+    if (i == 2) { IGN_CA = data.toInt(); }
+    if (i == 3) { speed = data.toFloat(); }
+    if (i == 4) { distance = data.toInt(); }
+    if (i == 5) { gasml = data.toFloat(); }
+    if (i == 6) { dispergas = data.toFloat(); }
+    if (i == 7) { worktime = data.toInt(); }
+  }
+
+  Lapcount = distance / (goal / totallaps);
+  return true;
+}
+
+void updateECU() {
+  static String ecuLineBuffer = "";
+  bool parsed = false;
+
+  while (Serial1.available() > 0) {
+    char c = (char)Serial1.read();
+    if (c == '\r') {
+      continue;
     }
+    if (c == '\n') {
+      if (parseEcuCsvLine(ecuLineBuffer)) {
+        receiveECUtime = millis();
+        parsed = true;
+      }
+      ecuLineBuffer = "";
+      continue;
+    }
+
+    ecuLineBuffer += c;
+    if (ecuLineBuffer.length() > 96) {
+      ecuLineBuffer = "";
+    }
+  }
+
+  if (!parsed && millis() - receiveECUtime > 2000) {
+    tachoRpm = 0;
+    INJ_timems = 0;
+    IGN_CA = 0;
+    speed = 0.0;
   }
 }
 
 // GNSSからの位置・時刻読み取り
 void updateGNSS() {
   gnssAltUpdated = false;
-  while (Serial2.available() > 0) {
+  // 1ループでのGNSS処理量を制限して他の周期処理の遅延を防ぐ
+  const int maxGnssBytesPerLoop = 256;
+  int processed = 0;
+  while (Serial2.available() > 0 && processed < maxGnssBytesPerLoop) {
+    processed++;
     if (gps.encode(Serial2.read())) {
       if (gps.time.isUpdated()) {
         double rawAlt = gps.altitude.meters();
@@ -724,11 +928,33 @@ void updateGNSS() {
               }
             }
           }
+
+          // GNSS時刻をシステム時刻に反映（初回受信時は強制反映、2回目以降はPPS同期運用中でもGNSS時刻との差が大きい場合のみ再同期）
+          tmElements_t tm = {};
+          tm.Year = CalendarYrToTm((int)gnss_year);
+          tm.Month = gnss_month;
+          tm.Day = gnss_day;
+          tm.Hour = gnss_hour;
+          tm.Minute = gnss_minute;
+          tm.Second = gnss_second;
+          latestGnssEpochJst = makeTime(tm);
+          latestGnssEpochValid = true;
+          lastGnssTimeUpdateMs = millis();
+
           // GPSから時刻を一度反映したら、以降はNTP同期で時刻を更新しても逆行しないようにする
           if (!gpsTimeLocked) {
-            setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
+            const time_t gnssEpoch = makeTime(tm);
+            syncTimeForwardOnly(gnssEpoch, 0);
             gpsTimeLocked = true;
+          } else if (latestGnssEpochValid) {
+            // 1PPS同期運用中でもGNSS時刻との差が大きい場合は再同期する
+            const long secDiff = (long)(latestGnssEpochJst - now());
+            if (secDiff > 2) {
+              syncTimeForwardOnly((time_t)latestGnssEpochJst, 2);
+            }
           }
+
+          ppsSyncEnabled = true;
           ntpSyncDone = true;  // GPS時刻受信後はNTP同期不要（GPS優先）
           refreshDatetime(gnss_csec);  // デバッグ用Serial出力
         }
@@ -848,10 +1074,8 @@ void updateDisplay() {
   lcd_s.setTextDatum(top_right);
   lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
   lcd_s.drawString(positionValid ? "GNSS: O" : "GNSS: x", 320, 15);
-  // if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
   if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
   if (!ambientpush && !MQTTpush) {
-    // lcd_s.drawString("Amb: x", 320, 30);
     lcd_s.drawString("MQTT: x", 320, 30);
   }
 
@@ -1098,12 +1322,27 @@ void setup() {
   // ECU, GNSS初期化
   Serial1.begin(115200, SERIAL_8N1, 27, 19);
   Serial2.begin(GNSS_BAUD);
+  pinMode(PPS_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PPS_PIN), onPpsRise, RISING);
   M5.Imu.init();
   altitudeEkf.setProcessAccelSigma(EKF_PROCESS_SIGMA_A);
   altitudeEkf.setInitialCovariance(100.0f, 10.0f);
   bmpReady = bmp.begin();
   baroValid = false;
   Serial.println(bmpReady ? "BMP280: OK" : "BMP280: NG");
+
+  // GSI Fetch Task開始
+  if (gsiTaskHandle == nullptr) {
+    xTaskCreatePinnedToCore(
+      gsiFetchTask,
+      "gsiFetch",
+      GSI_TASK_STACK_SIZE,
+      nullptr,
+      1,
+      &gsiTaskHandle,
+      1
+    );
+  }
   // BLE初期化
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
@@ -1279,6 +1518,7 @@ void loop() {
   updateBLE();
   updateECU();
   updateGNSS();
+  updatePpsDiscipline();
   updateGsiElevation();
   updateAltitudeFusion();
   updateDisplay();
@@ -1286,19 +1526,13 @@ void loop() {
   // Serial出力（デバッグ用）
   if ((long)(millis() - t_Serial) >= 0) {
     updateSerialOutput();
-    t_Serial += SERIAL_OUT_INTERVAL;      // 出力間隔を維持するために次回予定を加算
-    if ((long)(millis() - t_Serial) >= 0) {
-      t_Serial = millis() + SERIAL_OUT_INTERVAL;
-    }
+    t_Serial = millis() + SERIAL_OUT_INTERVAL;
   }
   
   // SDカードへのログ書き出し
   if (LOGGING && (long)(millis() - t_SD) >= 0) {
     updateSDLog();
-    t_SD += SD_LOG_INTERVAL;              // ログ書き出し間隔を維持するために次回予定を加算
-    if ((long)(millis() - t_SD) >= 0) {
-      t_SD = millis() + SD_LOG_INTERVAL;
-    }
+    t_SD = millis() + SD_LOG_INTERVAL;
   }
   
   if (MQTTpush) {
@@ -1317,10 +1551,7 @@ void loop() {
   
   if (ambientpush && (long)(millis() - t_amb) >= 0) {
     updateAmbient();
-    t_amb += AMBIENT_INTERVAL;
-    if ((long)(millis() - t_amb) >= 0) {
-      t_amb = millis() + AMBIENT_INTERVAL;
-    }
+    t_amb = millis() + AMBIENT_INTERVAL;
   }
   
   delay(10);
