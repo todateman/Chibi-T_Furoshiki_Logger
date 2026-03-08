@@ -5,7 +5,7 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - ECU からの走行データ取得 (Serial1)
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
 - 高度推定 (BMP280 + BMI270 + 絶対高度ソースの融合EKF)
-- インターネット接続時の国土地理院標高API利用 (失敗時はGNSS高度へフォールバック)
+- インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
 - BLE 経由のエンジン温度受信 (SoftwareSerial or HardwareSerial)
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
@@ -94,11 +94,24 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
   3. 絶対高度で更新（`GSI標高API` 優先、失敗時は `GNSS高度`）
 - 絶対高度ソース:
   - Wi-Fi接続かつ位置有効時は国土地理院APIを約10秒周期で取得
+  - API取得は HTTP 優先、HTTP失敗時に HTTPS へフォールバック
   - API取得失敗時はGNSS高度を使用（自動フォールバック）
+- ドリフト抑制（実装済）:
+  - 低速時 (`LOW_SPEED_FREEZE_KMPH`) はIMU鉛直加速度の寄与を凍結
+  - 小加速度はデッドバンド (`ALT_ACCEL_DEADBAND`) で無効化
+  - GSI更新間隔中も保持観測 (`R_GSI_HOLD`) を入れて絶対高度を維持
+  - GSIから大きく外れた場合は強制再ロック (`GSI_HARD_GATE_M`, `R_GSI_HARD`)
 - 現在の実走向け初期パラメータ（`src/main.cpp`）:
   - `R_BARO = 0.36`
+  - `R_BARO_WITH_ABS = 4.0`
+  - `R_GSI = 4.0`
+  - `R_GSI_HOLD = 9.0`
+  - `R_GSI_HARD = 0.25`
   - `R_GNSS = 36.0`
   - `EKF_PROCESS_SIGMA_A = 1.2`
+  - `ALT_ACCEL_DEADBAND = 0.35`
+  - `LOW_SPEED_FREEZE_KMPH = 3.0`
+  - `GSI_HARD_GATE_M = 3.0`
 
 ## 実装ログを使ったチューニング手順
 
@@ -211,6 +224,7 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
 | 温度 0.0 固定 | BLE センサ未送信 or タイムアウト <BR>  (>10s でリセット) |
+| `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
 
 ## 既知の課題 (改善予定)
 

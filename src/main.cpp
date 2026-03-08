@@ -140,10 +140,18 @@ struct BMP280Driver {
 static constexpr float SEA_LEVEL_HPA = 1013.25f;
 // 実走想定: 野外・水平移動・1-80km/h (路面振動/風圧の影響を見込んだ設定)
 static constexpr float R_BARO = 0.36f;          // baro sigma ~0.6m
+static constexpr float R_BARO_WITH_ABS = 4.0f;  // abs標高がある間はbaroを弱く使う
+static constexpr float R_GSI = 4.0f;            // GSI sigma ~2.0m
+static constexpr float R_GSI_HOLD = 9.0f;       // GSI更新間隔中の拘束用
+static constexpr float R_GSI_HARD = 0.25f;      // GSIから大きく外れたときの再ロック用
 static constexpr float R_GNSS = 36.0f;          // abs altitude sigma ~6.0m (GNSS fallback時)
 static constexpr float EKF_PROCESS_SIGMA_A = 1.2f; // IMU vertical accel noise sigma [m/s^2]
-static constexpr uint32_t GNSS_BAUD = 38400;
-static constexpr unsigned long GSI_ELEVATION_INTERVAL = 10000;
+static constexpr float ALT_ACCEL_DEADBAND = 0.35f; // 鉛直加速度デッドバンド [m/s^2]
+static constexpr float GSI_HARD_GATE_M = 3.0f;     // GSI再ロック開始しきい値 [m]
+static constexpr float LOW_SPEED_FREEZE_KMPH = 3.0f; // 低速時はIMU鉛直加速度を凍結
+static constexpr uint32_t GNSS_BAUD = 38400;    // GNSSモジュールのシリアル通信速度
+static constexpr unsigned long GSI_ELEVATION_INTERVAL = 10000;  // 国土地理院APIから標高を取得する間隔（ミリ秒）
+static constexpr uint16_t GSI_HTTP_TIMEOUT_MS = 5000; // 国土地理院APIへのHTTPリクエストのタイムアウト時間（ミリ秒）
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -404,51 +412,150 @@ void saveNextLogIndex(int nextIndex) {
 }
 
 // 国土地理院APIから標高を取得する（成功時 true）
-bool fetchGsiElevation(double lat, double lon, double& outElevation) {
-  WiFiClientSecure httpsClient;
-  httpsClient.setInsecure();
-
-  char url[192];
-  snprintf(url, sizeof(url),
-           "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon=%.7f&lat=%.7f&outtype=JSON",
-           lon, lat);
-
-  HTTPClient http;
-  http.setTimeout(2000);
-  if (!http.begin(httpsClient, url)) {
-    return false;
-  }
-
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-
-  String payload = http.getString();
-  http.end();
-
+bool parseGsiElevationPayload(const String& payload, double& outElevation) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
+  if (!err) {
+    JsonVariant elevation = doc["elevation"];
+    if (elevation.is<float>() || elevation.is<double>() || elevation.is<int>() || elevation.is<long>()) {
+      outElevation = elevation.as<double>();
+      return true;
+    }
+
+    if (elevation.is<const char*>()) {
+      const char* elevStr = elevation.as<const char*>();
+      if (elevStr != nullptr && strcmp(elevStr, "-----") != 0) {
+        char* endPtr = nullptr;
+        double parsed = strtod(elevStr, &endPtr);
+        if (endPtr != elevStr) {
+          outElevation = parsed;
+          return true;
+        }
+      }
+    }
+  }
+
+  // 予期しないレスポンス形式に備え、最低限の文字列抽出も試す。
+  int keyIndex = payload.indexOf("\"elevation\"");
+  if (keyIndex < 0) {
+    return false;
+  }
+  int colonIndex = payload.indexOf(':', keyIndex);
+  if (colonIndex < 0) {
     return false;
   }
 
-  JsonVariant elevation = doc["elevation"];
-  if (elevation.is<float>() || elevation.is<double>() || elevation.is<int>() || elevation.is<long>()) {
-    outElevation = elevation.as<double>();
-    return true;
+  int valueStart = colonIndex + 1;
+  while (valueStart < (int)payload.length() && isspace((unsigned char)payload[valueStart])) {
+    valueStart++;
+  }
+  if (valueStart >= (int)payload.length()) {
+    return false;
   }
 
-  if (elevation.is<const char*>()) {
-    const char* elevStr = elevation.as<const char*>();
-    if (elevStr != nullptr && strcmp(elevStr, "-----") != 0) {
-      char* endPtr = nullptr;
-      double parsed = strtod(elevStr, &endPtr);
-      if (endPtr != elevStr) {
-        outElevation = parsed;
-        return true;
+  bool quoted = payload[valueStart] == '"';
+  if (quoted) {
+    valueStart++;
+  }
+
+  int valueEnd = valueStart;
+  while (valueEnd < (int)payload.length()) {
+    char c = payload[valueEnd];
+    if (quoted) {
+      if (c == '"') {
+        break;
       }
+    } else if (c == ',' || c == '}' || isspace((unsigned char)c)) {
+      break;
+    }
+    valueEnd++;
+  }
+
+  if (valueEnd <= valueStart) {
+    return false;
+  }
+
+  String value = payload.substring(valueStart, valueEnd);
+  value.trim();
+  if (value == "-----") {
+    return false;
+  }
+
+  char* endPtr = nullptr;
+  double parsed = strtod(value.c_str(), &endPtr);
+  if (endPtr == value.c_str()) {
+    return false;
+  }
+  outElevation = parsed;
+  return true;
+}
+
+bool fetchGsiElevation(double lat, double lon, double& outElevation) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClientSecure httpsClient;
+  httpsClient.setInsecure();
+  httpsClient.setTimeout(GSI_HTTP_TIMEOUT_MS);
+
+  WiFiClient httpClient;
+
+  char httpsUrl[192];
+  char httpUrl[192];
+  snprintf(httpsUrl, sizeof(httpsUrl),
+           "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon=%.7f&lat=%.7f&outtype=JSON",
+           lon, lat);
+  snprintf(httpUrl, sizeof(httpUrl),
+           "http://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon=%.7f&lat=%.7f&outtype=JSON",
+           lon, lat);
+
+  String payload;
+
+  // HTTP優先。失敗時のみ HTTPS へフォールバック。
+  {
+    HTTPClient http;
+    http.setConnectTimeout(GSI_HTTP_TIMEOUT_MS);
+    http.setTimeout(GSI_HTTP_TIMEOUT_MS);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (http.begin(httpClient, httpUrl)) {
+      const int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        payload = http.getString();
+        http.end();
+        if (parseGsiElevationPayload(payload, outElevation)) {
+          return true;
+        }
+        Serial.println("[GSI] HTTP parse failed");
+      } else {
+        Serial.printf("[GSI] HTTP GET failed: %d\n", httpCode);
+        http.end();
+      }
+    } else {
+      Serial.println("[GSI] HTTP begin failed");
+    }
+  }
+
+  {
+    HTTPClient https;
+    https.setConnectTimeout(GSI_HTTP_TIMEOUT_MS);
+    https.setTimeout(GSI_HTTP_TIMEOUT_MS);
+    https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (https.begin(httpsClient, httpsUrl)) {
+      const int httpCode = https.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        payload = https.getString();
+        https.end();
+        if (parseGsiElevationPayload(payload, outElevation)) {
+          return true;
+        }
+        Serial.println("[GSI] HTTPS parse failed");
+      } else {
+        Serial.printf("[GSI] HTTPS GET failed: %d\n", httpCode);
+        https.end();
+      }
+    } else {
+      Serial.println("[GSI] HTTPS begin failed");
     }
   }
 
@@ -460,6 +567,11 @@ void updateGsiElevation() {
   gsiAltUpdated = false;
 
   if (WiFi.status() != WL_CONNECTED || !positionValid) {
+    gsiAltValid = false;
+    return;
+  }
+
+  if (!isfinite(la) || !isfinite(ln) || la < -90.0 || la > 90.0 || ln < -180.0 || ln > 180.0) {
     gsiAltValid = false;
     return;
   }
@@ -476,6 +588,10 @@ void updateGsiElevation() {
       altGSI = gsiElevation;
       gsiAltValid = true;
       gsiAltUpdated = true;
+      Serial.printf("[GSI] elevation=%.2f m (lat=%.7f, lon=%.7f)\n", gsiElevation, la, ln);
+    } else {
+      gsiAltValid = false;
+      Serial.printf("[GSI] invalid elevation range: %.2f\n", gsiElevation);
     }
   } else {
     // API取得不可時はGNSSへフォールバックできるよう無効化
@@ -653,21 +769,31 @@ void updateAltitudeFusion() {
   float az = 0.0f;
   M5.Imu.getAccel(&ax, &ay, &az);
   // Y軸加速度を用いて重力成分を除去
-  const float ayInertial = -(ay + 1.0f) * 9.80665f;
+  float ayInertial = -(ay + 1.0f) * 9.80665f;
+  if (fabsf(ayInertial) < ALT_ACCEL_DEADBAND || spd < LOW_SPEED_FREEZE_KMPH) {
+    ayInertial = 0.0f;
+  }
 
   bool baroUpdated = false;
   float rawBaroAlt = 0.0f;
+  const bool absFromGsi = gsiAltValid;
   const bool absAltValid = gsiAltValid || gnssAltValid;
-  const bool absAltUpdated = gsiAltValid ? gsiAltUpdated : gnssAltUpdated;
+  const bool absAltUpdated = absFromGsi ? gsiAltUpdated : gnssAltUpdated;
+  const float absAltVariance = absFromGsi ? R_GSI : R_GNSS;
   const double absAlt = gsiAltValid ? altGSI : altGNSS;
 
   if (bmpReady && bmp.readAltitude(SEA_LEVEL_HPA, rawBaroAlt)) {
-    if (absAltValid && absAltUpdated) {
+    if (absAltValid) {
+      const float targetOffset = (float)absAlt - rawBaroAlt;
       if (!baroCalibrated) {
-        baroOffset = (float)absAlt - rawBaroAlt;
+        baroOffset = targetOffset;
         baroCalibrated = true;
       } else {
-        baroOffset += 0.01f * (((float)absAlt - rawBaroAlt) - baroOffset);
+        float alpha = absAltUpdated ? 0.05f : 0.01f;
+        if (fabsf(targetOffset - baroOffset) > 20.0f) {
+          alpha = 0.2f;
+        }
+        baroOffset += alpha * (targetOffset - baroOffset);
       }
     }
     altBaro = rawBaroAlt + baroOffset;
@@ -678,22 +804,25 @@ void updateAltitudeFusion() {
   }
 
   if (!altitudeEkf.isInitialized()) {
-    if (baroUpdated) {
-      altitudeEkf.init((float)altBaro);
-      alt = altBaro;
-    } else if (absAltValid) {
+    if (absAltValid) {
       altitudeEkf.init((float)absAlt);
       alt = absAlt;
+    } else if (baroUpdated) {
+      altitudeEkf.init((float)altBaro);
+      alt = altBaro;
     }
     return;
   }
 
   altitudeEkf.predict(ayInertial, dt);
   if (baroUpdated) {
-    altitudeEkf.update((float)altBaro, R_BARO);
+    altitudeEkf.update((float)altBaro, absAltValid ? R_BARO_WITH_ABS : R_BARO);
   }
-  if (absAltValid && absAltUpdated) {
-    altitudeEkf.update((float)absAlt, R_GNSS);
+  if (absAltValid) {
+    altitudeEkf.update((float)absAlt, absAltUpdated ? absAltVariance : (absFromGsi ? R_GSI_HOLD : R_GNSS));
+    if (absFromGsi && fabsf(altitudeEkf.altitude() - (float)absAlt) > GSI_HARD_GATE_M) {
+      altitudeEkf.update((float)absAlt, R_GSI_HARD);
+    }
   }
   alt = altitudeEkf.altitude();
 }
@@ -713,11 +842,14 @@ void updateDisplay() {
   lcd_s.setTextSize(1);
   lcd_s.setTextDatum(top_right);
   lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
-  if (ambientpush) lcd_s.drawString("Amb: O", 320, 15);
-  if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 15);
-  if (!ambientpush && !MQTTpush) {lcd_s.drawString("Amb: x", 320, 15); lcd_s.drawString("MQTT: x", 320, 30);}
-  // 標高表示（デバッグ用）
-  // lcd_s.drawString("標高:" + String(alt, 1) + "m", 320, 85);
+  lcd_s.drawString(positionValid ? "GNSS: O" : "GNSS: x", 320, 15);
+  // if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
+  if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
+  if (!ambientpush && !MQTTpush) {
+    // lcd_s.drawString("Amb: x", 320, 30);
+    lcd_s.drawString("MQTT: x", 320, 30);
+  }
+
   
   // タイトル表示（表示モードごと）
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
@@ -766,16 +898,16 @@ void updateDisplay() {
       lcd_s.print("G");
     } else {
       lcd_s.print("FINISH");
-      lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
-      lcd_s.fillRect(10, 135, map(distance, 0, goal, 300, 0), 10, TFT_WHITE);
-      lcd_s.fillRect(map(distance, 0, goal, 310, 10), 135, map(distance, 0, goal, 0, 300), 10, TFT_BLACK);
-      for (uint8_t i = 0; i <= totallaps; i++) {
-        lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
-        lcd_s.setTextSize(0.6);
-        lcd_s.setTextDatum(TC_DATUM);
-        lcd_s.setCursor((300 * i / totallaps) + 7, 147);
-        lcd_s.print(i);
-      }
+    }
+    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
+    lcd_s.fillRect(10, 135, map(distance, 0, goal, 300, 0), 10, TFT_WHITE);
+    lcd_s.fillRect(map(distance, 0, goal, 310, 10), 135, map(distance, 0, goal, 0, 300), 10, TFT_BLACK);
+    for (uint8_t i = 0; i <= totallaps; i++) {
+      lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+      lcd_s.setTextSize(0.6);
+      lcd_s.setTextDatum(TC_DATUM);
+      lcd_s.setCursor((300 * i / totallaps) + 7, 147);
+      lcd_s.print(i);
     }
   } else if (dispmode == 1) {
     lcd_s.setCursor(140, 130);
