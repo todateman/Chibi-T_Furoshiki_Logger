@@ -826,7 +826,7 @@ void setup() {
   
   // GNSS初期化（モジュールに応じてボーレートを切り替える）
   if (isBmp280Ready) {
-      Serial2.begin(384002);  // M5Stack GNSS Module(NEO-M9N)
+      Serial2.begin(38400);  // M5Stack GNSS Module(NEO-M9N)
   } else {
       Serial2.begin(115200); // NEO-6M
   }
