@@ -30,6 +30,8 @@
 #define SD_LOG_INTERVAL     1000
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
+#define MQTT_RECONNECT_BASE_INTERVAL 5000UL
+#define MQTT_RECONNECT_MAX_INTERVAL  60000UL
 #define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
 #define SEA_LEVEL_FETCH_RETRY_INTERVAL 15000UL
@@ -759,8 +761,9 @@ void updateDisplay() {
   if (M5.BtnA.isPressed()) { dispmode = 1; }
   if (M5.BtnC.isPressed()) { dispmode = 2; }
 
+  // 標高グラフモードの場合は専用の描画関数を呼び出して終了する
   if (dispmode == 2) {
-    drawAltitudeGraphMode();
+    drawAltitudeGraphMode();      // 標高グラフモードの描画
     lcd.startWrite();
     lcd_s.pushSprite(0, 0);
     lcd.endWrite();
@@ -945,13 +948,21 @@ void updateSDLog() {
 void updateMQTT() {
   refreshDatetime();  // MQTT送信前に日時を更新
 
+  // Wi-Fi未接続時は即時復帰し、メインループを止めない
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
   if (!mqttclient.connected()) {
     static unsigned long lastReconnectAttempt = 0;
-    if (millis() - lastReconnectAttempt > 5000) {
+    static unsigned long reconnectInterval = MQTT_RECONNECT_BASE_INTERVAL;
+    if (millis() - lastReconnectAttempt > reconnectInterval) {
       lastReconnectAttempt = millis();
       if (mqttclient.connect(mqtt_deviceID)) {
+        reconnectInterval = MQTT_RECONNECT_BASE_INTERVAL;
         Serial.println("MQTT connected");
       } else {
+        reconnectInterval = min(reconnectInterval * 2UL, MQTT_RECONNECT_MAX_INTERVAL);
         Serial.print("MQTT reconnect failed, state: ");
         Serial.println(mqttclient.state());
       }
@@ -1163,6 +1174,9 @@ void setup() {
   // MQTT設定
   if (MQTTpush && isWifiConfigSucceeded) {
     mqttclient.setBufferSize(MQTT_BUFFER_SIZE);
+    mqttclient.setSocketTimeout(1);  // 失敗時に長時間ブロックしないよう短縮
+    client.setTimeout(1000);
+    client.setHandshakeTimeout(1);
     client.setCACert(AWS_CERT_CA);
     client.setCertificate(AWS_CERT_CRT);
     client.setPrivateKey(AWS_CERT_PRIVATE);
