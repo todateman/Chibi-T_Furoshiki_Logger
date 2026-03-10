@@ -120,12 +120,12 @@ float EngTemp = 0.0;
 
 // GPS用
 TinyGPSPlus gps;
-double la, ln;
+double la, ln;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
-double alt = 0.0;
-double spd = 0.0;
-String Loc = "";
+double alt = 0.0;   // GPS高度
+double spd = 0.0;   // GPS速度
+String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
 // BMP280による高度推定用
 Adafruit_BMP280 bmp280;
@@ -806,10 +806,31 @@ void setup() {
   
   // デバッグ用Serial
   Serial.begin(115200);
-  // ECU, GNSS初期化
+
+  // BMP280初期化（I2Cアドレス0x76）
+  if (bmp280.begin(0x76)) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                       Adafruit_BMP280::SAMPLING_X2,
+                       Adafruit_BMP280::SAMPLING_X16,
+                       Adafruit_BMP280::FILTER_X16,
+                       Adafruit_BMP280::STANDBY_MS_500);
+    Serial.println("BMP280 initialized");
+    isBmp280Ready = true;
+  } else {
+    Serial.println("BMP280 init failed");
+  }
+
+  // ECU初期化
   Serial1.begin(115200, SERIAL_8N1, 27, 19);
   Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
-  Serial2.begin(38400);  
+  
+  // GNSS初期化（モジュールに応じてボーレートを切り替える）
+  if (isBmp280Ready) {
+      Serial2.begin(384002);  // M5Stack GNSS Module(NEO-M9N)
+  } else {
+      Serial2.begin(115200); // NEO-6M
+  }
+
   // BLE初期化
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
@@ -967,22 +988,6 @@ void setup() {
     }
   }
 
-  // BMP280初期化（I2Cアドレス0x76優先、失敗時0x77）
-  isBmp280Ready = bmp280.begin(0x76);
-  if (!isBmp280Ready) {
-    isBmp280Ready = bmp280.begin(0x77);
-  }
-  if (isBmp280Ready) {
-    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                       Adafruit_BMP280::SAMPLING_X2,
-                       Adafruit_BMP280::SAMPLING_X16,
-                       Adafruit_BMP280::FILTER_X16,
-                       Adafruit_BMP280::STANDBY_MS_500);
-    Serial.println("BMP280 initialized");
-  } else {
-    Serial.println("BMP280 init failed");
-  }
-  
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
   Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
@@ -1048,8 +1053,8 @@ void loop() {
     t_alt += ALTITUDE_INTERVAL;
   }
 
-  // Open-Meteo呼び出しは低頻度で実行し、成功したら以後実行しない
-  tryFetchSeaLevelPressureFromOpenMeteo();
-  
+  // Open-Meteo呼び出しはBMP280が接続されているときのみ低頻度で実行し、成功したら以後実行しない
+  if (isBmp280Ready) tryFetchSeaLevelPressureFromOpenMeteo();
+
   delay(10);
 }
