@@ -120,7 +120,7 @@ float EngTemp = 0.0;
 
 // GPS用
 TinyGPSPlus gps;
-double la, ln;      // GPS緯度経度
+double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
 double alt = 0.0;   // GPS高度
@@ -211,6 +211,219 @@ void updateSystemTimeFromGnss() {
 
 // ディスプレイ表示モード
 uint8_t dispmode = 0;
+
+// ウェイポイント（標高グラフ用）
+struct Waypoint {
+  uint16_t id;
+  float lat;
+  float lng;
+  float alt;
+};
+
+// ウェイポイントデータの最大数（必要に応じて増減させる）
+const size_t MAX_WAYPOINTS = 2048;
+Waypoint waypoints[MAX_WAYPOINTS];
+size_t waypointCount = 0;
+float waypointMinAlt = 0.0f;
+float waypointMaxAlt = 0.0f;
+String loadedWaypointLoc = "";
+int nearestWaypointIndex = -1;
+
+// ロケーション識別子に対応するウェイポイントCSVファイルのパスを返す関数
+const char* getWaypointFilePathByLoc(const String& loc) {
+  if (loc == "su") {
+    return "/suzuka_waypoint.csv";
+  }
+  if (loc == "mo") {
+    return "/motegi_waypoint.csv";
+  }
+  return "/toyota_waypoint.csv";
+}
+
+// CSVの1行をパースしてWaypoint構造体に変換する関数
+bool parseWaypointCsvLine(const char* line, Waypoint& outPoint) {
+  int id = 0;
+  float latVal = 0.0f;
+  float lngVal = 0.0f;
+  float altVal = 0.0f;
+  float distanceDummy = 0.0f;
+  int parsed = sscanf(line, "%d,%f,%f,%f,%f", &id, &latVal, &lngVal, &altVal, &distanceDummy);
+  if (parsed < 4 || id <= 0) {
+    return false;
+  }
+
+  outPoint.id = static_cast<uint16_t>(id);
+  outPoint.lat = latVal;
+  outPoint.lng = lngVal;
+  outPoint.alt = altVal;
+  return true;
+}
+
+// ロケーション識別子に対応するウェイポイントCSVファイルをSDカードから読み込む関数
+bool loadWaypointFileForLoc(const String& loc) {
+  if (!LOGGING) {
+    waypointCount = 0;
+    nearestWaypointIndex = -1;
+    loadedWaypointLoc = "";
+    return false;
+  }
+
+  const char* path = getWaypointFilePathByLoc(loc);
+  file_t waypointFile = sd.open(path, O_READ);
+  if (!waypointFile) {
+    Serial.printf("[Waypoint] open failed: %s\n", path);
+    waypointCount = 0;
+    nearestWaypointIndex = -1;
+    loadedWaypointLoc = "";
+    return false;
+  }
+
+  char line[128];
+  size_t loadedCount = 0;
+  float minAlt = 1000000.0f;
+  float maxAlt = -1000000.0f;
+  while (waypointFile.available() && loadedCount < MAX_WAYPOINTS) {
+    int len = waypointFile.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (len <= 0) {
+      continue;
+    }
+    line[len] = '\0';
+    if (line[len - 1] == '\r') {
+      line[len - 1] = '\0';
+    }
+
+    if (line[0] == '\0' || (line[0] >= 'A' && line[0] <= 'Z') || (line[0] >= 'a' && line[0] <= 'z')) {
+      continue;  // ヘッダや空行を読み飛ばす
+    }
+
+    Waypoint point;
+    if (!parseWaypointCsvLine(line, point)) {
+      continue;
+    }
+
+    waypoints[loadedCount] = point;
+    if (point.alt < minAlt) {
+      minAlt = point.alt;
+    }
+    if (point.alt > maxAlt) {
+      maxAlt = point.alt;
+    }
+    loadedCount++;
+  }
+  waypointFile.close();
+
+  waypointCount = loadedCount;
+  nearestWaypointIndex = -1;
+  if (waypointCount == 0) {
+    loadedWaypointLoc = "";
+    return false;
+  }
+
+  if (fabsf(maxAlt - minAlt) < 0.1f) {
+    minAlt -= 1.0f;
+    maxAlt += 1.0f;
+  }
+  waypointMinAlt = minAlt;
+  waypointMaxAlt = maxAlt;
+  loadedWaypointLoc = loc;
+  Serial.printf("[Waypoint] loaded %u points from %s\n", static_cast<unsigned int>(waypointCount), path);
+  return true;
+}
+
+// 現在のロケーションに対応するウェイポイントがロードされていない場合にロードする関数
+void ensureWaypointLoadedForCurrentLoc() {
+  if (Loc.length() == 0) {
+    return;
+  }
+  if (loadedWaypointLoc == Loc && waypointCount > 0) {
+    return;
+  }
+  loadWaypointFileForLoc(Loc);
+}
+
+// 現在位置に最も近いウェイポイントのインデックスを返す関数
+int findNearestWaypointIndex(double lat, double lng) {
+  if (waypointCount == 0) {
+    return -1;
+  }
+
+  int nearest = 0;
+  double minDist2 = 1e18;
+  for (size_t i = 0; i < waypointCount; i++) {
+    double dLat = lat - static_cast<double>(waypoints[i].lat);
+    double dLng = lng - static_cast<double>(waypoints[i].lng);
+    double dist2 = dLat * dLat + dLng * dLng;
+    if (dist2 < minDist2) {
+      minDist2 = dist2;
+      nearest = static_cast<int>(i);
+    }
+  }
+
+  return nearest;
+}
+
+// 標高値をグラフのY座標に変換する関数
+int altitudeToGraphY(float value, float minAlt, float maxAlt, int top, int height) {
+  float normalized = (value - minAlt) / (maxAlt - minAlt);
+  normalized = constrain(normalized, 0.0f, 1.0f);
+  return top + height - 1 - static_cast<int>(normalized * static_cast<float>(height - 1));
+}
+
+// 標高グラフの描画
+void drawAltitudeGraphMode() {
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextSize(1);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.setTextColor(TFT_WHITE);
+
+  const int graphLeft = 10;
+  const int graphTop = 20;
+  const int graphWidth = 300;
+  const int graphHeight = 180;
+
+  lcd_s.drawRect(graphLeft, graphTop, graphWidth, graphHeight, TFT_WHITE);
+  if (waypointCount < 2) {
+    lcd_s.drawString("ウェイポイント未読込", 32, 108);
+    return;
+  }
+
+  for (size_t i = 0; i + 1 < waypointCount; i++) {
+    size_t next = i + 1;  // 右端と左端はつながない
+
+    int x1 = graphLeft + static_cast<int>((static_cast<float>(i) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
+    int y1 = altitudeToGraphY(waypoints[i].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+    int x2 = graphLeft + static_cast<int>((static_cast<float>(next) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
+    int y2 = altitudeToGraphY(waypoints[next].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+    lcd_s.drawLine(x1, y1, x2, y2, TFT_CYAN);
+  }
+
+  int plotIndex = nearestWaypointIndex;
+  if (plotIndex >= 0) {
+    int x = graphLeft + static_cast<int>((static_cast<float>(plotIndex) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
+    int yWaypoint = altitudeToGraphY(waypoints[plotIndex].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+    int yNow = altitudeToGraphY(static_cast<float>(alt), waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+
+    lcd_s.drawFastVLine(x, graphTop, graphHeight, TFT_DARKGREY);
+    lcd_s.fillCircle(x, yWaypoint, 3, TFT_YELLOW);
+    lcd_s.fillCircle(x, yNow, 4, TFT_RED);
+
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+    lcd_s.setTextDatum(TL_DATUM);
+    lcd_s.setTextColor(TFT_WHITE);
+    lcd_s.setCursor(8, 225);
+    lcd_s.printf("WP:%d/%u route:%.1fm now:%.1fm", waypoints[plotIndex].id,
+                 static_cast<unsigned int>(waypointCount),
+                 waypoints[plotIndex].alt,
+                 static_cast<float>(alt));
+  }
+
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.setCursor(graphLeft, graphTop - 14);
+  lcd_s.printf("max %.1fm", waypointMaxAlt);
+  lcd_s.setCursor(graphLeft, graphTop + graphHeight + 2);
+  lcd_s.printf("min %.1fm", waypointMinAlt);
+}
 
 //==================== 各種関数 =====================
 
@@ -545,18 +758,30 @@ void updateDisplay() {
   if (M5.BtnB.isPressed()) { dispmode = 0; }
   if (M5.BtnA.isPressed()) { dispmode = 1; }
   if (M5.BtnC.isPressed()) { dispmode = 2; }
+
+  if (dispmode == 2) {
+    drawAltitudeGraphMode();
+    lcd.startWrite();
+    lcd_s.pushSprite(0, 0);
+    lcd.endWrite();
+    return;
+  }
   
   // 接続状況表示
-  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
-  lcd_s.setTextSize(1);
-  lcd_s.setTextDatum(top_right);
-  lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
-  lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
-  if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
-  if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
-  if (!ambientpush && !MQTTpush) {
-    lcd_s.drawString("MQTT: x", 320, 30);
-    // lcd_s.drawString("Amb: x", 320, 45);
+  if (dispmode == 0 || dispmode == 1) {
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextSize(1);
+    lcd_s.setTextDatum(TL_DATUM);
+    lcd_s.drawString(Loc == "su" ? "鈴鹿" : (Loc == "mo" ? "茂木" : "豊田"), 10, 0);
+    lcd_s.setTextDatum(top_right);
+    lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
+    lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
+    if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
+    if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
+    if (!ambientpush && !MQTTpush) {
+      lcd_s.drawString("MQTT: x", 320, 30);
+      // lcd_s.drawString("Amb: x", 320, 45);
+    }
   }
   
   // タイトル表示（表示モードごと）
@@ -571,10 +796,6 @@ void updateDisplay() {
     lcd_s.drawString("回転数(rpm):", 10, 50);
     lcd_s.drawString("噴射時間(ms):", 10, 130);
     lcd_s.drawString("進角角度(CA):", 10, 210);
-  } else if (dispmode == 2) {
-    lcd_s.drawString("速度(km/h):", 10, 50);
-    lcd_s.drawString("回転数(rpm):", 10, 130);
-    lcd_s.drawString("燃費(km/l):", 10, 210);
   }
   
   // 第１表示行
@@ -582,7 +803,7 @@ void updateDisplay() {
   lcd_s.setTextSize(1);
   lcd_s.setTextDatum(BL_DATUM);
   lcd_s.setCursor(140, 50);
-  if (dispmode == 0 || dispmode == 2) {
+  if (dispmode == 0) {
     lcd_s.print(speed, 1);
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);
     int barLength = (int)((constrain(speed, 0.0, 45.0) / 45.0) * 300.0);
@@ -622,12 +843,6 @@ void updateDisplay() {
     lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
     lcd_s.fillRect(10, 135, map(INJ_timems, 0, 10, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(INJ_timems, 0, 10, 10, 310), 135, map(INJ_timems, 0, 10, 300, 0), 10, TFT_BLACK);
-  } else if (dispmode == 2) {
-    lcd_s.setCursor(140, 130);
-    lcd_s.print(tachoRpm);
-    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
-    lcd_s.fillRect(10, 135, map(tachoRpm, 0, 6500, 0, 300), 10, TFT_WHITE);
-    lcd_s.fillRect(map(tachoRpm, 0, 6500, 10, 310), 135, map(tachoRpm, 0, 6500, 300, 0), 10, TFT_BLACK);
   }
   
   // 第３表示行（走行時間・進角・燃費）
@@ -651,11 +866,6 @@ void updateDisplay() {
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
     lcd_s.fillRect(10, 215, map(IGN_CA, 0, 90, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(IGN_CA, 0, 90, 10, 310), 215, map(IGN_CA, 0, 90, 300, 0), 10, TFT_BLACK);
-  } else if (dispmode == 2) {
-    lcd_s.print(dispergas, 1);
-    lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
-    lcd_s.fillRect(10, 215, map(dispergas, 0, 2000, 0, 300), 10, TFT_WHITE);
-    lcd_s.fillRect(map(dispergas, 0, 2000, 10, 310), 215, map(dispergas, 0, 2000, 300, 0), 10, TFT_BLACK);
   }
   
   // スプライトをLCDへ転送
@@ -826,7 +1036,7 @@ void setup() {
   
   // GNSS初期化（モジュールに応じてボーレートを切り替える）
   if (isBmp280Ready) {
-      Serial2.begin(384002);  // M5Stack GNSS Module(NEO-M9N)
+      Serial2.begin(38400);  // M5Stack GNSS Module(NEO-M9N)
   } else {
       Serial2.begin(115200); // NEO-6M
   }
@@ -1007,6 +1217,14 @@ void loop() {
   updateBLE();
   updateECU();
   updateGNSS();
+
+  ensureWaypointLoadedForCurrentLoc();
+  if (gps.location.isValid() && waypointCount > 0) {
+    nearestWaypointIndex = findNearestWaypointIndex(la, ln);
+  } else {
+    nearestWaypointIndex = -1;
+  }
+
   updateDisplay();
   
   // デバッグ用Serial出力
