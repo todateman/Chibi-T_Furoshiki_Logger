@@ -91,10 +91,7 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 ### モード2(標高グラフ)の画面例
 
-<video width="320" height="240" controls autoplay>
-  <source src="./docs/m5stack_altitude_sim.webm" type="video/webm">
-  お使いのブラウザは video タグに対応していません
-</video>
+https://github.com/user-attachments/assets/a7fdfc0b-4c62-4426-a9e1-d857ddd0c710
 
 - 水色線: ウェイポイントファイルの標高プロファイル
 - 黄色点: 最近傍ウェイポイントIDの標高
