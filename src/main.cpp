@@ -34,7 +34,7 @@
 #define MQTT_RECONNECT_MAX_INTERVAL  60000UL
 #define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
-#define SEA_LEVEL_FETCH_RETRY_INTERVAL 15000UL
+#define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define GNSS_PARSE_BUDGET_BYTES 256
 
 // MQTT設定
@@ -132,9 +132,10 @@ String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "
 // BMP280による高度推定用
 Adafruit_BMP280 bmp280;
 bool isBmp280Ready = false;                       // BMP280が正常に初期化されているかどうか
-float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位、Open-Meteoから取得して更新される可能性あり）
-bool seaLevelPressureReplaced = false;            // 海面上気圧がOpen-Meteoから正常に取得されてbmp280の高度計算に使用されているかどうか
-unsigned long nextSeaLevelPressureFetchAt = 0;    // 次回の海面上気圧取得を試みる時刻（ミリ秒）
+float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
+float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280生高度の差分（m）
+bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
+unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
 
 // サーキットごとの設定
 const uint8_t totallaps_su = 8;
@@ -659,8 +660,8 @@ void updateGNSS() {
   }
 }
 
-// Open-MeteoのAPIを呼び出すために、現在の緯度経度が有効かどうかを判定する
-bool hasValidLocationForWeatherApi() {
+// 国土地理院APIを呼び出すために、現在の緯度経度が有効かどうかを判定する
+bool hasValidLocationForGsiApi() {
   return isfinite(la) && isfinite(ln) && gps.location.isValid() && la >= -90.0 && la <= 90.0 && ln >= -180.0 && ln <= 180.0;
 }
 
@@ -678,77 +679,146 @@ void updateAltitudeFromBmp280() {
 
   // 気圧から高度を計算する（国際標準大気モデルを使用）
   float pressureKPa = pressurePa / 1000.0f;
-  float altitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
-  if (isfinite(altitudeMeters) && altitudeMeters > -1000.0f && altitudeMeters < 12000.0f) {
-    alt = altitudeMeters;
+  float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
+  if (isfinite(rawAltitudeMeters) && rawAltitudeMeters > -1000.0f && rawAltitudeMeters < 12000.0f) {
+    alt = rawAltitudeMeters + altitudeOffsetMeters;
   }
 }
 
-// Open-MeteoのAPIを呼び出して海面上気圧を取得し、BMP280の高度計算に使用する値を更新する
-void tryFetchSeaLevelPressureFromOpenMeteo() {
-  // すでに正常に取得している場合は何もしない
-  if (seaLevelPressureReplaced) {
-    return;
-  }
-  // 前回の取得から一定時間経過していない場合は何もしない
-  if (millis() < nextSeaLevelPressureFetchAt) {
-    return;
+// 国土地理院APIのレスポンスをパースして標高(m)を取り出す
+bool tryParseGsiElevationResponse(const String& payload, float& outElevationMeters) {
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[GSI] JSON parse failed: %s\n", err.c_str());
+    return false;
   }
 
-  // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
-  if (WiFi.status() != WL_CONNECTED || !hasValidLocationForWeatherApi()) {
-    return;
+  float elevation = doc["elevation"] | NAN;
+  if (!isfinite(elevation) || elevation < -500.0f || elevation > 10000.0f) {
+    Serial.printf("[GSI] elevation out of range: %.2f\n", elevation);
+    return false;
   }
 
-  IPAddress resolvedIp;
-  int dnsResult = WiFi.hostByName("api.open-meteo.com", resolvedIp);
-  if (dnsResult != 1) {
-    Serial.printf("[OpenMeteo] DNS failed: result=%d RSSI=%d\n", dnsResult, WiFi.RSSI());
-    nextSeaLevelPressureFetchAt = millis() + SEA_LEVEL_FETCH_RETRY_INTERVAL;
-    return;
-  }
+  outElevationMeters = elevation;
+  return true;
+}
 
-  Serial.printf("[OpenMeteo] DNS ok: %s RSSI=%d\n", resolvedIp.toString().c_str(), WiFi.RSSI());
+// 国土地理院APIから標高(m)を取得する（HTTP優先、失敗時はHTTPSフォールバック）
+bool fetchGsiElevationMeters(float& outElevationMeters) {
+  const char* gsiHost = "cyberjapandata2.gsi.go.jp";
+  String query = String("/general/dem/scripts/getelevation.php?lon=") + String(ln, 6) +
+                 String("&lat=") + String(la, 6) +
+                 String("&outtype=JSON");
+  String httpsUrl = String("https://") + gsiHost + query;
+  String httpUrl = String("http://") + gsiHost + query;
 
-  // 遅延最小化とTLS失敗回避のため、Open-Meteo取得はHTTPで実施する
-  String url = String("http://api.open-meteo.com/v1/forecast?latitude=") + String(la, 6) +
-               String("&longitude=") + String(ln, 6) +
-               String("&current=pressure_msl");
-
-  WiFiClient weatherClient;
   HTTPClient http;
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setConnectTimeout(1200);
   http.setTimeout(1200);
 
-  // HTTP接続の開始に失敗した場合はリトライのための待ち時間をセットして終了する（成功している場合は次回以降の呼び出しで何もしない）
-  if (!http.begin(weatherClient, url)) {
-    Serial.println("[OpenMeteo] http.begin failed");
-    nextSeaLevelPressureFetchAt = millis() + SEA_LEVEL_FETCH_RETRY_INTERVAL;
+  WiFiClient plainClient;
+  if (http.begin(plainClient, httpUrl)) {
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      bool ok = tryParseGsiElevationResponse(http.getString(), outElevationMeters);
+      http.end();
+      if (ok) {
+        return true;
+      }
+    } else {
+      Serial.printf("[GSI] HTTP GET failed: %d (%s) RSSI=%d\n", code, http.errorToString(code).c_str(), WiFi.RSSI());
+    }
+    http.end();
+  } else {
+    Serial.println("[GSI] HTTP http.begin failed");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[GSI] skip HTTPS fallback: WiFi disconnected");
+    return false;
+  }
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  if (http.begin(secureClient, httpsUrl)) {
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      bool ok = tryParseGsiElevationResponse(http.getString(), outElevationMeters);
+      http.end();
+      if (ok) {
+        return true;
+      }
+    } else {
+      Serial.printf("[GSI] HTTPS GET failed: %d (%s) RSSI=%d\n", code, http.errorToString(code).c_str(), WiFi.RSSI());
+    }
+    http.end();
+  } else {
+    Serial.println("[GSI] HTTPS http.begin failed");
+  }
+
+  return false;
+}
+
+// 国土地理院API標高とBMP280生高度との差分を取得し、高度オフセットを固定する
+void tryFetchAltitudeOffsetFromGsi() {
+  // すでに正常に取得している場合は何もしない
+  if (altitudeOffsetFixed) {
+    return;
+  }
+  // 前回の取得から一定時間経過していない場合は何もしない
+  if (millis() < nextAltitudeOffsetFetchAt) {
     return;
   }
 
-  int code = http.GET();
-  if (code == HTTP_CODE_OK) {
-    StaticJsonDocument<512> doc;
-    DeserializationError err = deserializeJson(doc, http.getString());
-    if (!err) {
-      float pressureMslHpa = doc["current"]["pressure_msl"] | NAN;
-      if (isfinite(pressureMslHpa) && pressureMslHpa > 800.0f && pressureMslHpa < 1200.0f) {
-        seaLevelPressureKPa = pressureMslHpa / 10.0f;
-        seaLevelPressureReplaced = true;
-        Serial.printf("[OpenMeteo] sea-level pressure fixed: %.3f kPa\n", seaLevelPressureKPa);
-      }
-    }
-  } else {
-    Serial.printf("[OpenMeteo] GET failed: %d (%s) RSSI=%d\n", code, http.errorToString(code).c_str(), WiFi.RSSI());
+  // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
+  if (!isBmp280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
+    return;
   }
-  http.end();
 
-  // 取得に成功していない場合はリトライのための待ち時間をセットする（成功している場合は次回以降の呼び出しで何もしない）
-  if (!seaLevelPressureReplaced) {
-    nextSeaLevelPressureFetchAt = millis() + SEA_LEVEL_FETCH_RETRY_INTERVAL;
+  IPAddress resolvedIp;
+  int dnsResult = WiFi.hostByName("cyberjapandata2.gsi.go.jp", resolvedIp);
+  if (dnsResult != 1) {
+    Serial.printf("[GSI] DNS failed: result=%d RSSI=%d\n", dnsResult, WiFi.RSSI());
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
   }
+
+  Serial.printf("[GSI] DNS ok: %s RSSI=%d\n", resolvedIp.toString().c_str(), WiFi.RSSI());
+
+  float gsiElevationMeters = NAN;
+  if (!fetchGsiElevationMeters(gsiElevationMeters)) {
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  float pressurePa = bmp280.readPressure();
+  if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
+    Serial.println("[GSI] BMP280 pressure invalid while fixing offset");
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  float pressureKPa = pressurePa / 1000.0f;
+  float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
+  if (!isfinite(rawAltitudeMeters) || rawAltitudeMeters < -1000.0f || rawAltitudeMeters > 12000.0f) {
+    Serial.printf("[GSI] BMP280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  float offset = gsiElevationMeters - rawAltitudeMeters;
+  if (!isfinite(offset) || offset < -3000.0f || offset > 3000.0f) {
+    Serial.printf("[GSI] offset out of range: %.2f (gsi=%.2f raw=%.2f)\n", offset, gsiElevationMeters, rawAltitudeMeters);
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  altitudeOffsetMeters = offset;
+  altitudeOffsetFixed = true;
+  alt = rawAltitudeMeters + altitudeOffsetMeters;  // 次回ALT周期を待たずに現在値へ反映する
+  Serial.printf("[GSI] altitude offset fixed: %.2fm (gsi=%.2fm raw=%.2fm)\n", altitudeOffsetMeters, gsiElevationMeters, rawAltitudeMeters);
 }
 
 // ディスプレイ更新（表示モードごとに分岐）
@@ -1245,6 +1315,10 @@ void loop() {
   if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
     updateSerialOutput();
     t_Serial += SERIAL_OUT_INTERVAL;
+    // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+    if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
+      t_Serial = millis();
+    }
   }
   
   // SDカードへのログ書き出し
@@ -1285,8 +1359,8 @@ void loop() {
     t_alt += ALTITUDE_INTERVAL;
   }
 
-  // Open-Meteo呼び出しはBMP280が接続されているときのみ低頻度で実行し、成功したら以後実行しない
-  if (isBmp280Ready) tryFetchSeaLevelPressureFromOpenMeteo();
+  // 国土地理院API呼び出しはBMP280接続時のみ低頻度で実行し、成功したら以後実行しない
+  if (isBmp280Ready) tryFetchAltitudeOffsetFromGsi();
 
   delay(10);
 }

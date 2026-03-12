@@ -18,7 +18,7 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 | ウェイポイント標高グラフ | `sd`ディレクトリのウェイポイントCSV (`suzuka_waypoint.csv` / `motegi_waypoint.csv` / `toyota_waypoint.csv`) を読み込み、横軸=ウェイポイントID、縦軸=標高で表示。現在地の緯度経度を最も近いIDへ割り当てて標高を重ねて表示 |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
 | 高度推定 | BMP280気圧から高度推定 (標準大気式) |
-| 海面気圧補正 | Open-Meteoから`pressure_msl`を1回取得して高度基準を補正 |
+| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、BMP280高度との差分でオフセット補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
 | Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値除外<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
@@ -60,13 +60,14 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - シリアル出力: CSV形式 `lat,lon,alt,loc,Spd_GPS,rpm,Spd_PULSE,distance,gasml,dispergas,worktime,Temp`
 - 例外デコード: `monitor_filters = esp32_exception_decoder`
 
-## 高度推定 / Open-Meteo 補正
+## 高度推定 / 国土地理院API補正
 
 - 高度は GNSS ではなく BMP280 の気圧から算出
 - 海面気圧は初期値 `101.325kPa` を使用
-- Wi-Fi接続済みかつGNSS座標が有効なときのみ Open-Meteo API を低頻度で試行
-- Open-Meteoの`pressure_msl`取得に成功したら1回だけ海面気圧を置換し、以後は再取得しない
-- 通信遅延抑制のため Open-Meteo 取得は HTTP で実行
+- Wi-Fi接続済みかつGNSS座標が有効なときのみ、国土地理院API (`getelevation.php`) で標高取得を低頻度で試行
+- 標高取得成功時、その時点のBMP280生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
+- 以後の表示/ログ高度は `BMP280生高度 + オフセット` で算出
+- API取得は HTTPS を優先し、失敗時は HTTP フォールバック
 
 ## 起動時の Wi-Fi 操作
 
@@ -91,7 +92,9 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 ### モード2(標高グラフ)の画面例
 
-https://github.com/user-attachments/assets/a7fdfc0b-4c62-4426-a9e1-d857ddd0c710
+<video controls playsinline preload="metadata" width="720">
+  <source src="https://github.com/user-attachments/assets/a7fdfc0b-4c62-4426-a9e1-d857ddd0c710" type="video/webm">
+</video>
 
 - 水色線: ウェイポイントファイルの標高プロファイル
 - 黄色点: 最近傍ウェイポイントIDの標高
