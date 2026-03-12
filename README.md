@@ -95,6 +95,7 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 <p align="center" width="100%">
 <video src="https://github.com/user-attachments/assets/a7fdfc0b-4c62-4426-a9e1-d857ddd0c710" width="100%" controls></video>
 </p>
+
 - 水色線: ウェイポイントファイルの標高プロファイル
 - 黄色点: 最近傍ウェイポイントIDの標高
 - 赤色点: 現在地標高
