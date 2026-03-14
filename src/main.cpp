@@ -36,6 +36,8 @@
 #define ALTITUDE_INTERVAL   500
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define GNSS_PARSE_BUDGET_BYTES 256
+#define BMP280_I2C_SDA 21
+#define BMP280_I2C_SCL 22
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -1088,6 +1090,23 @@ void updateAmbient() {
   }
 }
 
+// GNSS Module内蔵BMP280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+bool initializeBmp280ForGnssModule() {
+  Wire.begin(BMP280_I2C_SDA, BMP280_I2C_SCL, 400000U);
+  Serial.printf("BMP280 I2C pin: SDA=%d SCL=%d\n", BMP280_I2C_SDA, BMP280_I2C_SCL);
+
+  const uint8_t addresses[] = {0x76, 0x77};
+  for (uint8_t i = 0; i < sizeof(addresses); i++) {
+    if (bmp280.begin(addresses[i], BMP280_CHIPID)) {
+      Serial.printf("BMP280 initialized (addr=0x%02X)\n", addresses[i]);
+      return true;
+    }
+  }
+
+  Serial.println("BMP280 init failed on addr 0x76/0x77");
+  return false;
+}
+
 //==================== setup() =====================
 void setup() {
   // M5初期化
@@ -1098,17 +1117,14 @@ void setup() {
   // デバッグ用Serial
   Serial.begin(115200);
 
-  // BMP280初期化（I2Cアドレス0x76）
-  if (bmp280.begin(0x76)) {
+  // BMP280初期化（ボードごとにPort.A I2Cピンへ切り替えて探索）
+  if (initializeBmp280ForGnssModule()) {
     bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
                        Adafruit_BMP280::SAMPLING_X2,
                        Adafruit_BMP280::SAMPLING_X16,
                        Adafruit_BMP280::FILTER_X16,
                        Adafruit_BMP280::STANDBY_MS_500);
-    Serial.println("BMP280 initialized");
     isBmp280Ready = true;
-  } else {
-    Serial.println("BMP280 init failed");
   }
 
   // ECU初期化

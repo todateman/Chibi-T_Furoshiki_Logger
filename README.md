@@ -29,8 +29,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
 - GNSS: Serial2 38400 bps ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module) DIP-SW TX:1, RX:1)
-- BMP280(気圧センサ): I2C 0x76 ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module)
-- BLE 温度センサ: RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可)
+- BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22 ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module)
+- BLE 温度センサ: M5Core2 PortA RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可 M5Stack Basicには32,33ピンが存在しないため使用不可)
 - ボタン: A/B/C でモード選択 + 起動時設定
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
