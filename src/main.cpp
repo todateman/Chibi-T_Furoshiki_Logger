@@ -228,7 +228,7 @@ struct Waypoint {
 };
 
 // ウェイポイントデータの最大数（必要に応じて増減させる）
-const size_t MAX_WAYPOINTS = 1024;
+const size_t MAX_WAYPOINTS = 300;
 Waypoint waypoints[MAX_WAYPOINTS];
 size_t waypointCount = 0;
 float waypointMinAlt = 0.0f;
@@ -1103,25 +1103,32 @@ void updateMQTT() {
     }
     return;
   }
-  mqttclient.loop();
+
+  // 多重送信ガード: 前回送信から500ms未満の場合はスキップ
+  static unsigned long lastPublishAt = 0;
+  if (millis() - lastPublishAt < 500UL) {
+    return;
+  }
+
   StaticJsonDocument<512> doc;
   doc["timestamp"] = datetime;
-  //doc["Spd_GPS"]   = spd;
-  doc["Spd_PULSE"] = speed;
-  doc["Lapcount"]  = Lapcount;
-  doc["worktime"]  = worktime;
-  doc["tachoRpm"]  = tachoRpm;
-  doc["distance"]  = distance;
-  doc["gasml"]     = gasml;
-  doc["dispergas"] = dispergas;
-  doc["lat"]       = la;
-  doc["lon"]       = ln;
-  doc["alt"]       = alt;
+  //doc["Spd_GPS"]   = (float)spd;
+  doc["Spd_PULSE"] = (float)speed;
+  doc["Lapcount"]  = (int)Lapcount;
+  doc["worktime"]  = (int)worktime;
+  doc["tachoRpm"]  = (int)tachoRpm;
+  doc["distance"]  = (int)distance;
+  doc["gasml"]     = (float)gasml;
+  doc["dispergas"] = (float)dispergas;
+  doc["lat"]       = (float)la;
+  doc["lon"]       = (float)ln;
+  doc["alt"]       = (float)alt;
   doc["loc"]       = Loc;
-  doc["temp"]      = EngTemp;
+  doc["temp"]      = (float)EngTemp;
   String jsonData;
   serializeJson(doc, jsonData);
   mqttclient.publish(mqtt_topic, jsonData.c_str());
+  lastPublishAt = millis();
 }
 
 // Ambient送信
@@ -1214,7 +1221,7 @@ void setup() {
   lcd.setBrightness(128);
   lcd.fillScreen(TFT_BLACK);
   // TLS接続時のヒープ確保余裕を増やすため、スプライトを4bitへ縮小
-  lcd_s.setColorDepth(4);
+  lcd_s.setColorDepth(8);
   lcd_s.createSprite(lcd.width(), lcd.height());
   lcd.setFont(&fonts::lgfxJapanGothicP_20);
   lcd.setTextSize(1);
@@ -1386,7 +1393,12 @@ void setup() {
 //==================== loop() =====================
 void loop() {
   M5.update();
-  
+
+  // MQTTコネクション維持（PubSubClient推奨: loop()を毎回呼ぶ）
+  if (MQTTpush && mqttclient.connected()) {
+    mqttclient.loop();
+  }
+
   updateBLE();
   updateECU();
   updateGNSS();
@@ -1427,11 +1439,19 @@ void loop() {
       if (millis() - t_MQTT >= MQTT_INTERVAL_PRE) {
         updateMQTT();
         t_MQTT += MQTT_INTERVAL_PRE;
+        // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+        if (millis() - t_MQTT >= MQTT_INTERVAL_PRE) {
+          t_MQTT = millis();
+        }
       }
     } else {
       if (millis() - t_MQTT >= MQTT_INTERVAL_RUN) {
         updateMQTT();
         t_MQTT += MQTT_INTERVAL_RUN;
+        // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+        if (millis() - t_MQTT >= MQTT_INTERVAL_RUN) {
+          t_MQTT = millis();
+        }
       }
     }
   }
