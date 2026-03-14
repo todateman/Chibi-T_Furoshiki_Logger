@@ -41,6 +41,7 @@
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
+#define MQTT_DIAGNOSTIC_LOG 0  // 本番:0, 切り分け時のみ1
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -78,8 +79,9 @@ const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイ�
 
 // WiFi, MQTT, Ambient
 WiFiManager wifiManager;
-WiFiClientSecure client;
-PubSubClient mqttclient(client);
+WiFiClient ambientClient;
+WiFiClientSecure mqttTlsClient;
+PubSubClient mqttclient(mqttTlsClient);
 Ambient ambient;
 bool isWifiConfigSucceeded = false;
 bool ambientpush = false;   // Ambient送信有効（必要に応じてfalseに設定）
@@ -226,7 +228,7 @@ struct Waypoint {
 };
 
 // ウェイポイントデータの最大数（必要に応じて増減させる）
-const size_t MAX_WAYPOINTS = 2048;
+const size_t MAX_WAYPOINTS = 1024;
 Waypoint waypoints[MAX_WAYPOINTS];
 size_t waypointCount = 0;
 float waypointMinAlt = 0.0f;
@@ -1017,6 +1019,57 @@ void updateSDLog() {
 }
 
 // MQTT送信（非同期リトライ）
+#if MQTT_DIAGNOSTIC_LOG
+void logMqttTlsErrorDetails() {
+  char errBuf[128] = {0};
+  int lastErr = mqttTlsClient.lastError(errBuf, sizeof(errBuf));
+  Serial.printf("MQTT TLS lastError=%d detail=%s\n", lastErr, errBuf[0] ? errBuf : "(none)");
+
+  IPAddress mqttIp;
+  int dnsResult = WiFi.hostByName(mqtt_server, mqttIp);
+  if (dnsResult == 1) {
+    Serial.printf("MQTT DNS ok: %s\n", mqttIp.toString().c_str());
+  } else {
+    Serial.printf("MQTT DNS failed: result=%d\n", dnsResult);
+  }
+}
+
+void logMqttRuntimeStats(const char* phase) {
+  Serial.printf("MQTT[%s] heap=%u minHeap=%u maxAlloc=%u RSSI=%d\n",
+                phase,
+                static_cast<unsigned int>(ESP.getFreeHeap()),
+                static_cast<unsigned int>(ESP.getMinFreeHeap()),
+                static_cast<unsigned int>(ESP.getMaxAllocHeap()),
+                WiFi.RSSI());
+}
+
+void runMqttPathDiagnostics() {
+  static unsigned long lastDiagAt = 0;
+  if (millis() - lastDiagAt < 60000UL) {
+    return;
+  }
+  lastDiagAt = millis();
+
+  WiFiClient tcpClient;
+  bool tcpOk = tcpClient.connect(mqtt_server, mqtt_port);
+  Serial.printf("MQTT diag TCP %s:%d -> %s\n", mqtt_server, mqtt_port, tcpOk ? "ok" : "failed");
+  tcpClient.stop();
+
+  WiFiClientSecure insecureTls;
+  insecureTls.setInsecure();
+  insecureTls.setTimeout(15);
+  bool tlsOk = insecureTls.connect(mqtt_server, mqtt_port);
+  if (tlsOk) {
+    Serial.println("MQTT diag TLS(insecure) -> ok");
+  } else {
+    char errBuf[128] = {0};
+    int lastErr = insecureTls.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("MQTT diag TLS(insecure) -> failed, err=%d detail=%s\n", lastErr, errBuf[0] ? errBuf : "(none)");
+  }
+  insecureTls.stop();
+}
+#endif
+
 void updateMQTT() {
   refreshDatetime();  // MQTT送信前に日時を更新
 
@@ -1030,6 +1083,9 @@ void updateMQTT() {
     static unsigned long reconnectInterval = MQTT_RECONNECT_BASE_INTERVAL;
     if (millis() - lastReconnectAttempt > reconnectInterval) {
       lastReconnectAttempt = millis();
+#if MQTT_DIAGNOSTIC_LOG
+      logMqttRuntimeStats("before-connect");
+#endif
       if (mqttclient.connect(mqtt_deviceID)) {
         reconnectInterval = MQTT_RECONNECT_BASE_INTERVAL;
         Serial.println("MQTT connected");
@@ -1037,6 +1093,12 @@ void updateMQTT() {
         reconnectInterval = min(reconnectInterval * 2UL, MQTT_RECONNECT_MAX_INTERVAL);
         Serial.print("MQTT reconnect failed, state: ");
         Serial.println(mqttclient.state());
+#if MQTT_DIAGNOSTIC_LOG
+        logMqttRuntimeStats("connect-failed");
+        logMqttTlsErrorDetails();
+        runMqttPathDiagnostics();
+#endif
+        mqttTlsClient.stop();
       }
     }
     return;
@@ -1151,7 +1213,8 @@ void setup() {
   lcd.setRotation(1);
   lcd.setBrightness(128);
   lcd.fillScreen(TFT_BLACK);
-  lcd_s.setColorDepth(8);
+  // TLS接続時のヒープ確保余裕を増やすため、スプライトを4bitへ縮小
+  lcd_s.setColorDepth(4);
   lcd_s.createSprite(lcd.width(), lcd.height());
   lcd.setFont(&fonts::lgfxJapanGothicP_20);
   lcd.setTextSize(1);
@@ -1241,33 +1304,37 @@ void setup() {
       lcd.drawString("Wi-Fi無効", lcd.width()/2, lcd.height()/2);
     }
   }
+
+  if (isWifiConfigSucceeded) {
+    // ESP32の省電力動作でTLS受信が不安定になることがあるため無効化する
+    WiFi.setSleep(false);
+    Serial.println("WiFi modem sleep disabled");
+  }
   
   // Ambient設定
   if (ambientpush && isWifiConfigSucceeded) {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     sprintf(devKey, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client)) {
+    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
       Serial.printf("Cannot get channelId for device %s\n", devKey);
-      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client)) {
+      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
         M5.update();
         delay(500);
       }
     }
-    ambient.begin(channelId, writeKey, &client);
+    ambient.begin(channelId, writeKey, &ambientClient);
   }
   
   // MQTT設定
   if (MQTTpush && isWifiConfigSucceeded) {
     mqttclient.setBufferSize(MQTT_BUFFER_SIZE);
-    mqttclient.setSocketTimeout(1);  // 失敗時に長時間ブロックしないよう短縮
-    client.setTimeout(1000);
-    client.setHandshakeTimeout(1);
-    client.setCACert(AWS_CERT_CA);
-    client.setCertificate(AWS_CERT_CRT);
-    client.setPrivateKey(AWS_CERT_PRIVATE);
+    mqttclient.setSocketTimeout(15);
+    mqttclient.setKeepAlive(60);
+    mqttTlsClient.setCACert(AWS_CERT_CA);
+    mqttTlsClient.setCertificate(AWS_CERT_CRT);
+    mqttTlsClient.setPrivateKey(AWS_CERT_PRIVATE);
     mqttclient.setServer(mqtt_server, mqtt_port);
-    updateMQTT();
   }
   
   // NTP同期（Wi-Fi接続成功時、GPS時刻受信前）
@@ -1296,6 +1363,12 @@ void setup() {
     if (!ntpSyncDone) {
       Serial.println("NTP sync timeout");
     }
+  }
+
+  // 初回MQTT接続はNTP/GNSSで時刻が確定した後に実行する
+  if (MQTTpush && isWifiConfigSucceeded) {
+    delay(300);
+    updateMQTT();
   }
 
   lcd.fillScreen(TFT_BLACK);
