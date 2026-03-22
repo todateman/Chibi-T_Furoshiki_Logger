@@ -13,108 +13,9 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_AHTX0.h>
 #include "secrets.h"
-
-// M5.In_I2C を使う BMP280 ミニドライバ
-struct BMP280Driver {
-  static constexpr uint8_t ADDR = 0x76;
-  static constexpr uint32_t FREQ = 400000;
-  uint16_t digT1 = 0;
-  int16_t digT2 = 0;
-  int16_t digT3 = 0;
-  uint16_t digP1 = 0;
-  int16_t digP2 = 0;
-  int16_t digP3 = 0;
-  int16_t digP4 = 0;
-  int16_t digP5 = 0;
-  int16_t digP6 = 0;
-  int16_t digP7 = 0;
-  int16_t digP8 = 0;
-  int16_t digP9 = 0;
-  int32_t tFine = 0;
-
-  bool begin() {
-    uint8_t id = 0;
-    if (!M5.In_I2C.readRegister(ADDR, 0xD0, &id, 1, FREQ)) {
-      return false;
-    }
-    if (id != 0x58) {
-      return false;
-    }
-    uint8_t calib[24] = {0};
-    if (!M5.In_I2C.readRegister(ADDR, 0x88, calib, sizeof(calib), FREQ)) {
-      return false;
-    }
-
-    digT1 = (uint16_t)(calib[1] << 8 | calib[0]);
-    digT2 = (int16_t)(calib[3] << 8 | calib[2]);
-    digT3 = (int16_t)(calib[5] << 8 | calib[4]);
-    digP1 = (uint16_t)(calib[7] << 8 | calib[6]);
-    digP2 = (int16_t)(calib[9] << 8 | calib[8]);
-    digP3 = (int16_t)(calib[11] << 8 | calib[10]);
-    digP4 = (int16_t)(calib[13] << 8 | calib[12]);
-    digP5 = (int16_t)(calib[15] << 8 | calib[14]);
-    digP6 = (int16_t)(calib[17] << 8 | calib[16]);
-    digP7 = (int16_t)(calib[19] << 8 | calib[18]);
-    digP8 = (int16_t)(calib[21] << 8 | calib[20]);
-    digP9 = (int16_t)(calib[23] << 8 | calib[22]);
-
-    uint8_t ctrlMeas = 0x27;  // temp x1, press x1, normal mode
-    uint8_t config = 0xA0;    // standby 1000ms, IIR x4
-    if (!M5.In_I2C.writeRegister8(ADDR, 0xF4, ctrlMeas, FREQ)) {
-      return false;
-    }
-    if (!M5.In_I2C.writeRegister8(ADDR, 0xF5, config, FREQ)) {
-      return false;
-    }
-    return true;
-  }
-
-  bool readPressurePa(float& pressurePa) {
-    uint8_t buf[6] = {0};
-    if (!M5.In_I2C.readRegister(ADDR, 0xF7, buf, sizeof(buf), FREQ)) {
-      return false;
-    }
-
-    int32_t adcP = (int32_t)((buf[0] << 12) | (buf[1] << 4) | (buf[2] >> 4));
-    int32_t adcT = (int32_t)((buf[3] << 12) | (buf[4] << 4) | (buf[5] >> 4));
-    if (adcP == 0x80000 || adcT == 0x80000) {
-      return false;
-    }
-
-    int32_t var1 = ((((adcT >> 3) - ((int32_t)digT1 << 1))) * ((int32_t)digT2)) >> 11;
-    int32_t var2 = (((((adcT >> 4) - ((int32_t)digT1)) * ((adcT >> 4) - ((int32_t)digT1))) >> 12) * ((int32_t)digT3)) >> 14;
-    tFine = var1 + var2;
-
-    int64_t pvar1 = ((int64_t)tFine) - 128000;
-    int64_t pvar2 = pvar1 * pvar1 * (int64_t)digP6;
-    pvar2 = pvar2 + ((pvar1 * (int64_t)digP5) << 17);
-    pvar2 = pvar2 + (((int64_t)digP4) << 35);
-    pvar1 = ((pvar1 * pvar1 * (int64_t)digP3) >> 8) + ((pvar1 * (int64_t)digP2) << 12);
-    pvar1 = (((((int64_t)1) << 47) + pvar1) * ((int64_t)digP1)) >> 33;
-    if (pvar1 == 0) {
-      return false;
-    }
-
-    int64_t p = 1048576 - adcP;
-    p = (((p << 31) - pvar2) * 3125) / pvar1;
-    pvar1 = (((int64_t)digP9) * (p >> 13) * (p >> 13)) >> 25;
-    pvar2 = (((int64_t)digP8) * p) >> 19;
-    p = ((p + pvar1 + pvar2) >> 8) + (((int64_t)digP7) << 4);
-
-    pressurePa = (float)p / 256.0f;
-    return pressurePa > 0.0f;
-  }
-
-  bool readAltitude(float seaLevelHpa, float& altitudeM) {
-    float pressurePa = 0.0f;
-    if (!readPressurePa(pressurePa)) {
-      return false;
-    }
-    altitudeM = AltitudeMath::pressureToAltitudeMeters(pressurePa, seaLevelHpa);
-    return true;
-  }
-};
 
 //==================== 定数・マクロ ====================
 #define pi 3.141592653589793
@@ -126,9 +27,6 @@ struct BMP280Driver {
 #define BLE_TX_PIN 33
 #define USE_HARDWARE_BLE 0
 
-// GNSSのPPSピン
-#define PPS_PIN 34
-
 // 各タスクの更新間隔（ミリ秒）
 #define SERIAL_OUT_INTERVAL 1000
 #define SD_LOG_INTERVAL     1000
@@ -138,33 +36,15 @@ struct BMP280Driver {
 #define MQTT_RECONNECT_MAX_INTERVAL  60000UL
 #define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
+#define ENV_SENSOR_INTERVAL 1000
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define GNSS_PARSE_BUDGET_BYTES 256
-#define BMP280_I2C_SDA 21
-#define BMP280_I2C_SCL 22
+#define BMX280_I2C_SDA 21
+#define BMX280_I2C_SCL 22
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
 #define MQTT_DIAGNOSTIC_LOG 0  // 本番:0, 切り分け時のみ1
-
-// 高度推定設定
-static constexpr float SEA_LEVEL_HPA = 1013.25f;
-// 実走想定: 野外・水平移動・1-80km/h (路面振動/風圧の影響を見込んだ設定)
-static constexpr float R_BARO = 0.36f;          // baro sigma ~0.6m
-static constexpr float R_BARO_WITH_ABS = 4.0f;  // abs標高がある間はbaroを弱く使う
-static constexpr float R_GSI = 4.0f;            // GSI sigma ~2.0m
-static constexpr float R_GSI_HOLD = 9.0f;       // GSI更新間隔中の拘束用
-static constexpr float R_GSI_HARD = 0.25f;      // GSIから大きく外れたときの再ロック用
-static constexpr float R_GNSS = 36.0f;          // abs altitude sigma ~6.0m (GNSS fallback時)
-static constexpr float EKF_PROCESS_SIGMA_A = 1.2f; // IMU vertical accel noise sigma [m/s^2]
-static constexpr float ALT_ACCEL_DEADBAND = 0.35f; // 鉛直加速度デッドバンド [m/s^2]
-static constexpr float GSI_HARD_GATE_M = 3.0f;     // GSI再ロック開始しきい値 [m]
-static constexpr float LOW_SPEED_FREEZE_KMPH = 3.0f; // 低速時はIMU鉛直加速度を凍結
-static constexpr uint32_t GNSS_BAUD = 38400;    // GNSSモジュールのシリアル通信速度
-static constexpr unsigned long GSI_ELEVATION_INTERVAL = 10000;  // 国土地理院APIから標高を取得する間隔（ミリ秒）
-static constexpr uint16_t GSI_HTTP_TIMEOUT_MS = 5000; // 国土地理院APIへのHTTPリクエストのタイムアウト時間（ミリ秒）
-static constexpr uint32_t GSI_TASK_POLL_MS = 20;    // 国土地理院APIリクエスト処理タスクのポーリング間隔（ミリ秒）
-static constexpr uint32_t GSI_TASK_STACK_SIZE = 8192; // 国土地理院APIリクエスト処理タスクのスタックサイズ（バイト）
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -219,6 +99,7 @@ unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
 unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
+unsigned long t_env    = 0;
 unsigned long lastSdSyncAt = 0;
 uint16_t sdLinesSinceSync = 0;
 
@@ -249,6 +130,7 @@ float EngTemp = 0.0;    // エンジン温度 [°C]
 
 // GPS用
 TinyGPSPlus gps;
+int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, M5Stack GNSS Module:38400）
 double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
@@ -256,11 +138,23 @@ double alt = 0.0;   // GPS高度
 double spd = 0.0;   // GPS速度
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
-// BMP280による高度推定用
+// BMP280/BME280による高度推定用
 Adafruit_BMP280 bmp280;
-bool isBmp280Ready = false;                       // BMP280が正常に初期化されているかどうか
+Adafruit_BME280 bme280;
+Adafruit_AHTX0 aht20;
+bool isBmx280Ready = false;     // BMP280/BME280が正常に初期化されているかどうか
+bool isAht20Ready = false;
+enum PressureSensorType {
+  PRESSURE_SENSOR_NONE = 0,
+  PRESSURE_SENSOR_BMP280,
+  PRESSURE_SENSOR_BME280,
+};
+PressureSensorType pressureSensorType = PRESSURE_SENSOR_NONE;
+float envPressureKPa = NAN;
+float envTemperatureC = NAN;
+float envHumidityPct = NAN;
 float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
-float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280生高度の差分（m）
+float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280/BME280生高度の差分（m）
 bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
 unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
 
@@ -277,19 +171,8 @@ const int time_offset = 9;  // JST
 char datetime[23];
 uint64_t lastDatetimeCentis = 0;  // CSV時刻の逆行防止（1/100秒単位）
 
-// 時刻同期フラグ
-bool ntpSyncDone = false;     // NTP同期が完了したかどうか
-bool gpsTimeLocked = false;   // GNSS時刻を反映しているかどうか（GPSから時刻を一度反映したら、以降はNTP同期で時刻を更新しても逆行しないようにするためのフラグ）
-
-// 1PPS同期用状態
-volatile bool ppsPulsePending = false;      // PPS割り込みが発生して処理待ちの状態かどうか
-volatile unsigned long ppsLastIsrMs = 0;    // PPS割り込みが最後に発生したときの millis() の値
-volatile uint32_t ppsPulseCount = 0;        // PPS割り込みが発生した回数（デバッグ用）
-bool ppsSyncEnabled = false;                // GNSS時刻が有効なときのみ true
-bool ppsSignalAlive = false;                // 直近でPPSが入力されているか
-unsigned long lastGnssTimeUpdateMs = 0;     // GNSS時刻を最後に受信した時刻
-time_t latestGnssEpochJst = 0;              // 最新のGNSS時刻（JST）
-bool latestGnssEpochValid = false;          // 最新のGNSS時刻が有効かどうか（GNSSから時刻を一度でも受信したらtrueになるフラグ。これがfalseのときはPPS割り込みがあっても時刻同期を行わないようにするためのフラグ）
+// NTP同期フラグ（GPS受信後は更新しない）
+bool ntpSyncDone = false;
 
 // 日時バッファ更新（必要に応じてセンチ秒を指定）
 void refreshDatetime(uint8_t csec = 255) {
@@ -347,79 +230,6 @@ void updateSystemTimeFromGnss() {
   if (current < 1577836800 || gnssJst > (current + 2)) {  // currentが未初期化または2秒以上先行時のみ補正
     setTime(gnssJst);
     ntpSyncDone = true;
-  }
-}
-
-// PPS割り込みハンドラ
-void IRAM_ATTR onPpsRise() {
-  ppsLastIsrMs = millis();
-  ppsPulseCount++;
-  ppsPulsePending = true;
-}
-
-// システム時刻の逆行を防ぎ、必要なときだけ前進補正する
-bool syncTimeForwardOnly(time_t candidateEpoch, long forwardThresholdSec = 0) {
-  const time_t currentEpoch = now();
-
-  if (candidateEpoch < currentEpoch) {
-    return false;
-  }
-
-  const long diff = (long)(candidateEpoch - currentEpoch);
-  if (diff < forwardThresholdSec) {
-    return false;
-  }
-
-  setTime(candidateEpoch);
-  return true;
-}
-
-// PPSの最終入力からの経過時間をミリ秒で取得
-unsigned long getPpsAgeMs() {
-  noInterrupts();
-  const unsigned long lastMs = ppsLastIsrMs;
-  interrupts();
-
-  return millis() - lastMs;
-}
-
-// PPS同期の状態を更新し、必要に応じてシステム時刻をGNSS時刻に合わせる
-void updatePpsDiscipline() {
-  static bool prevLocked = false;
-
-  const unsigned long ppsAgeMs = getPpsAgeMs();
-  ppsSignalAlive = (ppsAgeMs <= 1500);
-  const bool lockedNow = ppsSyncEnabled && ppsSignalAlive;
-  if (lockedNow != prevLocked) {
-    Serial.println(lockedNow ? "[PPS] lock" : "[PPS] signal lost");
-    prevLocked = lockedNow;
-  }
-
-  if (!ppsSyncEnabled) {
-    return;
-  }
-
-  // GNSS時刻が一定時間更新されていない場合はPPS同期を一時停止
-  if (millis() - lastGnssTimeUpdateMs > 3000) {
-    ppsSyncEnabled = false;
-    return;
-  }
-
-  if (!ppsPulsePending) {
-    return;
-  }
-
-  noInterrupts();
-  ppsPulsePending = false;
-  interrupts();
-
-  // TimeLibは内部で秒を進めるため、PPSごとに+1すると二重加算になる。
-  // PPS到来時はGNSS時刻との差が大きい場合のみ再同期する。
-  if (latestGnssEpochValid) {
-    const long secDiff = (long)(latestGnssEpochJst - now());
-    if (secDiff > 2) {
-      syncTimeForwardOnly((time_t)latestGnssEpochJst, 2);
-    }
   }
 }
 
@@ -767,252 +577,6 @@ void saveNextLogIndex(int nextIndex) {
   indexFile.close();                  // インデックスファイルを閉じる
 }
 
-// 国土地理院APIから標高を取得する（成功時 true）
-bool parseGsiElevationPayload(const String& payload, double& outElevation) {
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload);
-  if (!err) {
-    JsonVariant elevation = doc["elevation"];
-    if (elevation.is<float>() || elevation.is<double>() || elevation.is<int>() || elevation.is<long>()) {
-      outElevation = elevation.as<double>();
-      return true;
-    }
-
-    if (elevation.is<const char*>()) {
-      const char* elevStr = elevation.as<const char*>();
-      if (elevStr != nullptr && strcmp(elevStr, "-----") != 0) {
-        char* endPtr = nullptr;
-        double parsed = strtod(elevStr, &endPtr);
-        if (endPtr != elevStr) {
-          outElevation = parsed;
-          return true;
-        }
-      }
-    }
-  }
-
-  // 予期しないレスポンス形式に備え、最低限の文字列抽出も試す。
-  int keyIndex = payload.indexOf("\"elevation\"");
-  if (keyIndex < 0) {
-    return false;
-  }
-  int colonIndex = payload.indexOf(':', keyIndex);
-  if (colonIndex < 0) {
-    return false;
-  }
-
-  int valueStart = colonIndex + 1;
-  while (valueStart < (int)payload.length() && isspace((unsigned char)payload[valueStart])) {
-    valueStart++;
-  }
-  if (valueStart >= (int)payload.length()) {
-    return false;
-  }
-
-  bool quoted = payload[valueStart] == '"';
-  if (quoted) {
-    valueStart++;
-  }
-
-  int valueEnd = valueStart;
-  while (valueEnd < (int)payload.length()) {
-    char c = payload[valueEnd];
-    if (quoted) {
-      if (c == '"') {
-        break;
-      }
-    } else if (c == ',' || c == '}' || isspace((unsigned char)c)) {
-      break;
-    }
-    valueEnd++;
-  }
-
-  if (valueEnd <= valueStart) {
-    return false;
-  }
-
-  String value = payload.substring(valueStart, valueEnd);
-  value.trim();
-  if (value == "-----") {
-    return false;
-  }
-
-  char* endPtr = nullptr;
-  double parsed = strtod(value.c_str(), &endPtr);
-  if (endPtr == value.c_str()) {
-    return false;
-  }
-  outElevation = parsed;
-  return true;
-}
-
-// 国土地理院APIから標高を取得する（成功時 true）
-bool fetchGsiElevation(double lat, double lon, double& outElevation) {
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-
-  WiFiClientSecure httpsClient;
-  httpsClient.setInsecure();
-  httpsClient.setTimeout(GSI_HTTP_TIMEOUT_MS);
-
-  WiFiClient httpClient;
-
-  char httpsUrl[192];
-  char httpUrl[192];
-  snprintf(httpsUrl, sizeof(httpsUrl),
-           "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon=%.7f&lat=%.7f&outtype=JSON",
-           lon, lat);
-  snprintf(httpUrl, sizeof(httpUrl),
-           "http://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon=%.7f&lat=%.7f&outtype=JSON",
-           lon, lat);
-
-  String payload;
-
-  // HTTP優先。失敗時のみ HTTPS へフォールバック。
-  {
-    HTTPClient http;
-    http.setConnectTimeout(GSI_HTTP_TIMEOUT_MS);
-    http.setTimeout(GSI_HTTP_TIMEOUT_MS);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (http.begin(httpClient, httpUrl)) {
-      const int httpCode = http.GET();
-      if (httpCode == HTTP_CODE_OK) {
-        payload = http.getString();
-        http.end();
-        if (parseGsiElevationPayload(payload, outElevation)) {
-          return true;
-        }
-        Serial.println("[GSI] HTTP parse failed");
-      } else {
-        Serial.printf("[GSI] HTTP GET failed: %d\n", httpCode);
-        http.end();
-      }
-    } else {
-      Serial.println("[GSI] HTTP begin failed");
-    }
-  }
-
-  {
-    HTTPClient https;
-    https.setConnectTimeout(GSI_HTTP_TIMEOUT_MS);
-    https.setTimeout(GSI_HTTP_TIMEOUT_MS);
-    https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (https.begin(httpsClient, httpsUrl)) {
-      const int httpCode = https.GET();
-      if (httpCode == HTTP_CODE_OK) {
-        payload = https.getString();
-        https.end();
-        if (parseGsiElevationPayload(payload, outElevation)) {
-          return true;
-        }
-        Serial.println("[GSI] HTTPS parse failed");
-      } else {
-        Serial.printf("[GSI] HTTPS GET failed: %d\n", httpCode);
-        https.end();
-      }
-    } else {
-      Serial.println("[GSI] HTTPS begin failed");
-    }
-  }
-
-  return false;
-}
-
-// 国土地理院APIからの標高取得をバックグラウンドで処理するタスク
-void gsiFetchTask(void* pvParameters) {
-  (void)pvParameters;
-
-  for (;;) {
-    bool shouldFetch = false;
-    double lat = 0.0;
-    double lon = 0.0;
-
-    portENTER_CRITICAL(&gsiMutex);
-    if (gsiRequestPending && !gsiWorkerBusy) {
-      gsiWorkerBusy = true;
-      gsiRequestPending = false;
-      lat = gsiRequestLat;
-      lon = gsiRequestLon;
-      shouldFetch = true;
-    }
-    portEXIT_CRITICAL(&gsiMutex);
-
-    if (shouldFetch) {
-      double elevation = 0.0;
-      bool ok = fetchGsiElevation(lat, lon, elevation);
-
-      portENTER_CRITICAL(&gsiMutex);
-      gsiResponseElevation = elevation;
-      gsiResponseSuccess = ok;
-      gsiResponseReady = true;
-      gsiWorkerBusy = false;
-      portEXIT_CRITICAL(&gsiMutex);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(GSI_TASK_POLL_MS));
-  }
-}
-
-// インターネット利用可能時はGSI標高を定期取得
-void updateGsiElevation() {
-  gsiAltUpdated = false;
-
-  bool hasResponse = false;
-  bool responseSuccess = false;
-  double responseElevation = 0.0;
-  portENTER_CRITICAL(&gsiMutex);
-  if (gsiResponseReady) {
-    hasResponse = true;
-    responseSuccess = gsiResponseSuccess;
-    responseElevation = gsiResponseElevation;
-    gsiResponseReady = false;
-  }
-  portEXIT_CRITICAL(&gsiMutex);
-
-  if (hasResponse) {
-    if (responseSuccess && responseElevation > -500.0 && responseElevation < 10000.0) {
-      altGSI = responseElevation;
-      gsiAltValid = true;
-      gsiAltUpdated = true;
-      Serial.printf("[GSI] elevation=%.2f m (lat=%.7f, lon=%.7f)\n", responseElevation, la, ln);
-    } else {
-      gsiAltValid = false;
-      if (responseSuccess) {
-        Serial.printf("[GSI] invalid elevation range: %.2f\n", responseElevation);
-      }
-    }
-  }
-
-  if (WiFi.status() != WL_CONNECTED || !positionValid) {
-    gsiAltValid = false;
-    return;
-  }
-
-  if (!isfinite(la) || !isfinite(ln) || la < -90.0 || la > 90.0 || ln < -180.0 || ln > 180.0) {
-    gsiAltValid = false;
-    return;
-  }
-
-  unsigned long now = millis();
-  if (now - lastGsiRequestMs < GSI_ELEVATION_INTERVAL) {
-    return;
-  }
-  bool canQueue = false;
-  portENTER_CRITICAL(&gsiMutex);
-  if (!gsiRequestPending && !gsiWorkerBusy) {
-    gsiRequestLat = la;
-    gsiRequestLon = ln;
-    gsiRequestPending = true;
-    canQueue = true;
-  }
-  portEXIT_CRITICAL(&gsiMutex);
-
-  if (canQueue) {
-    lastGsiRequestMs = now;
-  }
-}
-
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
 void updateBLE() {
   static String bleBuffer = "";
@@ -1051,79 +615,33 @@ void updateBLE() {
 }
 
 // ECUからのデータ読み取り
-bool parseEcuCsvLine(const String& line) {
-  String str = line;
-  str.trim();
-  if (str.length() == 0) {
-    return false;
-  }
-
-  // ECUデータは8項目固定。カンマ不足の不完全行は破棄する。
-  int commaCount = 0;
-  for (size_t i = 0; i < str.length(); i++) {
-    if (str[i] == ',') {
-      commaCount++;
-    }
-  }
-  if (commaCount < 7) {
-    return false;
-  }
-
-  for (uint8_t i = 0; i < 8; i++) {
-    int commaIndex = str.indexOf(',');
-    String data;
-    if (commaIndex >= 0) {
-      data = str.substring(0, commaIndex);
-      str = str.substring(commaIndex + 1);
-    } else {
-      data = str;
-      str = "";
-    }
-    data.trim();
-
-    if (i == 0) { tachoRpm = data.toInt(); }
-    if (i == 1) { INJ_timems = data.toFloat(); }
-    if (i == 2) { IGN_CA = data.toInt(); }
-    if (i == 3) { speed = data.toFloat(); }
-    if (i == 4) { distance = data.toInt(); }
-    if (i == 5) { gasml = data.toFloat(); }
-    if (i == 6) { dispergas = data.toFloat(); }
-    if (i == 7) { worktime = data.toInt(); }
-  }
-
-  Lapcount = distance / (goal / totallaps);
-  return true;
-}
-
 void updateECU() {
-  static String ecuLineBuffer = "";
-  bool parsed = false;
-
-  while (Serial1.available() > 0) {
-    char c = (char)Serial1.read();
-    if (c == '\r') {
-      continue;
+  if (Serial1.available()) {
+    receiveECUtime = millis();
+    String str = Serial1.readStringUntil('\n');
+    str.trim();
+    for (uint8_t i = 0; i < 8; i++) {
+      int commaIndex = str.indexOf(",");
+      String data = str.substring(0, commaIndex);
+      data.trim();
+      str = str.substring(commaIndex + 1);
+      if (i == 0) { tachoRpm = data.toInt(); }
+      if (i == 1) { INJ_timems = data.toFloat(); }
+      if (i == 2) { IGN_CA = data.toInt(); }
+      if (i == 3) { speed = data.toFloat(); }
+      if (i == 4) { distance = data.toInt(); }
+      if (i == 5) { gasml = data.toFloat(); }
+      if (i == 6) { dispergas = data.toFloat(); }
+      if (i == 7) { worktime = data.toInt(); }
     }
-    if (c == '\n') {
-      if (parseEcuCsvLine(ecuLineBuffer)) {
-        receiveECUtime = millis();
-        parsed = true;
-      }
-      ecuLineBuffer = "";
-      continue;
+    Lapcount = distance / (goal / totallaps);
+  } else {
+    if (millis() - receiveECUtime > 2000) {
+      tachoRpm = 0;
+      INJ_timems = 0;
+      IGN_CA = 0;
+      speed = 0.0;
     }
-
-    ecuLineBuffer += c;
-    if (ecuLineBuffer.length() > 96) {
-      ecuLineBuffer = "";
-    }
-  }
-
-  if (!parsed && millis() - receiveECUtime > 2000) {
-    tachoRpm = 0;
-    INJ_timems = 0;
-    IGN_CA = 0;
-    speed = 0.0;
   }
 }
 
@@ -1139,7 +657,6 @@ void updateGNSS() {
         if (gps.location.lng() > 120) {  // 異常値除外
           la = gps.location.lat();
           ln = gps.location.lng();
-          positionValid = true;
           spd = gps.speed.kmph();
           uint8_t gnss_csec = gps.time.centisecond();
           refreshDatetime(gnss_csec);  // デバッグ用Serial出力
@@ -1149,12 +666,12 @@ void updateGNSS() {
     }
   }
   // ロケーション判定
-  if (positionValid && la >= 34.837989 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.544450) {
+  if (la >= 34.837989 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.544450) {
     Loc = "su";
     totallaps = totallaps_su;
     goal = goal_su;
     limittime = limittime_su;
-  } else if (positionValid && la >= 36.528477 && la <= 36.538522 && ln >= 140.2192761 && ln <= 140.23853) {
+  } else if (la >= 36.528477 && la <= 36.538522 && ln >= 140.2192761 && ln <= 140.23853) {
     Loc = "mo";
     totallaps = totallaps_mo;
     goal = goal_mo;
@@ -1169,14 +686,62 @@ bool hasValidLocationForGsiApi() {
   return isfinite(la) && isfinite(ln) && gps.location.isValid() && la >= -90.0 && la <= 90.0 && ln >= -180.0 && ln <= 180.0;
 }
 
-// BMP280から気圧を読み取って高度を更新する
-void updateAltitudeFromBmp280() {
-  if (!isBmp280Ready) {
+// 検出したセンサーから現在の気圧(Pa)を読み出す
+bool readPressurePa(float& outPressurePa) {
+  if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+    outPressurePa = bmp280.readPressure();
+    return true;
+  }
+  if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+    outPressurePa = bme280.readPressure();
+    return true;
+  }
+  return false;
+}
+
+// 利用中の環境センサーから気圧・気温・湿度を取得する
+void updateEnvironmentSensors() {
+  float pressurePa = NAN;
+  if (readPressurePa(pressurePa) && isfinite(pressurePa) && pressurePa >= 30000.0f && pressurePa <= 120000.0f) {
+    envPressureKPa = pressurePa / 1000.0f;
+  } else {
+    envPressureKPa = NAN;
+  }
+
+  if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+    float temperatureC = bme280.readTemperature();
+    float humidityPct = bme280.readHumidity();
+    envTemperatureC = (isfinite(temperatureC) && temperatureC > -40.0f && temperatureC < 100.0f) ? temperatureC : NAN;
+    envHumidityPct = (isfinite(humidityPct) && humidityPct >= 0.0f && humidityPct <= 100.0f) ? humidityPct : NAN;
+    return;
+  }
+
+  if (pressureSensorType == PRESSURE_SENSOR_BMP280 && isAht20Ready) {
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+    aht20.getEvent(&humidityEvent, &temperatureEvent);
+    envTemperatureC = (isfinite(temperatureEvent.temperature) && temperatureEvent.temperature > -40.0f && temperatureEvent.temperature < 100.0f)
+                        ? temperatureEvent.temperature : NAN;
+    envHumidityPct = (isfinite(humidityEvent.relative_humidity) && humidityEvent.relative_humidity >= 0.0f && humidityEvent.relative_humidity <= 100.0f)
+                        ? humidityEvent.relative_humidity : NAN;
+    return;
+  }
+
+  envTemperatureC = NAN;
+  envHumidityPct = NAN;
+}
+
+// BMP280/BME280から気圧を読み取って高度を更新する
+void updateAltitudeFromBmx280() {
+  if (!isBmx280Ready) {
     return;
   }
   
-  // BMP280から気圧を読み取る
-  float pressurePa = bmp280.readPressure();
+  // BMP280/BME280から気圧を読み取る
+  float pressurePa = NAN;
+  if (!readPressurePa(pressurePa)) {
+    return;
+  }
   if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
     return;
   }
@@ -1265,7 +830,7 @@ bool fetchGsiElevationMeters(float& outElevationMeters) {
   return false;
 }
 
-// 国土地理院API標高とBMP280生高度との差分を取得し、高度オフセットを固定する
+// 国土地理院API標高とBMP280/BME280生高度との差分を取得し、高度オフセットを固定する
 void tryFetchAltitudeOffsetFromGsi() {
   // すでに正常に取得している場合は何もしない
   if (altitudeOffsetFixed) {
@@ -1277,7 +842,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   }
 
   // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
-  if (!isBmp280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
+  if (!isBmx280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
     return;
   }
 
@@ -1297,9 +862,14 @@ void tryFetchAltitudeOffsetFromGsi() {
     return;
   }
 
-  float pressurePa = bmp280.readPressure();
+  float pressurePa = NAN;
+  if (!readPressurePa(pressurePa)) {
+    Serial.println("[GSI] pressure sensor read failed while fixing offset");
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
   if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
-    Serial.println("[GSI] BMP280 pressure invalid while fixing offset");
+    Serial.println("[GSI] BMP280/BME280 pressure invalid while fixing offset");
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -1307,7 +877,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   float pressureKPa = pressurePa / 1000.0f;
   float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
   if (!isfinite(rawAltitudeMeters) || rawAltitudeMeters < -1000.0f || rawAltitudeMeters > 12000.0f) {
-    Serial.printf("[GSI] BMP280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
+    Serial.printf("[GSI] BMP280/BME280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -1398,13 +968,12 @@ void updateDisplay() {
   if (dispmode == 0) {
     uint8_t restlaps = totallaps - Lapcount;
     lcd_s.setCursor(140, 130);
-    if (restlaps > 1) {
+    if (restlaps > 1)
       lcd_s.print(restlaps);
-    } else if (restlaps == 1) {
+    else if (restlaps == 1)
       lcd_s.print("G");
-    } else {
+    else
       lcd_s.print("FINISH");
-    }
     lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
     lcd_s.fillRect(10, 135, map(distance, 0, goal, 300, 0), 10, TFT_WHITE);
     lcd_s.fillRect(map(distance, 0, goal, 310, 10), 135, map(distance, 0, goal, 0, 300), 10, TFT_BLACK);
@@ -1434,12 +1003,11 @@ void updateDisplay() {
     lcd_s.setTextColor((map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0)) ? TFT_WHITE : TFT_MAGENTA);
     lcd_s.printf("%02d:%02d", workmin, worksec);
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
-    if (map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0)) {
+    if (map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0))
       lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
-    } else {
+    else
       lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_MAGENTA);
-      lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
-    }
+    lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
   } else if (dispmode == 1) {
     lcd_s.print(IGN_CA);
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
@@ -1466,7 +1034,11 @@ void updateSerialOutput() {
   Serial.print(gasml, 1); Serial.print(",");
   Serial.print(dispergas, 1); Serial.print(",");
   Serial.print(worktime); Serial.print(",");
-  Serial.println(EngTemp, 2);
+  Serial.print(EngTemp, 2); Serial.print(",");
+  Serial.print(isfinite(envPressureKPa) ? String(envPressureKPa, 3) : ""); Serial.print(",");
+  Serial.print(isfinite(envTemperatureC) ? String(envTemperatureC, 2) : ""); Serial.print(",");
+  Serial.print(isfinite(envHumidityPct) ? String(envHumidityPct, 1) : ""); Serial.print(",");
+  Serial.println(datetime);
 }
 
 // SDカードへのログ書き出し
@@ -1487,7 +1059,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -1506,7 +1078,13 @@ void updateSDLog() {
     logFile.print(ln, 7);      logFile.print(",");
     logFile.print(alt, 1);     logFile.print(",");
     logFile.print(Loc);        logFile.print(",");
-    logFile.println(EngTemp, 2);
+    logFile.print(EngTemp, 2); logFile.print(",");
+    if (isfinite(envPressureKPa)) { logFile.print(envPressureKPa, 3); }
+    logFile.print(",");
+    if (isfinite(envTemperatureC)) { logFile.print(envTemperatureC, 2); }
+    logFile.print(",");
+    if (isfinite(envHumidityPct)) { logFile.print(envHumidityPct, 1); }
+    logFile.println();
 
     // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
     sdLinesSinceSync++;
@@ -1661,20 +1239,73 @@ void updateAmbient() {
   }
 }
 
-// GNSS Module内蔵BMP280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
-bool initializeBmp280ForGnssModule() {
-  Wire.begin(BMP280_I2C_SDA, BMP280_I2C_SCL, 400000U);
-  Serial.printf("BMP280 I2C pin: SDA=%d SCL=%d\n", BMP280_I2C_SDA, BMP280_I2C_SCL);
+// I2CデバイスからチップIDレジスタ(0xD0)を読み取る
+bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
+  Wire.beginTransmission(i2cAddress);
+  Wire.write(0xD0);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(static_cast<int>(i2cAddress), 1) != 1) {
+    return false;
+  }
+  outChipId = static_cast<uint8_t>(Wire.read());
+  return true;
+}
+
+// BMP280/BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+bool initializePressureSensorForGnssModule() {
+  const uint8_t bmp280ChipId = BMP280_CHIPID;  // 0x58
+  const uint8_t bme280ChipId = 0x60;
+
+  Wire.begin(BMX280_I2C_SDA, BMX280_I2C_SCL, 400000U);
+  Serial.printf("Pressure sensor I2C pin: SDA=%d SCL=%d\n", BMX280_I2C_SDA, BMX280_I2C_SCL);
 
   const uint8_t addresses[] = {0x76, 0x77};
   for (uint8_t i = 0; i < sizeof(addresses); i++) {
-    if (bmp280.begin(addresses[i], BMP280_CHIPID)) {
-      Serial.printf("BMP280 initialized (addr=0x%02X)\n", addresses[i]);
-      return true;
+    uint8_t chipId = 0;
+    if (!readPressureSensorChipId(addresses[i], chipId)) {
+      continue;
     }
+
+    // チップIDに応じてBMP280/BME280を初期化する
+    if (chipId == bmp280ChipId) {
+      if (bmp280.begin(addresses[i], BMP280_CHIPID)) {
+        pressureSensorType = PRESSURE_SENSOR_BMP280;
+        Serial.printf("BMP280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+        return true;
+      }
+      Serial.printf("BMP280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      continue;
+    }
+
+    if (chipId == bme280ChipId) {
+      if (bme280.begin(addresses[i], &Wire)) {
+        pressureSensorType = PRESSURE_SENSOR_BME280;
+        Serial.printf("BME280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+        return true;
+      }
+      Serial.printf("BME280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      continue;
+    }
+
+    Serial.printf("Unknown pressure sensor id=0x%02X at addr=0x%02X\n", chipId, addresses[i]);
   }
 
-  Serial.println("BMP280 init failed on addr 0x76/0x77");
+  pressureSensorType = PRESSURE_SENSOR_NONE;
+  Serial.println("Pressure sensor init failed on addr 0x76/0x77");
+  return false;
+}
+
+// BMP280使用時の温湿度取得用にAHT20を初期化する
+bool initializeAht20ForGnssModule() {
+  if (aht20.begin(&Wire)) {
+    Serial.println("AHT20 initialized");
+    return true;
+  }
+
+  Serial.println("AHT20 init failed");
   return false;
 }
 
@@ -1688,26 +1319,35 @@ void setup() {
   // デバッグ用Serial
   Serial.begin(115200);
 
-  // BMP280初期化（ボードごとにPort.A I2Cピンへ切り替えて探索）
-  if (initializeBmp280ForGnssModule()) {
-    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                       Adafruit_BMP280::SAMPLING_X2,
-                       Adafruit_BMP280::SAMPLING_X16,
-                       Adafruit_BMP280::FILTER_X16,
-                       Adafruit_BMP280::STANDBY_MS_500);
-    isBmp280Ready = true;
+  // 気圧センサー初期化（BMP280/BME280を自動判別）
+  if (initializePressureSensorForGnssModule()) {
+    if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+      bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                         Adafruit_BMP280::SAMPLING_X2,
+                         Adafruit_BMP280::SAMPLING_X16,
+                         Adafruit_BMP280::FILTER_X16,
+                         Adafruit_BMP280::STANDBY_MS_500);
+    } else if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+      bme280.setSampling(Adafruit_BME280::MODE_NORMAL,
+                         Adafruit_BME280::SAMPLING_X2,
+                         Adafruit_BME280::SAMPLING_X16,
+                         Adafruit_BME280::SAMPLING_X1,
+                         Adafruit_BME280::FILTER_X16,
+                         Adafruit_BME280::STANDBY_MS_500);
+    }
+    isBmx280Ready = true;
+    if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+      isAht20Ready = initializeAht20ForGnssModule();
+    }
   }
+  updateEnvironmentSensors();
 
   // ECU初期化
   Serial1.begin(115200, SERIAL_8N1, 27, 19);
   Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
   
-  // GNSS初期化（モジュールに応じてボーレートを切り替える）
-  if (isBmp280Ready) {
-      Serial2.begin(38400);  // M5Stack GNSS Module(NEO-M9N)
-  } else {
-      Serial2.begin(115200); // NEO-6M
-  }
+  // GNSS初期化
+  Serial2.begin(gnss_bps);
 
   // BLE初期化
   #if USE_HARDWARE_BLE
@@ -1882,13 +1522,14 @@ void setup() {
 
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
-  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
+  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp, Pressure, Humidity, datetime"));
   
   t_Serial = millis();
   t_SD = millis();
   t_MQTT = millis();
   t_amb = millis();
   t_alt = millis();
+  t_env = millis();
   lastSdSyncAt = millis();
 }
 
@@ -1964,14 +1605,22 @@ void loop() {
     t_amb += AMBIENT_INTERVAL;
   }
   
-  // 高度更新はBMP280が正常に初期化されている場合のみ実行する
+  // 高度更新はBMP280/BME280が正常に初期化されている場合のみ実行する
   if (millis() - t_alt >= ALTITUDE_INTERVAL) {
-    updateAltitudeFromBmp280();
+    updateAltitudeFromBmx280();
     t_alt += ALTITUDE_INTERVAL;
   }
+  // 環境センサー更新はBMP280/BME280のいずれかが正常に初期化されている場合のみ実行する
+  if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
+    updateEnvironmentSensors();
+    t_env += ENV_SENSOR_INTERVAL;
+    if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
+      t_env = millis();
+    }
+  }
 
-  // 国土地理院API呼び出しはBMP280接続時のみ低頻度で実行し、成功したら以後実行しない
-  if (isBmp280Ready) tryFetchAltitudeOffsetFromGsi();
+  // 国土地理院API呼び出しはBMP280/BME280接続時のみ低頻度で実行し、成功したら以後実行しない
+  if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
 
   delay(10);
 }
