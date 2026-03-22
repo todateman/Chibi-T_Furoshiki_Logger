@@ -16,11 +16,11 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 | 機能 | 内容 |
 | ---- | ---- |
 | 周回/距離管理 | 位置範囲からサーキット判定 (鈴鹿/茂木/その他) と周回数・走行時間計算 |
-| 高度推定 | EKFで `気圧高度(BMP280)` + `加速度(BMI270)` + `絶対高度(国土地理院GSI優先/GNSSフォールバック)` を融合 |
-| 表示モード切替 | Aボタン=`モード 0` 回転数/噴射時間/進角(セッティング向け)<BR>Bボタン=`モード 1` 速度/残周回/走行時間(デフォルト)<BR>Cボタン=`モード 2` 速度/回転数/燃費(燃費確認用) |
+| 表示モード切替 | Bボタン=`モード 0` 速度/残周回/走行時間(デフォルト)<BR>Aボタン=`モード 1` 回転数/噴射時間/進角(セッティング向け)<BR>Cボタン=`モード 2` 走行ルート標高グラフ + 現在地標高プロット |
+| ウェイポイント標高グラフ | `sd`ディレクトリのウェイポイントCSV (`suzuka_waypoint.csv` / `motegi_waypoint.csv` / `toyota_waypoint.csv`) を読み込み、横軸=ウェイポイントID、縦軸=標高で表示。現在地の緯度経度を最も近いIDへ割り当てて標高を重ねて表示 |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
 | 高度推定 | BMP280気圧から高度推定 (標準大気式) |
-| 海面気圧補正 | Open-Meteoから`pressure_msl`を1回取得して高度基準を補正 |
+| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、BMP280高度との差分でオフセット補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
 | Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値除外<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
@@ -31,8 +31,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
 - GNSS: Serial2 38400 bps ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module) DIP-SW TX:1, RX:1)
-- BMP280(気圧センサ): I2C 0x76 ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module)
-- BLE 温度センサ: RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可)
+- BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22 ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module)
+- BLE 温度センサ: M5Core2 PortA RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可 M5Stack Basicには32,33ピンが存在しないため使用不可)
 - ボタン: A/B/C でモード選択 + 起動時設定
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
@@ -62,13 +62,14 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - シリアル出力: CSV形式 `lat,lon,alt,loc,Spd_GPS,rpm,Spd_PULSE,distance,gasml,dispergas,worktime,Temp`
 - 例外デコード: `monitor_filters = esp32_exception_decoder`
 
-## 高度推定 / Open-Meteo 補正
+## 高度推定 / 国土地理院API補正
 
 - 高度は GNSS ではなく BMP280 の気圧から算出
 - 海面気圧は初期値 `101.325kPa` を使用
-- Wi-Fi接続済みかつGNSS座標が有効なときのみ Open-Meteo API を低頻度で試行
-- Open-Meteoの`pressure_msl`取得に成功したら1回だけ海面気圧を置換し、以後は再取得しない
-- 通信遅延抑制のため Open-Meteo 取得は HTTP で実行
+- Wi-Fi接続済みかつGNSS座標が有効なときのみ、国土地理院API (`getelevation.php`) で標高取得を低頻度で試行
+- 標高取得成功時、その時点のBMP280生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
+- 以後の表示/ログ高度は `BMP280生高度 + オフセット` で算出
+- API取得は HTTPS を優先し、失敗時は HTTP フォールバック
 
 ## 起動時の Wi-Fi 操作
 
@@ -82,7 +83,25 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 1. モード 0: 速度, 残り周回 (最後は G/FINISH), 走行時間進行バー
 2. モード 1: 回転数, 噴射時間, 進角角度バー
-3. モード 2: 速度, 回転数, 燃費 (距離/燃料) バー
+3. モード 2: 走行ルートの標高グラフ（ウェイポイントID基準）と現在地標高を重ねて表示
+
+### モード2(標高グラフ)の仕様
+
+- サーキット判定 (`Loc`: su / mo / to) に応じて対応CSVを自動読み込み
+- 現在地の緯度経度をもとに、ウェイポイントの最近傍IDを算出
+- グラフ内に「ルート標高」と「現在地標高」を同時プロット
+- 右端と左端は接続せず、先頭IDから末尾IDまでを表示
+
+### モード2(標高グラフ)の画面例
+
+<p align="center" width="100%">
+<video src="https://github.com/user-attachments/assets/a7fdfc0b-4c62-4426-a9e1-d857ddd0c710" width="100%" controls></video>
+</p>
+
+- 水色線: ウェイポイントファイルの標高プロファイル
+- 黄色点: 最近傍ウェイポイントIDの標高
+- 赤色点: 現在地標高
+- 下部テキスト: `WP:現在ID/総ポイント数 route:ルート標高 now:現在地標高`
 
 ## ログファイル仕様 (SD)
 
@@ -236,9 +255,16 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | ---- | ---- |
 | SD init failed | FAT/exFAT フォーマット <BR> SPI 接続確認, 遅延を長くする検討 |
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
+| MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
 | 温度 0.0 固定 | BLE センサ未送信 or タイムアウト <BR>  (>10s でリセット) |
 | `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
+
+### MQTT 診断ログ運用
+
+- 本番運用では `src/main.cpp` の `MQTT_DIAGNOSTIC_LOG` を `0` のまま使用 (既定)
+- AWS IoT接続トラブルの切り分け時のみ `1` に変更して再ビルド
+- 診断で確認する主なログ: `MQTT TLS lastError`, `MQTT DNS`, `MQTT diag TCP/TLS(insecure)`, `heap/minHeap/maxAlloc`
 
 ## 既知の課題 (改善予定)
 
