@@ -14,6 +14,7 @@
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_BME280.h>
+#include <Adafruit_AHTX0.h>
 #include "secrets.h"
 
 //==================== 定数・マクロ ====================
@@ -35,10 +36,11 @@
 #define MQTT_RECONNECT_MAX_INTERVAL  60000UL
 #define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
+#define ENV_SENSOR_INTERVAL 1000
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define GNSS_PARSE_BUDGET_BYTES 256
-#define BMP280_I2C_SDA 21
-#define BMP280_I2C_SCL 22
+#define BMX280_I2C_SDA 21
+#define BMX280_I2C_SCL 22
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -97,6 +99,7 @@ unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
 unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
+unsigned long t_env    = 0;
 unsigned long lastSdSyncAt = 0;
 uint16_t sdLinesSinceSync = 0;
 
@@ -127,6 +130,7 @@ float EngTemp = 0.0;    // エンジン温度 [°C]
 
 // GPS用
 TinyGPSPlus gps;
+int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, M5Stack GNSS Module:38400）
 double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
@@ -134,18 +138,23 @@ double alt = 0.0;   // GPS高度
 double spd = 0.0;   // GPS速度
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
-// BMP280による高度推定用
+// BMP280/BME280による高度推定用
 Adafruit_BMP280 bmp280;
 Adafruit_BME280 bme280;
-bool isBmp280Ready = false;                       // BMP280が正常に初期化されているかどうか
+Adafruit_AHTX0 aht20;
+bool isBmx280Ready = false;     // BMP280/BME280が正常に初期化されているかどうか
+bool isAht20Ready = false;
 enum PressureSensorType {
   PRESSURE_SENSOR_NONE = 0,
   PRESSURE_SENSOR_BMP280,
   PRESSURE_SENSOR_BME280,
 };
 PressureSensorType pressureSensorType = PRESSURE_SENSOR_NONE;
+float envPressureKPa = NAN;
+float envTemperatureC = NAN;
+float envHumidityPct = NAN;
 float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
-float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280生高度の差分（m）
+float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280/BME280生高度の差分（m）
 bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
 unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
 
@@ -690,13 +699,45 @@ bool readPressurePa(float& outPressurePa) {
   return false;
 }
 
-// BMP280から気圧を読み取って高度を更新する
-void updateAltitudeFromBmp280() {
-  if (!isBmp280Ready) {
+// 利用中の環境センサーから気圧・気温・湿度を取得する
+void updateEnvironmentSensors() {
+  float pressurePa = NAN;
+  if (readPressurePa(pressurePa) && isfinite(pressurePa) && pressurePa >= 30000.0f && pressurePa <= 120000.0f) {
+    envPressureKPa = pressurePa / 1000.0f;
+  } else {
+    envPressureKPa = NAN;
+  }
+
+  if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+    float temperatureC = bme280.readTemperature();
+    float humidityPct = bme280.readHumidity();
+    envTemperatureC = (isfinite(temperatureC) && temperatureC > -40.0f && temperatureC < 100.0f) ? temperatureC : NAN;
+    envHumidityPct = (isfinite(humidityPct) && humidityPct >= 0.0f && humidityPct <= 100.0f) ? humidityPct : NAN;
+    return;
+  }
+
+  if (pressureSensorType == PRESSURE_SENSOR_BMP280 && isAht20Ready) {
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+    aht20.getEvent(&humidityEvent, &temperatureEvent);
+    envTemperatureC = (isfinite(temperatureEvent.temperature) && temperatureEvent.temperature > -40.0f && temperatureEvent.temperature < 100.0f)
+                        ? temperatureEvent.temperature : NAN;
+    envHumidityPct = (isfinite(humidityEvent.relative_humidity) && humidityEvent.relative_humidity >= 0.0f && humidityEvent.relative_humidity <= 100.0f)
+                        ? humidityEvent.relative_humidity : NAN;
+    return;
+  }
+
+  envTemperatureC = NAN;
+  envHumidityPct = NAN;
+}
+
+// BMP280/BME280から気圧を読み取って高度を更新する
+void updateAltitudeFromBmx280() {
+  if (!isBmx280Ready) {
     return;
   }
   
-  // BMP280から気圧を読み取る
+  // BMP280/BME280から気圧を読み取る
   float pressurePa = NAN;
   if (!readPressurePa(pressurePa)) {
     return;
@@ -789,7 +830,7 @@ bool fetchGsiElevationMeters(float& outElevationMeters) {
   return false;
 }
 
-// 国土地理院API標高とBMP280生高度との差分を取得し、高度オフセットを固定する
+// 国土地理院API標高とBMP280/BME280生高度との差分を取得し、高度オフセットを固定する
 void tryFetchAltitudeOffsetFromGsi() {
   // すでに正常に取得している場合は何もしない
   if (altitudeOffsetFixed) {
@@ -801,7 +842,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   }
 
   // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
-  if (!isBmp280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
+  if (!isBmx280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
     return;
   }
 
@@ -828,7 +869,7 @@ void tryFetchAltitudeOffsetFromGsi() {
     return;
   }
   if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
-    Serial.println("[GSI] BMP280 pressure invalid while fixing offset");
+    Serial.println("[GSI] BMP280/BME280 pressure invalid while fixing offset");
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -836,7 +877,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   float pressureKPa = pressurePa / 1000.0f;
   float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
   if (!isfinite(rawAltitudeMeters) || rawAltitudeMeters < -1000.0f || rawAltitudeMeters > 12000.0f) {
-    Serial.printf("[GSI] BMP280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
+    Serial.printf("[GSI] BMP280/BME280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -993,7 +1034,11 @@ void updateSerialOutput() {
   Serial.print(gasml, 1); Serial.print(",");
   Serial.print(dispergas, 1); Serial.print(",");
   Serial.print(worktime); Serial.print(",");
-  Serial.println(EngTemp, 2);
+  Serial.print(EngTemp, 2); Serial.print(",");
+  Serial.print(isfinite(envPressureKPa) ? String(envPressureKPa, 3) : ""); Serial.print(",");
+  Serial.print(isfinite(envTemperatureC) ? String(envTemperatureC, 2) : ""); Serial.print(",");
+  Serial.print(isfinite(envHumidityPct) ? String(envHumidityPct, 1) : ""); Serial.print(",");
+  Serial.println(datetime);
 }
 
 // SDカードへのログ書き出し
@@ -1014,7 +1059,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -1033,7 +1078,13 @@ void updateSDLog() {
     logFile.print(ln, 7);      logFile.print(",");
     logFile.print(alt, 1);     logFile.print(",");
     logFile.print(Loc);        logFile.print(",");
-    logFile.println(EngTemp, 2);
+    logFile.print(EngTemp, 2); logFile.print(",");
+    if (isfinite(envPressureKPa)) { logFile.print(envPressureKPa, 3); }
+    logFile.print(",");
+    if (isfinite(envTemperatureC)) { logFile.print(envTemperatureC, 2); }
+    logFile.print(",");
+    if (isfinite(envHumidityPct)) { logFile.print(envHumidityPct, 1); }
+    logFile.println();
 
     // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
     sdLinesSinceSync++;
@@ -1203,13 +1254,13 @@ bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   return true;
 }
 
-// GNSS Module内蔵のBMP280/BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+// BMP280/BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
 bool initializePressureSensorForGnssModule() {
   const uint8_t bmp280ChipId = BMP280_CHIPID;  // 0x58
   const uint8_t bme280ChipId = 0x60;
 
-  Wire.begin(BMP280_I2C_SDA, BMP280_I2C_SCL, 400000U);
-  Serial.printf("Pressure sensor I2C pin: SDA=%d SCL=%d\n", BMP280_I2C_SDA, BMP280_I2C_SCL);
+  Wire.begin(BMX280_I2C_SDA, BMX280_I2C_SCL, 400000U);
+  Serial.printf("Pressure sensor I2C pin: SDA=%d SCL=%d\n", BMX280_I2C_SDA, BMX280_I2C_SCL);
 
   const uint8_t addresses[] = {0x76, 0x77};
   for (uint8_t i = 0; i < sizeof(addresses); i++) {
@@ -1218,6 +1269,7 @@ bool initializePressureSensorForGnssModule() {
       continue;
     }
 
+    // チップIDに応じてBMP280/BME280を初期化する
     if (chipId == bmp280ChipId) {
       if (bmp280.begin(addresses[i], BMP280_CHIPID)) {
         pressureSensorType = PRESSURE_SENSOR_BMP280;
@@ -1243,6 +1295,17 @@ bool initializePressureSensorForGnssModule() {
 
   pressureSensorType = PRESSURE_SENSOR_NONE;
   Serial.println("Pressure sensor init failed on addr 0x76/0x77");
+  return false;
+}
+
+// BMP280使用時の温湿度取得用にAHT20を初期化する
+bool initializeAht20ForGnssModule() {
+  if (aht20.begin(&Wire)) {
+    Serial.println("AHT20 initialized");
+    return true;
+  }
+
+  Serial.println("AHT20 init failed");
   return false;
 }
 
@@ -1272,19 +1335,19 @@ void setup() {
                          Adafruit_BME280::FILTER_X16,
                          Adafruit_BME280::STANDBY_MS_500);
     }
-    isBmp280Ready = true;
+    isBmx280Ready = true;
+    if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+      isAht20Ready = initializeAht20ForGnssModule();
+    }
   }
+  updateEnvironmentSensors();
 
   // ECU初期化
   Serial1.begin(115200, SERIAL_8N1, 27, 19);
   Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
   
-  // GNSS初期化（モジュールに応じてボーレートを切り替える）
-  if (isBmp280Ready) {
-      Serial2.begin(38400);  // M5Stack GNSS Module(NEO-M9N)
-  } else {
-      Serial2.begin(115200); // NEO-6M
-  }
+  // GNSS初期化
+  Serial2.begin(gnss_bps);
 
   // BLE初期化
   #if USE_HARDWARE_BLE
@@ -1459,13 +1522,14 @@ void setup() {
 
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
-  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
+  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp, Pressure, Humidity, datetime"));
   
   t_Serial = millis();
   t_SD = millis();
   t_MQTT = millis();
   t_amb = millis();
   t_alt = millis();
+  t_env = millis();
   lastSdSyncAt = millis();
 }
 
@@ -1541,14 +1605,22 @@ void loop() {
     t_amb += AMBIENT_INTERVAL;
   }
   
-  // 高度更新はBMP280が正常に初期化されている場合のみ実行する
+  // 高度更新はBMP280/BME280が正常に初期化されている場合のみ実行する
   if (millis() - t_alt >= ALTITUDE_INTERVAL) {
-    updateAltitudeFromBmp280();
+    updateAltitudeFromBmx280();
     t_alt += ALTITUDE_INTERVAL;
   }
+  // 環境センサー更新はBMP280/BME280のいずれかが正常に初期化されている場合のみ実行する
+  if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
+    updateEnvironmentSensors();
+    t_env += ENV_SENSOR_INTERVAL;
+    if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
+      t_env = millis();
+    }
+  }
 
-  // 国土地理院API呼び出しはBMP280接続時のみ低頻度で実行し、成功したら以後実行しない
-  if (isBmp280Ready) tryFetchAltitudeOffsetFromGsi();
+  // 国土地理院API呼び出しはBMP280/BME280接続時のみ低頻度で実行し、成功したら以後実行しない
+  if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
 
   delay(10);
 }
