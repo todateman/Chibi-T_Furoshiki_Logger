@@ -11,7 +11,8 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include "AltitudeEKF.h"
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
 #include "secrets.h"
 
 // M5.In_I2C を使う BMP280 ミニドライバ
@@ -134,6 +135,9 @@ struct BMP280Driver {
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define AMBIENT_INTERVAL    10000
+#define ALTITUDE_INTERVAL   500
+#define SEA_LEVEL_FETCH_RETRY_INTERVAL 15000UL
+#define GNSS_PARSE_BUDGET_BYTES 256
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -208,6 +212,9 @@ unsigned long t_Serial = 0;
 unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
 unsigned long t_amb    = 0;
+unsigned long t_alt    = 0;
+unsigned long lastSdSyncAt = 0;
+uint16_t sdLinesSinceSync = 0;
 
 // シリアル（ECU, GNSS, BLE）
 unsigned long receiveECUtime = 0;
@@ -236,37 +243,20 @@ float EngTemp = 0.0;    // エンジン温度 [°C]
 
 // GPS用
 TinyGPSPlus gps;
-BMP280Driver bmp;
-AltitudeEKF altitudeEkf;
-double la, ln;              // 緯度経度
+double la, ln;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
-double alt = 0.0;           // GPS高度（GNSS）
-double altGNSS = 0.0;       // GPS高度（GNSS）フィルタリング後
-double altBaro = 0.0;       // 気圧高度（Baro）
-double spd = 0.0;           // GPS速度
-String Loc = "";            // 位置情報（緯度経度）文字列
-bool gnssAltValid = false;  // GNSS高度が有効かどうか
-bool gnssAltUpdated = false;  // GNSS高度が更新されたかどうか（EKFの更新に利用）
-bool positionValid = false; // 位置情報が有効かどうか（GNSS高度の更新に利用）
-double altGSI = 0.0;        // 国土地理院API(https://maps.gsi.go.jp/development/elevation_s.html)から取得した標高
-bool gsiAltValid = false;   // 国土地理院APIから取得した標高が有効かどうか
-bool gsiAltUpdated = false; // 国土地理院APIから取得した標高が更新されたかどうか（EKFの更新に利用）
-unsigned long lastGsiRequestMs = 0; // 最後に国土地理院APIにリクエストを送った時刻（EKFの更新に利用）
-TaskHandle_t gsiTaskHandle = nullptr; // 国土地理院APIリクエスト処理タスクのハンドル
-portMUX_TYPE gsiMutex = portMUX_INITIALIZER_UNLOCKED; // 国土地理院APIリクエスト処理タスクとEKF更新タスクで標高データの整合性を保つためのミューテックス
-volatile bool gsiRequestPending = false;  // 国土地理院APIへのリクエストが保留されているかどうか（EKFの更新タスクからリクエストを出すときに設定し、国土地理院APIリクエスト処理タスクが処理開始時に確認してクリアするフラグ）
-volatile bool gsiWorkerBusy = false;  // 国土地理院APIリクエスト処理タスクが現在リクエストを処理中かどうか（EKFの更新タスクから新たにリクエストを出すときに確認するフラグ。これがtrueのときは前のリクエストの処理が終わるまで待つ）
-volatile bool gsiResponseReady = false; // 国土地理院APIからのレスポンスが処理されてEKFの更新に利用できる状態かどうか（国土地理院APIリクエスト処理タスクがレスポンスを受け取って標高データを更新したときにtrueになり、EKFの更新タスクが更新された標高データを利用してEKFを更新した後にfalseにするフラグ）
-volatile bool gsiResponseSuccess = false; // 国土地理院APIからのレスポンスが成功だったかどうか（国土地理院APIリクエスト処理タスクがレスポンスを受け取って標高データを更新したときに設定するフラグ。EKFの更新タスクはこれがtrueのときはgsiResponseElevationの値を信頼してEKFを更新し、falseのときはgsiResponseElevationの値を無視してEKFの更新を行う）
-double gsiRequestLat = 0.0; // 国土地理院APIにリクエストを出すときの緯度（EKFの更新タスクがリクエストを出すときに設定する値。国土地理院APIリクエスト処理タスクはこれを使ってリクエストを送る）
-double gsiRequestLon = 0.0; // 国土地理院APIにリクエストを出すときの経度（EKFの更新タスクがリクエストを出すときに設定する値。国土地理院APIリクエスト処理タスクはこれを使ってリクエストを送る）
-double gsiResponseElevation = 0.0;  // 国土地理院APIからのレスポンスで得られた標高（国土地理院APIリクエスト処理タスクがレスポンスを受け取って処理したときに設定する値。EKFの更新タスクはgsiResponseSuccessがtrueのときはこれを信頼してEKFを更新し、falseのときはこれを無視してEKFの更新を行う）
-bool bmpReady = false;      // BMP280が正常に初期化されているかどうか
-bool baroValid = false;     // 気圧高度が有効かどうか（EKFの更新に利用）
-bool baroCalibrated = false;  // 気圧高度がキャリブレーションされているかどうか（EKFの更新に利用）
-float baroOffset = 0.0f;    // 気圧高度のオフセット値（キャリブレーションに利用）
-unsigned long lastAltFusionMs = 0;  // 最後に高度融合を行った時刻（EKFの更新に利用）
+double alt = 0.0;   // GPS高度
+double spd = 0.0;   // GPS速度
+String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
+
+// BMP280による高度推定用
+Adafruit_BMP280 bmp280;
+bool isBmp280Ready = false;                       // BMP280が正常に初期化されているかどうか
+float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位、Open-Meteoから取得して更新される可能性あり）
+bool seaLevelPressureReplaced = false;            // 海面上気圧がOpen-Meteoから正常に取得されてbmp280の高度計算に使用されているかどうか
+unsigned long nextSeaLevelPressureFetchAt = 0;    // 次回の海面上気圧取得を試みる時刻（ミリ秒）
+
 // サーキットごとの設定
 const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの周回数
 const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの周回数
@@ -278,6 +268,7 @@ const int time_offset = 9;  // JST
 
 // 時刻表示用バッファ
 char datetime[23];
+uint64_t lastDatetimeCentis = 0;  // CSV時刻の逆行防止（1/100秒単位）
 
 // 時刻同期フラグ
 bool ntpSyncDone = false;     // NTP同期が完了したかどうか
@@ -300,8 +291,56 @@ void refreshDatetime(uint8_t csec = 255) {
     displayCsec = (millis() / 10) % 100;  // センチ秒が指定されていない場合は現在のミリ秒から算出して表示（00-99）
   }
 
+  // GNSS/NTP再同期で秒が戻った場合でも、ログ時刻文字列は単調増加を維持する
+  // NOTE: ここで setTime() は呼ばない。呼ぶと同一秒内の多重呼び出しで秒が人工的に進み、
+  //       CSV時刻のバースト/空白を生むため。
+  uint64_t currentCentis = static_cast<uint64_t>(now()) * 100ULL + static_cast<uint64_t>(displayCsec);
+  if (currentCentis <= lastDatetimeCentis) {
+    currentCentis = lastDatetimeCentis + 1ULL;
+    displayCsec = static_cast<uint8_t>(currentCentis % 100ULL);
+  } else {
+    displayCsec = static_cast<uint8_t>(currentCentis % 100ULL);
+  }
+  lastDatetimeCentis = currentCentis;
+
+  tmElements_t tm;
+  breakTime(static_cast<time_t>(currentCentis / 100ULL), tm);
+
   sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
-            year(), month(), day(), hour(), minute(), second(), displayCsec);
+            tmYearToCalendar(tm.Year), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second, displayCsec);
+}
+
+// GNSS UTC日時をJSTへ変換したtime_tを作成する
+bool buildGnssJstTime(time_t& outJstTime) {
+  if (!gps.date.isValid() || !gps.time.isValid()) {
+    return false;
+  }
+
+  tmElements_t tm;
+  tm.Year = CalendarYrToTm(gps.date.year());
+  tm.Month = gps.date.month();
+  tm.Day = gps.date.day();
+  tm.Hour = gps.time.hour();
+  tm.Minute = gps.time.minute();
+  tm.Second = gps.time.second();
+
+  time_t utc = makeTime(tm);
+  outJstTime = utc + static_cast<time_t>(time_offset * SECS_PER_HOUR);
+  return true;
+}
+
+// GNSSでの再同期はforward-onlyで行い、過剰な補正を抑制する
+void updateSystemTimeFromGnss() {
+  time_t gnssJst = 0;
+  if (!buildGnssJstTime(gnssJst)) {
+    return;
+  }
+
+  time_t current = now();
+  if (current < 1577836800 || gnssJst > (current + 2)) {  // currentが未初期化または2秒以上先行時のみ補正
+    setTime(gnssJst);
+    ntpSyncDone = true;
+  }
 }
 
 // PPS割り込みハンドラ
@@ -870,92 +909,19 @@ void updateECU() {
 
 // GNSSからの位置・時刻読み取り
 void updateGNSS() {
-  gnssAltUpdated = false;
-  // 1ループでのGNSS処理量を制限して他の周期処理の遅延を防ぐ
-  const int maxGnssBytesPerLoop = 256;
-  int processed = 0;
-  while (Serial2.available() > 0 && processed < maxGnssBytesPerLoop) {
-    processed++;
-    if (gps.encode(Serial2.read())) {
+  uint16_t parsedBytes = 0;
+  while (Serial2.available() > 0 && parsedBytes < GNSS_PARSE_BUDGET_BYTES) {
+    char ch = Serial2.read();
+    parsedBytes++;
+    if (gps.encode(ch)) {
       if (gps.time.isUpdated()) {
-        double rawAlt = gps.altitude.meters();
-        if (rawAlt > -500 && rawAlt < 10000.0) { // 標高的に妥当な範囲内かを確認
-          altGNSS = rawAlt;
-          gnssAltValid = true;
-          gnssAltUpdated = true;
-        }
+        updateSystemTimeFromGnss();
         if (gps.location.lng() > 120) {  // 異常値除外
           la = gps.location.lat();
           ln = gps.location.lng();
           positionValid = true;
           spd = gps.speed.kmph();
-          uint8_t gnss_day = gps.date.day();
-          uint8_t gnss_month = gps.date.month();
-          uint8_t gnss_year = gps.date.year();
-          uint8_t gnss_hour = gps.time.hour();
-          uint8_t gnss_minute = gps.time.minute();
-          uint8_t gnss_second = gps.time.second();
           uint8_t gnss_csec = gps.time.centisecond();
-          // JST変換
-          gnss_hour = gnss_hour + time_offset;
-          if (gnss_hour > 23) {  // 時間が日付を超える場合
-            gnss_hour -= 24;
-            gnss_day++;
-            if (gnss_month == 2){  // ２月の場合
-              if ( (gnss_year % 4) == 0 ) {
-                if(gnss_day > 28) {
-                  gnss_day = 1;
-                  gnss_month++;
-                }
-              } else {
-                if(gnss_day > 29) {
-                  gnss_day = 1;
-                  gnss_month++;
-                }              
-              }
-            }else if ((gnss_month % 2) == 0){ // ２月以外の偶数月の場合
-              if ( gnss_day > 30 ){
-                gnss_day = 1;
-                gnss_month++;
-                if ( gnss_month > 12 ){
-                  gnss_year++;
-                }
-              }      
-            }else{  //　奇数月の場合
-              if ( gnss_day > 31 ){
-                gnss_day = 1;
-                gnss_month++;          
-              }
-            }
-          }
-
-          // GNSS時刻をシステム時刻に反映（初回受信時は強制反映、2回目以降はPPS同期運用中でもGNSS時刻との差が大きい場合のみ再同期）
-          tmElements_t tm = {};
-          tm.Year = CalendarYrToTm((int)gnss_year);
-          tm.Month = gnss_month;
-          tm.Day = gnss_day;
-          tm.Hour = gnss_hour;
-          tm.Minute = gnss_minute;
-          tm.Second = gnss_second;
-          latestGnssEpochJst = makeTime(tm);
-          latestGnssEpochValid = true;
-          lastGnssTimeUpdateMs = millis();
-
-          // GPSから時刻を一度反映したら、以降はNTP同期で時刻を更新しても逆行しないようにする
-          if (!gpsTimeLocked) {
-            const time_t gnssEpoch = makeTime(tm);
-            syncTimeForwardOnly(gnssEpoch, 0);
-            gpsTimeLocked = true;
-          } else if (latestGnssEpochValid) {
-            // 1PPS同期運用中でもGNSS時刻との差が大きい場合は再同期する
-            const long secDiff = (long)(latestGnssEpochJst - now());
-            if (secDiff > 2) {
-              syncTimeForwardOnly((time_t)latestGnssEpochJst, 2);
-            }
-          }
-
-          ppsSyncEnabled = true;
-          ntpSyncDone = true;  // GPS時刻受信後はNTP同期不要（GPS優先）
           refreshDatetime(gnss_csec);  // デバッグ用Serial出力
         }
         break;
@@ -978,84 +944,96 @@ void updateGNSS() {
   }
 }
 
-// GNSS + BMP280 + IMU で高度を融合
-void updateAltitudeFusion() {
-  unsigned long now = millis();
-  if (lastAltFusionMs == 0) {
-    lastAltFusionMs = now;
+// Open-MeteoのAPIを呼び出すために、現在の緯度経度が有効かどうかを判定する
+bool hasValidLocationForWeatherApi() {
+  return isfinite(la) && isfinite(ln) && gps.location.isValid() && la >= -90.0 && la <= 90.0 && ln >= -180.0 && ln <= 180.0;
+}
+
+// BMP280から気圧を読み取って高度を更新する
+void updateAltitudeFromBmp280() {
+  if (!isBmp280Ready) {
+    return;
+  }
+  
+  // BMP280から気圧を読み取る
+  float pressurePa = bmp280.readPressure();
+  if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
     return;
   }
 
-  float dt = (now - lastAltFusionMs) * 0.001f;
-  if (dt <= 0.0f) {
+  // 気圧から高度を計算する（国際標準大気モデルを使用）
+  float pressureKPa = pressurePa / 1000.0f;
+  float altitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
+  if (isfinite(altitudeMeters) && altitudeMeters > -1000.0f && altitudeMeters < 12000.0f) {
+    alt = altitudeMeters;
+  }
+}
+
+// Open-MeteoのAPIを呼び出して海面上気圧を取得し、BMP280の高度計算に使用する値を更新する
+void tryFetchSeaLevelPressureFromOpenMeteo() {
+  // すでに正常に取得している場合は何もしない
+  if (seaLevelPressureReplaced) {
     return;
   }
-  if (dt > 0.2f) {
-    dt = 0.2f;
-  }
-  lastAltFusionMs = now;
-
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-  M5.Imu.getAccel(&ax, &ay, &az);
-  // Y軸加速度を用いて重力成分を除去
-  float ayInertial = -(ay + 1.0f) * 9.80665f;
-  if (fabsf(ayInertial) < ALT_ACCEL_DEADBAND || spd < LOW_SPEED_FREEZE_KMPH) {
-    ayInertial = 0.0f;
+  // 前回の取得から一定時間経過していない場合は何もしない
+  if (millis() < nextSeaLevelPressureFetchAt) {
+    return;
   }
 
-  bool baroUpdated = false;
-  float rawBaroAlt = 0.0f;
-  const bool absFromGsi = gsiAltValid;
-  const bool absAltValid = gsiAltValid || gnssAltValid;
-  const bool absAltUpdated = absFromGsi ? gsiAltUpdated : gnssAltUpdated;
-  const float absAltVariance = absFromGsi ? R_GSI : R_GNSS;
-  const double absAlt = gsiAltValid ? altGSI : altGNSS;
+  // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
+  if (WiFi.status() != WL_CONNECTED || !hasValidLocationForWeatherApi()) {
+    return;
+  }
 
-  if (bmpReady && bmp.readAltitude(SEA_LEVEL_HPA, rawBaroAlt)) {
-    if (absAltValid) {
-      const float targetOffset = (float)absAlt - rawBaroAlt;
-      if (!baroCalibrated) {
-        baroOffset = targetOffset;
-        baroCalibrated = true;
-      } else {
-        float alpha = absAltUpdated ? 0.05f : 0.01f;
-        if (fabsf(targetOffset - baroOffset) > 20.0f) {
-          alpha = 0.2f;
-        }
-        baroOffset += alpha * (targetOffset - baroOffset);
+  IPAddress resolvedIp;
+  int dnsResult = WiFi.hostByName("api.open-meteo.com", resolvedIp);
+  if (dnsResult != 1) {
+    Serial.printf("[OpenMeteo] DNS failed: result=%d RSSI=%d\n", dnsResult, WiFi.RSSI());
+    nextSeaLevelPressureFetchAt = millis() + SEA_LEVEL_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  Serial.printf("[OpenMeteo] DNS ok: %s RSSI=%d\n", resolvedIp.toString().c_str(), WiFi.RSSI());
+
+  // 遅延最小化とTLS失敗回避のため、Open-Meteo取得はHTTPで実施する
+  String url = String("http://api.open-meteo.com/v1/forecast?latitude=") + String(la, 6) +
+               String("&longitude=") + String(ln, 6) +
+               String("&current=pressure_msl");
+
+  WiFiClient weatherClient;
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+
+  // HTTP接続の開始に失敗した場合はリトライのための待ち時間をセットして終了する（成功している場合は次回以降の呼び出しで何もしない）
+  if (!http.begin(weatherClient, url)) {
+    Serial.println("[OpenMeteo] http.begin failed");
+    nextSeaLevelPressureFetchAt = millis() + SEA_LEVEL_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, http.getString());
+    if (!err) {
+      float pressureMslHpa = doc["current"]["pressure_msl"] | NAN;
+      if (isfinite(pressureMslHpa) && pressureMslHpa > 800.0f && pressureMslHpa < 1200.0f) {
+        seaLevelPressureKPa = pressureMslHpa / 10.0f;
+        seaLevelPressureReplaced = true;
+        Serial.printf("[OpenMeteo] sea-level pressure fixed: %.3f kPa\n", seaLevelPressureKPa);
       }
     }
-    altBaro = rawBaroAlt + baroOffset;
-    baroValid = true;
-    baroUpdated = true;
   } else {
-    baroValid = false;
+    Serial.printf("[OpenMeteo] GET failed: %d (%s) RSSI=%d\n", code, http.errorToString(code).c_str(), WiFi.RSSI());
   }
+  http.end();
 
-  if (!altitudeEkf.isInitialized()) {
-    if (absAltValid) {
-      altitudeEkf.init((float)absAlt);
-      alt = absAlt;
-    } else if (baroUpdated) {
-      altitudeEkf.init((float)altBaro);
-      alt = altBaro;
-    }
-    return;
+  // 取得に成功していない場合はリトライのための待ち時間をセットする（成功している場合は次回以降の呼び出しで何もしない）
+  if (!seaLevelPressureReplaced) {
+    nextSeaLevelPressureFetchAt = millis() + SEA_LEVEL_FETCH_RETRY_INTERVAL;
   }
-
-  altitudeEkf.predict(ayInertial, dt);
-  if (baroUpdated) {
-    altitudeEkf.update((float)altBaro, absAltValid ? R_BARO_WITH_ABS : R_BARO);
-  }
-  if (absAltValid) {
-    altitudeEkf.update((float)absAlt, absAltUpdated ? absAltVariance : (absFromGsi ? R_GSI_HOLD : R_GNSS));
-    if (absFromGsi && fabsf(altitudeEkf.altitude() - (float)absAlt) > GSI_HARD_GATE_M) {
-      altitudeEkf.update((float)absAlt, R_GSI_HARD);
-    }
-  }
-  alt = altitudeEkf.altitude();
 }
 
 // ディスプレイ更新（表示モードごとに分岐）
@@ -1073,12 +1051,13 @@ void updateDisplay() {
   lcd_s.setTextSize(1);
   lcd_s.setTextDatum(top_right);
   lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
-  lcd_s.drawString(positionValid ? "GNSS: O" : "GNSS: x", 320, 15);
+  lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
   if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
+  if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
   if (!ambientpush && !MQTTpush) {
     lcd_s.drawString("MQTT: x", 320, 30);
+    // lcd_s.drawString("Amb: x", 320, 45);
   }
-
   
   // タイトル表示（表示モードごと）
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
@@ -1212,7 +1191,10 @@ void updateSDLog() {
     isNewFile = !sd.exists(fileName);
   }
 
-  logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
+  // ログファイルが開いていない場合は開く（すでに開いている場合は再利用して追記）
+  if (!logFile) {
+    logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
+  }
   if (logFile) {
     if (!logFileInitialized) {
       if (isNewFile) {
@@ -1238,7 +1220,14 @@ void updateSDLog() {
     logFile.print(alt, 1);     logFile.print(",");
     logFile.print(Loc);        logFile.print(",");
     logFile.println(EngTemp, 2);
-    logFile.close();
+
+    // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
+    sdLinesSinceSync++;
+    if (sdLinesSinceSync >= 5 || (millis() - lastSdSyncAt) >= 5000UL) {
+      logFile.sync();
+      sdLinesSinceSync = 0;
+      lastSdSyncAt = millis();
+    }
   } else {
     Serial.println("SD Log open failed!");
   }
@@ -1319,30 +1308,31 @@ void setup() {
   
   // デバッグ用Serial
   Serial.begin(115200);
-  // ECU, GNSS初期化
-  Serial1.begin(115200, SERIAL_8N1, 27, 19);
-  Serial2.begin(GNSS_BAUD);
-  pinMode(PPS_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PPS_PIN), onPpsRise, RISING);
-  M5.Imu.init();
-  altitudeEkf.setProcessAccelSigma(EKF_PROCESS_SIGMA_A);
-  altitudeEkf.setInitialCovariance(100.0f, 10.0f);
-  bmpReady = bmp.begin();
-  baroValid = false;
-  Serial.println(bmpReady ? "BMP280: OK" : "BMP280: NG");
 
-  // GSI Fetch Task開始
-  if (gsiTaskHandle == nullptr) {
-    xTaskCreatePinnedToCore(
-      gsiFetchTask,
-      "gsiFetch",
-      GSI_TASK_STACK_SIZE,
-      nullptr,
-      1,
-      &gsiTaskHandle,
-      1
-    );
+  // BMP280初期化（I2Cアドレス0x76）
+  if (bmp280.begin(0x76)) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                       Adafruit_BMP280::SAMPLING_X2,
+                       Adafruit_BMP280::SAMPLING_X16,
+                       Adafruit_BMP280::FILTER_X16,
+                       Adafruit_BMP280::STANDBY_MS_500);
+    Serial.println("BMP280 initialized");
+    isBmp280Ready = true;
+  } else {
+    Serial.println("BMP280 init failed");
   }
+
+  // ECU初期化
+  Serial1.begin(115200, SERIAL_8N1, 27, 19);
+  Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
+  
+  // GNSS初期化（モジュールに応じてボーレートを切り替える）
+  if (isBmp280Ready) {
+      Serial2.begin(38400);  // M5Stack GNSS Module(NEO-M9N)
+  } else {
+      Serial2.begin(115200); // NEO-6M
+  }
+
   // BLE初期化
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
@@ -1499,16 +1489,17 @@ void setup() {
       Serial.println("NTP sync timeout");
     }
   }
-  
+
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
   Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
   
-  // タイマー初期化
-  t_Serial = millis() + SERIAL_OUT_INTERVAL;
-  t_SD = millis() + SD_LOG_INTERVAL;
-  t_MQTT = millis();                          
-  t_amb = millis() + AMBIENT_INTERVAL;
+  t_Serial = millis();
+  t_SD = millis();
+  t_MQTT = millis();
+  t_amb = millis();
+  t_alt = millis();
+  lastSdSyncAt = millis();
 }
 
 //==================== loop() =====================
@@ -1523,36 +1514,52 @@ void loop() {
   updateAltitudeFusion();
   updateDisplay();
   
-  // Serial出力（デバッグ用）
-  if ((long)(millis() - t_Serial) >= 0) {
+  // デバッグ用Serial出力
+  if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
     updateSerialOutput();
-    t_Serial = millis() + SERIAL_OUT_INTERVAL;
+    t_Serial += SERIAL_OUT_INTERVAL;
   }
   
   // SDカードへのログ書き出し
-  if (LOGGING && (long)(millis() - t_SD) >= 0) {
+  if (LOGGING && (millis() - t_SD >= SD_LOG_INTERVAL)) {
     updateSDLog();
-    t_SD = millis() + SD_LOG_INTERVAL;
+    t_SD += SD_LOG_INTERVAL;
+    // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+    if (millis() - t_SD >= SD_LOG_INTERVAL) {
+      t_SD = millis();
+    }
   }
   
+  // MQTT送信は頻度を変えて実行（周回開始前は低頻度、周回開始後は高頻度）
+  // Wi-Fi接続が必要なため、接続成功している場合のみ更新する
   if (MQTTpush) {
     if (worktime == 0) {
       if (millis() - t_MQTT >= MQTT_INTERVAL_PRE) {
         updateMQTT();
-        t_MQTT = millis();
+        t_MQTT += MQTT_INTERVAL_PRE;
       }
     } else {
       if (millis() - t_MQTT >= MQTT_INTERVAL_RUN) {
         updateMQTT();
-        t_MQTT = millis();
+        t_MQTT += MQTT_INTERVAL_RUN;
       }
     }
   }
   
-  if (ambientpush && (long)(millis() - t_amb) >= 0) {
+  // AmbientはWi-Fi接続が必要なため、接続成功している場合のみ更新する
+  if (ambientpush && (millis() - t_amb >= AMBIENT_INTERVAL)) {
     updateAmbient();
-    t_amb = millis() + AMBIENT_INTERVAL;
+    t_amb += AMBIENT_INTERVAL;
   }
   
+  // 高度更新はBMP280が正常に初期化されている場合のみ実行する
+  if (millis() - t_alt >= ALTITUDE_INTERVAL) {
+    updateAltitudeFromBmp280();
+    t_alt += ALTITUDE_INTERVAL;
+  }
+
+  // Open-Meteo呼び出しはBMP280が接続されているときのみ低頻度で実行し、成功したら以後実行しない
+  if (isBmp280Ready) tryFetchSeaLevelPressureFromOpenMeteo();
+
   delay(10);
 }

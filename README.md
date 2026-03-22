@@ -19,6 +19,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 | 高度推定 | EKFで `気圧高度(BMP280)` + `加速度(BMI270)` + `絶対高度(国土地理院GSI優先/GNSSフォールバック)` を融合 |
 | 表示モード切替 | Aボタン=`モード 0` 回転数/噴射時間/進角(セッティング向け)<BR>Bボタン=`モード 1` 速度/残周回/走行時間(デフォルト)<BR>Cボタン=`モード 2` 速度/回転数/燃費(燃費確認用) |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
+| 高度推定 | BMP280気圧から高度推定 (標準大気式) |
+| 海面気圧補正 | Open-Meteoから`pressure_msl`を1回取得して高度基準を補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
 | Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値除外<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
@@ -28,7 +30,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - 基板: M5Stack Core2 (ESP32, PSRAM 使用)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
-- GNSS: Serial2 38400 bps ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module) DIP-SW RX:1, TX:1)
+- GNSS: Serial2 38400 bps ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module) DIP-SW TX:1, RX:1)
+- BMP280(気圧センサ): I2C 0x76 ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module)
 - BLE 温度センサ: RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可)
 - ボタン: A/B/C でモード選択 + 起動時設定
 
@@ -43,7 +46,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - [EspSoftwareSerial](https://github.com/plerup/espsoftwareserial)
 - [SdFat](https://github.com/greiman/SdFat)
 - [WiFiManager](https://github.com/tzapu/WiFiManager) (同梱ライブラリ `lib/WiFiManager`)
-- [HTTPClient (ESP32 Arduino Core)](https://github.com/espressif/arduino-esp32)
+- [Adafruit BMP280 Library](https://github.com/adafruit/Adafruit_BMP280_Library)
+- [Adafruit Unified Sensor](https://github.com/adafruit/Adafruit_Sensor)
 
 ## ビルド & 実行 (PlatformIO)
 
@@ -57,6 +61,14 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 - シリアル出力: CSV形式 `lat,lon,alt,loc,Spd_GPS,rpm,Spd_PULSE,distance,gasml,dispergas,worktime,Temp`
 - 例外デコード: `monitor_filters = esp32_exception_decoder`
+
+## 高度推定 / Open-Meteo 補正
+
+- 高度は GNSS ではなく BMP280 の気圧から算出
+- 海面気圧は初期値 `101.325kPa` を使用
+- Wi-Fi接続済みかつGNSS座標が有効なときのみ Open-Meteo API を低頻度で試行
+- Open-Meteoの`pressure_msl`取得に成功したら1回だけ海面気圧を置換し、以後は再取得しない
+- 通信遅延抑制のため Open-Meteo 取得は HTTP で実行
 
 ## 起動時の Wi-Fi 操作
 
@@ -82,6 +94,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - 走行時間: ECU送信の積算秒
 - 燃費: コード中 `dispergas` (km/L 指定の閾値 2000 スケールバー)
 - タイムスタンプは `logFile.timestamp()` によりファイル更新時にも設定
+- SD書き込みはファイルを開きっぱなしで運用し、定期 `sync()` で書き込み確定  
+  （電源切では`sync()`実行済みのログを残す）
 
 ## 高度推定仕様
 
@@ -228,13 +242,12 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 
 ## 既知の課題 (改善予定)
 
-1. SD カード初期化: 挿入済でも最大 3 秒待機しているため、`sd.begin()` 成功時に即時ブレークし後続処理へ進むよう最適化する
+1. 電源断耐性: 開きっぱなし運用のため、電源断時は最後の `sync()` 以降の数秒分が欠損する可能性がある
 2. BLE 温度欠損: SoftwareSerial 経由で温度値の欠損が発生。対策として FreeRTOS タスク分離 / HardwareSerial への移行 / リングバッファ導入を検討
 
 ## 次ステップ (改善案)
 
-- 実走ログに基づく `R_BARO / R_GNSS / EKF_PROCESS_SIGMA_A` の継続最適化
-- GSI API 取得失敗率の可視化 (成功/失敗カウントの追加)
+- 停止操作で `sync/close` を明示実行する安全停止フローの追加
 - 速度(`Spd_PULSE`)を 0.1 km/h 単位で記録・送信 (必要ならスケール変更)
 - GNSS 日付処理の簡素化 (標準ライブラリ活用)
 - 証明書有効期限チェック機能

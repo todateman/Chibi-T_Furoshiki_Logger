@@ -186,18 +186,16 @@ partition "SDカード初期化" {
             :sd.mkdir("/LOG")
             画面メッセージ表示;
         endif
-
-        if (/LOG/LOG0000.CSV 存在?) then (yes)
-            :NEXTID.TXT から次番号読込;
-        else (no)
-            :fileNum = 0;
-        endif
-
-        :未使用ファイル名を探索
-        /LOG/LOG%04d.CSV;
-
-        :logFileInitialized = false
-        (ヘッダ/BOMは初回 updateSDLog 時に書込);
+        
+        repeat
+            :fileName生成
+            /LOG/LOG%04d.CSV;
+            
+        repeat while (ファイル既存?) is (yes)
+        ->no;
+        
+        :初回の updateSDLog() で
+        BOM/ヘッダを作成;
         
     else (no)
         :LOGGING = false
@@ -331,7 +329,8 @@ partition "最終準備" {
     t_Serial = millis()
     t_SD = millis()
     t_MQTT = millis()
-    t_amb = millis();
+    t_amb = millis()
+    t_alt = millis();
 }
 
 stop
@@ -408,11 +407,21 @@ partition "定期出力処理 (タイミング制御)" {
         if (millis() - t_SD >= 1000ms?) then (yes)
             :updateSDLog()
             SDカードへCSV記録;
-            :t_SD = millis();
+            :t_SD += 1000ms
+            (遅延時は再同期);
         else (no)
         endif
     else (no)
     endif
+
+    if (millis() - t_alt >= 500ms?) then (yes)
+        :updateAltitudeFromBmp280()
+        気圧高度更新;
+        :t_alt += 500ms;
+    endif
+
+    :tryFetchSeaLevelPressureFromOpenMeteo()
+    成功時は以後停止;
     
     if (MQTTpush?) then (yes)
         if (worktime == 0?) then (yes: 走行前)
@@ -588,45 +597,15 @@ partition "updateGNSS() - GNSS位置・時刻受信" {
         
         if (gps.encode(byte)?) then (yes: 完全な文完成)
             if (gps.time.isUpdated()?) then (yes)
-                if (gps.location.lng() > 120?) then (yes: 異常値除外)
+                if (座標が有効範囲?) then (yes: 異常値除外)
                     :la = gps.location.lat()
                     ln = gps.location.lng()
                     spd = gps.speed.kmph()
                     位置・速度取得;
-                    
-                    :日時データ取得
-                    gnss_day, month, year
-                    gnss_hour, minute, second
-                    gnss_csec;
-                    
-                    :gnss_hour += 9
-                    JST変換 (UTC+9);
-                    
-                    if (gnss_hour > 23?) then (yes)
-                        :gnss_hour -= 24
-                        gnss_day++
-                        日付繰り上げ;
-                        
-                        if (月末判定?) then (yes: 月末超過)
-                            :gnss_day = 1
-                            gnss_month++
-                            月繰り上げ;
-                            
-                            if (gnss_month > 12?) then (yes)
-                                :gnss_year++
-                                年繰り上げ;
-                            else (no)
-                            endif
-                        else (no)
-                        endif
-                    else (no)
-                    endif
-                    
-                    :setTime()
-                    システム時刻設定;
-                    
-                    :sprintf_P(datetime, ...)
-                    日時文字列生成;
+                    :buildGnssJstTime()
+                    UTC->JST変換;
+                    :updateSystemTimeFromGnss()
+                    forward-onlyで時刻補正;
                     
                     break;
                 endif
@@ -753,8 +732,9 @@ partition "定期送信タイミング制御" {
                 if (millis() - t_SD >= 1000?) then (yes)
                     :updateSDLog()
                     SDカードへCSV記録;
-                    :t_SD = millis()
-                    タイマーリセット;
+                    :t_SD += 1000
+                    (遅延時は再同期)
+                    ドリフト抑制;
                 else (no)
                 endif
             else (no)
@@ -910,9 +890,11 @@ title updateSDLog() - SDカードログ記録処理詳細
 start
 
 partition "updateSDLog() - SDカードログ記録" {
-    :logFile = sd.open(fileName, 
-    O_WRITE | O_CREAT | O_APPEND)
-    追記モードでファイルオープン;
+    if (logFile未オープン?) then (yes)
+        :logFile = sd.open(fileName,
+        O_WRITE | O_CREAT | O_APPEND)
+        初回のみオープン;
+    endif
     
     if (logFile?) then (yes: オープン成功)
         :logFile.timestamp(T_WRITE, 
@@ -923,7 +905,8 @@ partition "updateSDLog() - SDカードログ記録" {
         :CSVデータ書き込み
         datetime, speed, Lapcount,
         worktime, tachoRpm, distance,
-        gasml, dispergas, la, ln, EngTemp;
+        gasml, dispergas, la, ln,
+        alt, loc, EngTemp;
         
         note right
             形式: CSV (カンマ区切り)
@@ -934,8 +917,8 @@ partition "updateSDLog() - SDカードログ記録" {
             - その他: 1桁
         end note
         
-        :logFile.close()
-        ファイルクローズ;
+        :5行または5秒ごとに
+        logFile.sync();
         
     else (no: オープン失敗)
         :Serial.println("SD Log open failed!")
