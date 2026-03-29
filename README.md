@@ -4,9 +4,10 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 - ECU からの走行データ取得 (Serial1)
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
-- 高度推定 (BMP280 + BMI270 + 絶対高度ソースの融合EKF)
+- 高度推定 (BME280を用いた気圧→高度換算)
 - インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
 - BLE 経由のエンジン温度受信 (SoftwareSerial or HardwareSerial)
+- BME280を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
 - LCD (M5Unified + LovyanGFX) への複数モード表示
@@ -19,8 +20,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 | 表示モード切替 | Bボタン=`モード 0` 速度/残周回/走行時間(デフォルト)<BR>Aボタン=`モード 1` 回転数/噴射時間/進角(セッティング向け)<BR>Cボタン=`モード 2` 走行ルート標高グラフ + 現在地標高プロット |
 | ウェイポイント標高グラフ | `sd`ディレクトリのウェイポイントCSV (`suzuka_waypoint.csv` / `motegi_waypoint.csv` / `toyota_waypoint.csv`) を読み込み、横軸=ウェイポイントID、縦軸=標高で表示。現在地の緯度経度を最も近いIDへ割り当てて標高を重ねて表示 |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
-| 高度推定 | BMP280気圧から高度推定 (標準大気式) |
-| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、BMP280高度との差分でオフセット補正 |
+| 高度推定 | BME280 気圧から高度推定 (標準大気式) |
+| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、BME280高度との差分でオフセット補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
 | Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値除外<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
@@ -30,8 +31,9 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - 基板: M5Stack Core2 (ESP32, PSRAM 使用)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
-- GNSS: Serial2 38400 bps ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module) DIP-SW TX:1, RX:1)
-- BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22 ([M5Stack GNSS Module](https://docs.m5stack.com/ja/module/GNSS%20Module)
+- GNSS: Serial2 115200 bps (RX=13, TX=14)
+- BME280(気圧/気温/湿度センサ) / BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22
+  - 運用注記: M5Core2のI2C 0x38はタッチセンサと競合するため、AHT20は使用しない
 - BLE 温度センサ: M5Core2 PortA RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可 M5Stack Basicには32,33ピンが存在しないため使用不可)
 - ボタン: A/B/C でモード選択 + 起動時設定
 
@@ -46,7 +48,7 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - [EspSoftwareSerial](https://github.com/plerup/espsoftwareserial)
 - [SdFat](https://github.com/greiman/SdFat)
 - [WiFiManager](https://github.com/tzapu/WiFiManager) (同梱ライブラリ `lib/WiFiManager`)
-- [Adafruit BMP280 Library](https://github.com/adafruit/Adafruit_BMP280_Library)
+- [Adafruit BME280 Library](https://github.com/adafruit/Adafruit_BME280_Library)
 - [Adafruit Unified Sensor](https://github.com/adafruit/Adafruit_Sensor)
 
 ## ビルド & 実行 (PlatformIO)
@@ -59,16 +61,16 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 ### デバッグ
 
-- シリアル出力: CSV形式 `lat,lon,alt,loc,Spd_GPS,rpm,Spd_PULSE,distance,gasml,dispergas,worktime,Temp`
+- シリアル出力: CSV形式 `lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, EngTemp, Pressure, Temp, Humidity, datetime`
 - 例外デコード: `monitor_filters = esp32_exception_decoder`
 
 ## 高度推定 / 国土地理院API補正
 
-- 高度は GNSS ではなく BMP280 の気圧から算出
+- 高度は GNSS ではなく BME280 の気圧から算出
 - 海面気圧は初期値 `101.325kPa` を使用
 - Wi-Fi接続済みかつGNSS座標が有効なときのみ、国土地理院API (`getelevation.php`) で標高取得を低頻度で試行
-- 標高取得成功時、その時点のBMP280生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
-- 以後の表示/ログ高度は `BMP280生高度 + オフセット` で算出
+- 標高取得成功時、その時点のBME280生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
+- 以後の表示/ログ高度は `BME280生高度 + オフセット` で算出
 - API取得は HTTPS を優先し、失敗時は HTTP フォールバック
 
 ## 起動時の Wi-Fi 操作
@@ -120,10 +122,10 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 - 実装ファイル:
   - `include/AltitudeEKF.h`: 気圧→高度変換と2状態EKF本体
-  - `src/main.cpp`: BMP280ドライバ、国土地理院GSI API取得、センサ融合ロジック
+  - `src/main.cpp`: BME280ドライバ、国土地理院GSI API取得、センサ融合ロジック
 - 融合の流れ（1ループ）:
   1. IMU の Y軸加速度から重力成分を除去して予測ステップ
-  2. BMP280 気圧高度で更新（高頻度）
+  2. BME280 気圧高度で更新（高頻度）
   3. 絶対高度で更新（`GSI標高API` 優先、失敗時は `GNSS高度`）
 - 絶対高度ソース:
   - Wi-Fi接続かつ位置有効時は国土地理院APIを約10秒周期で取得

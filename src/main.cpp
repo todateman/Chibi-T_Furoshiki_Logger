@@ -150,9 +150,9 @@ enum PressureSensorType {
   PRESSURE_SENSOR_BME280,
 };
 PressureSensorType pressureSensorType = PRESSURE_SENSOR_NONE;
-float envPressureKPa = NAN;
-float envTemperatureC = NAN;
-float envHumidityPct = NAN;
+float envPressureKPa = NAN;                       // BMP280/BME280/AHT20から取得した環境気圧 [kPa]（センサーが複数ある場合はBME280 > AHT20 > BMP280の優先順位で選択。いずれも利用できない場合はNAN）
+float envTemperatureC = NAN;                      // BMP280/BME280/AHT20から取得した環境温度 [°C]（センサーが複数ある場合はBME280 > AHT20 > BMP280の優先順位で選択。いずれも利用できない場合はNAN）
+float envHumidityPct = NAN;                       // BME280またはAHT20から取得した環境湿度 [%]（BMP280は湿度センサーを搭載していないため、この値は利用できない）
 float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
 float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280/BME280生高度の差分（m）
 bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
@@ -173,21 +173,92 @@ uint64_t lastDatetimeCentis = 0;  // CSV時刻の逆行防止（1/100秒単位�
 
 // NTP同期フラグ（GPS受信後は更新しない）
 bool ntpSyncDone = false;
+unsigned long nextNtpRetryAt = 0;
+
+// 時刻同期で受け入れる年の下限（RTC初期値の1999年などを除外）
+const int VALID_TIME_YEAR_MIN = 2024;
+const unsigned long NTP_SYNC_TIMEOUT_MS = 30000UL;
+const unsigned long NTP_RETRY_INTERVAL_MS = 60000UL;
+
+// 時刻同期で受け入れる年の範囲内かどうかを判定する関数
+bool isValidSyncYear(int year) {
+  return year >= VALID_TIME_YEAR_MIN && year <= 2099;
+}
+
+// 日時バッファ更新関数の宣言（必要に応じてセンチ秒を指定可能）
+void refreshDatetime(uint8_t csec);
+
+// NTPサーバーからの時刻同期を試みる関数（成功した場合はtrueを返す）
+bool trySyncTimeFromNtp(unsigned long timeoutMs) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  // JST固定で複数NTPサーバーを指定して取得成功率を上げる
+  configTzTime("JST-9", "ntp.nict.jp", "time.google.com", "pool.ntp.org");
+  Serial.println("NTP sync started");
+
+  unsigned long ntpStart = millis();
+  while (millis() - ntpStart < timeoutMs) {
+    time_t epoch = time(nullptr);
+    struct tm timeinfo;
+    if (localtime_r(&epoch, &timeinfo) != nullptr) {
+      int calendarYear = timeinfo.tm_year + 1900;
+      if (isValidSyncYear(calendarYear)) {
+        ntpSyncDone = true;
+        // TimeLib側はJST基準で扱う（GNSS同期経路と同じ基準）
+        setTime(static_cast<time_t>(epoch) + static_cast<time_t>(time_offset * SECS_PER_HOUR));
+        refreshDatetime(0);
+        Serial.printf("NTP sync succeeded: %04d/%02d/%02d %02d:%02d:%02d\n",
+                      calendarYear,
+                      timeinfo.tm_mon + 1,
+                      timeinfo.tm_mday,
+                      timeinfo.tm_hour,
+                      timeinfo.tm_min,
+                      timeinfo.tm_sec);
+        return true;
+      }
+    }
+
+    M5.update();
+    delay(100);
+  }
+
+  Serial.println("NTP sync timeout");
+  return false;
+}
 
 // 日時バッファ更新（必要に応じてセンチ秒を指定）
 void refreshDatetime(uint8_t csec = 255) {
+  time_t currentSecond = now();
   uint8_t displayCsec = csec;
   if (displayCsec > 99) {
-    displayCsec = (millis() / 10) % 100;  // センチ秒が指定されていない場合は現在のミリ秒から算出して表示（00-99）
+    static time_t centiBaseSecond = 0;
+    static unsigned long centiBaseMillis = 0;
+    unsigned long nowMs = millis();
+
+    // センチ秒が指定されていない場合は、現在秒の先頭からの経過時間で算出する
+    // 1Hzロギング時に "毎秒+0.01" ずつ増える見え方を防ぐ
+    if (currentSecond != centiBaseSecond) {
+      centiBaseSecond = currentSecond;
+      centiBaseMillis = nowMs;
+      displayCsec = 0;
+    } else {
+      unsigned long elapsedMs = nowMs - centiBaseMillis;
+      if (elapsedMs > 990) {
+        elapsedMs = 990;
+      }
+      displayCsec = static_cast<uint8_t>(elapsedMs / 10);
+    }
   }
 
   // GNSS/NTP再同期で秒が戻った場合でも、ログ時刻文字列は単調増加を維持する
   // NOTE: ここで setTime() は呼ばない。呼ぶと同一秒内の多重呼び出しで秒が人工的に進み、
   //       CSV時刻のバースト/空白を生むため。
-  uint64_t currentCentis = static_cast<uint64_t>(now()) * 100ULL + static_cast<uint64_t>(displayCsec);
-  if (currentCentis <= lastDatetimeCentis) {
-    currentCentis = lastDatetimeCentis + 1ULL;
-    displayCsec = static_cast<uint8_t>(currentCentis % 100ULL);
+  uint64_t currentCentis = static_cast<uint64_t>(currentSecond) * 100ULL + static_cast<uint64_t>(displayCsec);
+  if (currentCentis < lastDatetimeCentis) {
+    currentCentis = lastDatetimeCentis;
+    displayCsec = static_cast<uint8_t>(lastDatetimeCentis % 100ULL);
   } else {
     displayCsec = static_cast<uint8_t>(currentCentis % 100ULL);
   }
@@ -206,8 +277,13 @@ bool buildGnssJstTime(time_t& outJstTime) {
     return false;
   }
 
+  int gpsYear = gps.date.year();
+  if (!isValidSyncYear(gpsYear)) {
+    return false;
+  }
+
   tmElements_t tm;
-  tm.Year = CalendarYrToTm(gps.date.year());
+  tm.Year = CalendarYrToTm(gpsYear);
   tm.Month = gps.date.month();
   tm.Day = gps.date.day();
   tm.Hour = gps.time.hour();
@@ -1488,29 +1564,8 @@ void setup() {
   
   // NTP同期（Wi-Fi接続成功時、GPS時刻受信前）
   if (isWifiConfigSucceeded && !ntpSyncDone) {
-    configTime(9 * 3600, 0, "pool.ntp.org");  // JST (UTC+9)
-    Serial.println("NTP sync started");
-    // NTP同期待機（最大10秒）
-    unsigned long ntpStart = millis();
-    while (millis() - ntpStart < 10000) {
-      time_t now = time(nullptr);
-      struct tm* timeinfo = localtime(&now);
-      if (timeinfo->tm_year > 70) {  // 1970年以降になったかチェック
-        ntpSyncDone = true;
-        // TimeLibの時刻を更新（datetime バッファ用）
-        setTime(timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec,
-                timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900);
-        // datetime バッファを更新
-        refreshDatetime(0);
-        Serial.print("NTP sync succeeded: ");
-        Serial.println(asctime(timeinfo));
-        break;
-      }
-      M5.update();
-      delay(100);
-    }
-    if (!ntpSyncDone) {
-      Serial.println("NTP sync timeout");
+    if (!trySyncTimeFromNtp(NTP_SYNC_TIMEOUT_MS)) {
+      nextNtpRetryAt = millis() + NTP_RETRY_INTERVAL_MS;
     }
   }
 
@@ -1522,7 +1577,7 @@ void setup() {
 
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
-  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp, Pressure, Humidity, datetime"));
+  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Pressure, Temp, Humidity, datetime"));
   
   t_Serial = millis();
   t_SD = millis();
@@ -1536,6 +1591,15 @@ void setup() {
 //==================== loop() =====================
 void loop() {
   M5.update();
+
+  // NTP初回失敗時の再試行（GNSS未受信環境でも時刻が確定するようにする）
+  if (!ntpSyncDone && MQTTpush && isWifiConfigSucceeded && millis() >= nextNtpRetryAt) {
+    if (trySyncTimeFromNtp(5000UL)) {
+      nextNtpRetryAt = 0;
+    } else {
+      nextNtpRetryAt = millis() + NTP_RETRY_INTERVAL_MS;
+    }
+  }
 
   // MQTTコネクション維持（PubSubClient推奨: loop()を毎回呼ぶ）
   if (MQTTpush && mqttclient.connected()) {
