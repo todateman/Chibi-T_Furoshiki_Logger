@@ -70,6 +70,8 @@ partition "メインループ (loop)" {
             updateBLE()
             updateECU()
             updateGNSS()
+            updateGsiElevation()
+            updateAltitudeFusion()
         end note
         
         :updateDisplay()
@@ -129,15 +131,20 @@ partition "ハードウェア初期化" {
     :Serial1.begin(115200, SERIAL_8N1, 27, 19)
     ECU接続;
     
-    :Serial2.begin(115200)
+    :Serial2.begin(38400)
     GNSS接続;
+
+    :M5.Imu.init()
+    EKFパラメータ設定
+    BMP280初期化;
     
     if (USE_HARDWARE_BLE?) then (1)
         :SerialBLE.begin(115200, SERIAL_8N1, 32, 33)
         UART2使用;
     else (0)
-        :SerialBLE.begin(115200)
-        SoftwareSerial使用;
+        :SerialBLE.begin(115200, ..., false, 512)
+        SoftwareSerial使用
+        (RXバッファ拡張);
     endif
 }
 
@@ -187,11 +194,8 @@ partition "SDカード初期化" {
         repeat while (ファイル既存?) is (yes)
         ->no;
         
-        :logFile.open()
-        BOM書き込み (UTF-8)
-        CSVヘッダ書き込み;
-        
-        :logFile.close();
+        :初回の updateSDLog() で
+        BOM/ヘッダを作成;
         
     else (no)
         :LOGGING = false
@@ -294,6 +298,26 @@ partition "MQTT設定" {
     endif
 }
 
+partition "NTP同期" {
+    if (isWifiConfigSucceeded && !ntpSyncDone?) then (yes)
+        :configTime(JST)
+        NTP同期開始;
+
+        repeat
+            :time(nullptr) で時刻確認;
+        repeat while (10秒以内 && 年が1970相当?) is (yes)
+        ->no;
+
+        if (同期成功?) then (yes)
+            :setTime() へ反映
+            refreshDatetime(0)
+            ntpSyncDone = true;
+        else (no)
+            :NTP timeoutログ出力;
+        endif
+    endif
+}
+
 partition "最終準備" {
     :画面表示
     "読み込み中...";
@@ -305,7 +329,8 @@ partition "最終準備" {
     t_Serial = millis()
     t_SD = millis()
     t_MQTT = millis()
-    t_amb = millis();
+    t_amb = millis()
+    t_alt = millis();
 }
 
 stop
@@ -341,6 +366,22 @@ partition "データ収集フェーズ" {
         詳細は次ページ
         「データ収集詳細」参照
     end note
+
+    :updateGsiElevation()
+    GSI標高取得;
+    note right
+        - HTTP優先
+        - 失敗時 HTTPS へフォールバック
+        - 取得不可時はGNSS高度利用
+    end note
+
+    :updateAltitudeFusion()
+    高度融合EKF更新;
+    note right
+        - 低速時はIMU鉛直加速度を凍結
+        - GSI保持観測でドリフト抑制
+        - GSI乖離時は強制再ロック
+    end note
 }
 
 partition "表示更新" {
@@ -366,11 +407,21 @@ partition "定期出力処理 (タイミング制御)" {
         if (millis() - t_SD >= 1000ms?) then (yes)
             :updateSDLog()
             SDカードへCSV記録;
-            :t_SD = millis();
+            :t_SD += 1000ms
+            (遅延時は再同期);
         else (no)
         endif
     else (no)
     endif
+
+    if (millis() - t_alt >= 500ms?) then (yes)
+        :updateAltitudeFromBmp280()
+        気圧高度更新;
+        :t_alt += 500ms;
+    endif
+
+    :tryFetchSeaLevelPressureFromOpenMeteo()
+    成功時は以後停止;
     
     if (MQTTpush?) then (yes)
         if (worktime == 0?) then (yes: 走行前)
@@ -427,44 +478,34 @@ partition "updateBLE() - BLE温度データ受信" {
     
     while (SerialBLE.available() > 0?) is (yes)
         :c = SerialBLE.read()
-        1文字読み取り;
-        
-        :bleBuffer += c
         lastBLETime = millis();
-        
+
         if (c == '\n'?) then (yes)
-            :bleBuffer.trim()
-            前後空白除去;
-            
-            if (bleBuffer.length() > 0?) then (yes)
-                :tempValue = bleBuffer.toFloat()
-                文字列を浮動小数点に変換;
-                
-                if (データ妥当性チェック?) then (yes: valid)
-                    note right
-                        - toFloat()が有効な変換を実施
-                        - 温度範囲: 20～150℃
-                    end note
-                    :EngTemp = tempValue
-                    温度更新;
-                else (no: invalid)
-                    :前回値を保持
-                    (更新しない);
-                endif
+            :processBLEPayload(bleBuffer, false);
+        elseif (c == '\r'?) then (yes)
+        else (値文字?)
+            :bleBuffer += c;
+            if (bleBuffer.length() > 15?) then (yes)
+                :bleBuffer = "";
             endif
-            
-            :bleBuffer = ""
-            バッファクリア;
         endif
     endwhile (no)
-    
-    if (millis() - lastBLETime > 10000?) then (yes: タイムアウト)
-        :EngTemp = 0.0
-        温度リセット;
-        :bleBuffer = ""
-        バッファクリア;
-    else (no)
+
+    if (millis() - lastBLETime > 100ms && bleBufferあり?) then (yes)
+        :processBLEPayload(bleBuffer, true)
+        部分フレームをタイムアウト処理;
     endif
+
+    if (millis() - lastBLETime > 2000ms?) then (yes)
+        :EngTemp = 0.0
+        bleBuffer = "";
+    endif
+
+    note right
+        processBLEPayload 内で:
+        - 数値文字列のみ許可
+        - 温度範囲 10-150℃
+    end note
 }
 
 stop
@@ -509,7 +550,7 @@ partition "updateECU() - ECU走行データ受信" {
                 :IGN_CA = data.toInt()
                 進角角度;
             case (3)
-                :speed = data.toInt()
+                :speed = data.toFloat()
                 速度;
             case (4)
                 :distance = data.toInt()
@@ -556,45 +597,15 @@ partition "updateGNSS() - GNSS位置・時刻受信" {
         
         if (gps.encode(byte)?) then (yes: 完全な文完成)
             if (gps.time.isUpdated()?) then (yes)
-                if (gps.location.lng() > 120?) then (yes: 異常値除外)
+                if (座標が有効範囲?) then (yes: 異常値除外)
                     :la = gps.location.lat()
                     ln = gps.location.lng()
                     spd = gps.speed.kmph()
                     位置・速度取得;
-                    
-                    :日時データ取得
-                    gnss_day, month, year
-                    gnss_hour, minute, second
-                    gnss_csec;
-                    
-                    :gnss_hour += 9
-                    JST変換 (UTC+9);
-                    
-                    if (gnss_hour > 23?) then (yes)
-                        :gnss_hour -= 24
-                        gnss_day++
-                        日付繰り上げ;
-                        
-                        if (月末判定?) then (yes: 月末超過)
-                            :gnss_day = 1
-                            gnss_month++
-                            月繰り上げ;
-                            
-                            if (gnss_month > 12?) then (yes)
-                                :gnss_year++
-                                年繰り上げ;
-                            else (no)
-                            endif
-                        else (no)
-                        endif
-                    else (no)
-                    endif
-                    
-                    :setTime()
-                    システム時刻設定;
-                    
-                    :sprintf_P(datetime, ...)
-                    日時文字列生成;
+                    :buildGnssJstTime()
+                    UTC->JST変換;
+                    :updateSystemTimeFromGnss()
+                    forward-onlyで時刻補正;
                     
                     break;
                 endif
@@ -608,7 +619,7 @@ partition "updateGNSS() - GNSS位置・時刻受信" {
             totallaps = 8
             goal = 17616
             limittime = 2536;
-        elseif (茂木範囲内?) then (yes)
+        elseif (もてぎ範囲内?) then (yes)
             :Loc = "mo"
             totallaps = 7
             goal = 16389
@@ -618,6 +629,75 @@ partition "updateGNSS() - GNSS位置・時刻受信" {
             デフォルト値維持;
         endif
     }
+}
+
+stop
+
+|高度融合|
+start
+
+partition "updateGsiElevation() - GSI標高取得" {
+    :gsiAltUpdated = false;
+
+    if (WiFi接続 && 位置有効?) then (yes)
+        if (取得間隔 >= 10秒?) then (yes)
+            :HTTPでGSI API取得;
+
+            if (HTTP成功?) then (yes)
+                :レスポンス解析;
+            else (no)
+                :HTTPSで再試行;
+                if (HTTPS成功?) then (yes)
+                    :レスポンス解析;
+                else (no)
+                endif
+            endif
+
+            if (標高取得成功?) then (yes)
+                :altGSI更新
+                gsiAltValid = true
+                gsiAltUpdated = true;
+            else (no)
+                :gsiAltValid = false
+                GNSSへフォールバック;
+            endif
+        else (no)
+        endif
+    else (no)
+        :gsiAltValid = false;
+    endif
+}
+
+partition "updateAltitudeFusion() - 高度融合" {
+    :IMU加速度取得;
+    :鉛直加速度へ変換;
+
+    if (低速 or 微小加速度?) then (yes)
+        :鉛直加速度=0;
+    else (no)
+    endif
+
+    :BMP280高度取得;
+    if (絶対高度有効?) then (yes)
+        :baroOffsetを絶対高度へ追従;
+    endif
+
+    if (EKF未初期化?) then (yes)
+        :絶対高度優先でEKF初期化;
+        stop
+    endif
+
+    :predict(鉛直加速度, dt);
+    :baro観測更新
+    (絶対高度有効時は重み低下);
+    :絶対高度観測更新
+    (更新間隔中も保持観測);
+
+    if (GSIと大きく乖離?) then (yes)
+        :強制再ロック更新;
+    endif
+
+    :alt = EKF推定高度;
 }
 
 stop
@@ -652,8 +732,9 @@ partition "定期送信タイミング制御" {
                 if (millis() - t_SD >= 1000?) then (yes)
                     :updateSDLog()
                     SDカードへCSV記録;
-                    :t_SD = millis()
-                    タイマーリセット;
+                    :t_SD += 1000
+                    (遅延時は再同期)
+                    ドリフト抑制;
                 else (no)
                 endif
             else (no)
@@ -809,9 +890,11 @@ title updateSDLog() - SDカードログ記録処理詳細
 start
 
 partition "updateSDLog() - SDカードログ記録" {
-    :logFile = sd.open(fileName, 
-    O_WRITE | O_CREAT | O_APPEND)
-    追記モードでファイルオープン;
+    if (logFile未オープン?) then (yes)
+        :logFile = sd.open(fileName,
+        O_WRITE | O_CREAT | O_APPEND)
+        初回のみオープン;
+    endif
     
     if (logFile?) then (yes: オープン成功)
         :logFile.timestamp(T_WRITE, 
@@ -822,7 +905,8 @@ partition "updateSDLog() - SDカードログ記録" {
         :CSVデータ書き込み
         datetime, speed, Lapcount,
         worktime, tachoRpm, distance,
-        gasml, dispergas, la, ln, EngTemp;
+        gasml, dispergas, la, ln,
+        alt, loc, EngTemp;
         
         note right
             形式: CSV (カンマ区切り)
@@ -833,8 +917,8 @@ partition "updateSDLog() - SDカードログ記録" {
             - その他: 1桁
         end note
         
-        :logFile.close()
-        ファイルクローズ;
+        :5行または5秒ごとに
+        logFile.sync();
         
     else (no: オープン失敗)
         :Serial.println("SD Log open failed!")
@@ -853,8 +937,7 @@ start
 
 partition "updateAmbient() - Ambient送信" {
     if (WiFi接続中?) then (yes: WL_CONNECTED)
-        :char buf[16]
-        バッファ準備;
+        :char buf[16] を準備;
         
         :ambient.set(1, spd)
         フィールド1: GPS速度;
@@ -1106,15 +1189,5 @@ lcd.endWrite()
 スプライトをLCDへ転送;
 
 stop
-
-note bottom
-    表示モード:
-    0: 速度/残周回/走行時間 (デフォルト)
-    1: 回転数/噴射時間/進角角度 (セッティング)
-    2: 速度/回転数/燃費 (燃費確認)
-    
-    各モードで3段の情報を表示し、
-    それぞれバーグラフで視覚化
-end note
 
 @enduml

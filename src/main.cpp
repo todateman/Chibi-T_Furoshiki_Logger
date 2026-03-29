@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include "SdFat.h"
@@ -9,8 +8,13 @@
 #include <TimeLib.h>
 #include <WiFiClientSecure.h>
 #include <WiFiClient.h>
+#include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_AHTX0.h>
 #include "secrets.h"
 
 //==================== 定数・マクロ ====================
@@ -28,10 +32,19 @@
 #define SD_LOG_INTERVAL     1000
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
+#define MQTT_RECONNECT_BASE_INTERVAL 5000UL
+#define MQTT_RECONNECT_MAX_INTERVAL  60000UL
 #define AMBIENT_INTERVAL    10000
+#define ALTITUDE_INTERVAL   500
+#define ENV_SENSOR_INTERVAL 1000
+#define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
+#define GNSS_PARSE_BUDGET_BYTES 256
+#define BMX280_I2C_SDA 21
+#define BMX280_I2C_SCL 22
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
+#define MQTT_DIAGNOSTIC_LOG 0  // 本番:0, 切り分け時のみ1
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -69,8 +82,9 @@ const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイ�
 
 // WiFi, MQTT, Ambient
 WiFiManager wifiManager;
-WiFiClientSecure client;
-PubSubClient mqttclient(client);
+WiFiClient ambientClient;
+WiFiClientSecure mqttTlsClient;
+PubSubClient mqttclient(mqttTlsClient);
 Ambient ambient;
 bool isWifiConfigSucceeded = false;
 bool ambientpush = false;   // Ambient送信有効（必要に応じてfalseに設定）
@@ -84,6 +98,10 @@ unsigned long t_Serial = 0;
 unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
 unsigned long t_amb    = 0;
+unsigned long t_alt    = 0;
+unsigned long t_env    = 0;
+unsigned long lastSdSyncAt = 0;
+uint16_t sdLinesSinceSync = 0;
 
 // シリアル（ECU, GNSS, BLE）
 unsigned long receiveECUtime = 0;
@@ -96,56 +114,416 @@ SoftwareSerial SerialBLE(BLE_RX_PIN, BLE_TX_PIN);
 #endif
 
 // ECU受信データ
-uint16_t tachoRpm = 0;
-float INJ_timems = 0.0;
-uint8_t IGN_CA = 0;
-float speed = 0.0;
-uint16_t distance = 0;
-float gasml = 0.0;
-float dispergas = 0.0;
-uint16_t worktime = 0;
-uint16_t Lapcount = 0;
-uint8_t totallaps = 3;
-uint16_t goal = 1000;
-uint16_t limittime = 100;
-float EngTemp = 0.0;
+uint16_t tachoRpm = 0;  // エンジン回転数 [rpm]
+float INJ_timems = 0.0; // 燃料噴射時間 [ms]（燃料噴射量の指標として利用）
+uint8_t IGN_CA = 0;     // 点火時期 [°CA]（クランク角度）
+float speed = 0.0;      // 車軸パルスから算出した車速 [km/h]
+uint16_t distance = 0;  // 走行距離 [m]
+float gasml = 0.0;      // 燃料消費量 [ml]（燃料噴射時間から推定）※あくまで目安で、実際の消費量とは異なる可能性が高い
+float dispergas = 0.0;  // 燃料消費率 [ml/km]（燃料消費量 / 走行距離）※あくまで目安で、実際の消費率とは異なる可能性が高い
+uint16_t worktime = 0;  // 走行時間 [s]（エンジン始動以降の時間を累積）
+uint16_t Lapcount = 0;  // 周回数
+uint8_t totallaps = 3;  // 周回数（サーキットごとに設定値を上書き）
+uint16_t goal = 1000;   // 走行距離 [m]（サーキットごとに設定値を上書き）
+uint16_t limittime = 100; // 制限時間 [s]（サーキットごとに設定値を上書き）
+float EngTemp = 0.0;    // エンジン温度 [°C]
 
 // GPS用
 TinyGPSPlus gps;
-double la, ln;
+int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, M5Stack GNSS Module:38400）
+double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
-double alt = 0.0;
-double spd = 0.0;
-String Loc = "";
+double alt = 0.0;   // GPS高度
+double spd = 0.0;   // GPS速度
+String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
+
+// BMP280/BME280による高度推定用
+Adafruit_BMP280 bmp280;
+Adafruit_BME280 bme280;
+Adafruit_AHTX0 aht20;
+bool isBmx280Ready = false;     // BMP280/BME280が正常に初期化されているかどうか
+bool isAht20Ready = false;
+enum PressureSensorType {
+  PRESSURE_SENSOR_NONE = 0,
+  PRESSURE_SENSOR_BMP280,
+  PRESSURE_SENSOR_BME280,
+};
+PressureSensorType pressureSensorType = PRESSURE_SENSOR_NONE;
+float envPressureKPa = NAN;                       // BMP280/BME280/AHT20から取得した環境気圧 [kPa]（センサーが複数ある場合はBME280 > AHT20 > BMP280の優先順位で選択。いずれも利用できない場合はNAN）
+float envTemperatureC = NAN;                      // BMP280/BME280/AHT20から取得した環境温度 [°C]（センサーが複数ある場合はBME280 > AHT20 > BMP280の優先順位で選択。いずれも利用できない場合はNAN）
+float envHumidityPct = NAN;                       // BME280またはAHT20から取得した環境湿度 [%]（BMP280は湿度センサーを搭載していないため、この値は利用できない）
+float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
+float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBMP280/BME280生高度の差分（m）
+bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
+unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
+
 // サーキットごとの設定
-const uint8_t totallaps_su = 8;
-const uint8_t totallaps_mo = 7;
-const uint16_t goal_su = 17616;
-const uint16_t goal_mo = 16389;
-const uint16_t limittime_su = 2536;
-const uint16_t limittime_mo = 2360;
+const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの周回数
+const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの周回数
+const uint16_t goal_su = 17616; // 鈴鹿サーキット東コースの走行距離 [m]
+const uint16_t goal_mo = 16389; // ツインリンクもてぎオーバルコースの走行距離 [m]
+const uint16_t limittime_su = 2536; // 鈴鹿サーキット東コースの制限時間 [s]
+const uint16_t limittime_mo = 2360; // ツインリンクもてぎオーバルコースの制限時間 [s]
 const int time_offset = 9;  // JST
 
 // 時刻表示用バッファ
 char datetime[23];
+uint64_t lastDatetimeCentis = 0;  // CSV時刻の逆行防止（1/100秒単位）
 
 // NTP同期フラグ（GPS受信後は更新しない）
 bool ntpSyncDone = false;
+unsigned long nextNtpRetryAt = 0;
+
+// 時刻同期で受け入れる年の下限（RTC初期値の1999年などを除外）
+const int VALID_TIME_YEAR_MIN = 2024;
+const unsigned long NTP_SYNC_TIMEOUT_MS = 30000UL;
+const unsigned long NTP_RETRY_INTERVAL_MS = 60000UL;
+
+// 時刻同期で受け入れる年の範囲内かどうかを判定する関数
+bool isValidSyncYear(int year) {
+  return year >= VALID_TIME_YEAR_MIN && year <= 2099;
+}
+
+// 日時バッファ更新関数の宣言（必要に応じてセンチ秒を指定可能）
+void refreshDatetime(uint8_t csec);
+
+// NTPサーバーからの時刻同期を試みる関数（成功した場合はtrueを返す）
+bool trySyncTimeFromNtp(unsigned long timeoutMs) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  // JST固定で複数NTPサーバーを指定して取得成功率を上げる
+  configTzTime("JST-9", "ntp.nict.jp", "time.google.com", "pool.ntp.org");
+  Serial.println("NTP sync started");
+
+  unsigned long ntpStart = millis();
+  while (millis() - ntpStart < timeoutMs) {
+    time_t epoch = time(nullptr);
+    struct tm timeinfo;
+    if (localtime_r(&epoch, &timeinfo) != nullptr) {
+      int calendarYear = timeinfo.tm_year + 1900;
+      if (isValidSyncYear(calendarYear)) {
+        ntpSyncDone = true;
+        // TimeLib側はJST基準で扱う（GNSS同期経路と同じ基準）
+        setTime(static_cast<time_t>(epoch) + static_cast<time_t>(time_offset * SECS_PER_HOUR));
+        refreshDatetime(0);
+        Serial.printf("NTP sync succeeded: %04d/%02d/%02d %02d:%02d:%02d\n",
+                      calendarYear,
+                      timeinfo.tm_mon + 1,
+                      timeinfo.tm_mday,
+                      timeinfo.tm_hour,
+                      timeinfo.tm_min,
+                      timeinfo.tm_sec);
+        return true;
+      }
+    }
+
+    M5.update();
+    delay(100);
+  }
+
+  Serial.println("NTP sync timeout");
+  return false;
+}
 
 // 日時バッファ更新（必要に応じてセンチ秒を指定）
 void refreshDatetime(uint8_t csec = 255) {
+  time_t currentSecond = now();
   uint8_t displayCsec = csec;
   if (displayCsec > 99) {
-    displayCsec = (millis() / 10) % 100;  // センチ秒が指定されていない場合は現在のミリ秒から算出して表示（00-99）
+    static time_t centiBaseSecond = 0;
+    static unsigned long centiBaseMillis = 0;
+    unsigned long nowMs = millis();
+
+    // センチ秒が指定されていない場合は、現在秒の先頭からの経過時間で算出する
+    // 1Hzロギング時に "毎秒+0.01" ずつ増える見え方を防ぐ
+    if (currentSecond != centiBaseSecond) {
+      centiBaseSecond = currentSecond;
+      centiBaseMillis = nowMs;
+      displayCsec = 0;
+    } else {
+      unsigned long elapsedMs = nowMs - centiBaseMillis;
+      if (elapsedMs > 990) {
+        elapsedMs = 990;
+      }
+      displayCsec = static_cast<uint8_t>(elapsedMs / 10);
+    }
   }
 
+  // GNSS/NTP再同期で秒が戻った場合でも、ログ時刻文字列は単調増加を維持する
+  // NOTE: ここで setTime() は呼ばない。呼ぶと同一秒内の多重呼び出しで秒が人工的に進み、
+  //       CSV時刻のバースト/空白を生むため。
+  uint64_t currentCentis = static_cast<uint64_t>(currentSecond) * 100ULL + static_cast<uint64_t>(displayCsec);
+  if (currentCentis < lastDatetimeCentis) {
+    currentCentis = lastDatetimeCentis;
+    displayCsec = static_cast<uint8_t>(lastDatetimeCentis % 100ULL);
+  } else {
+    displayCsec = static_cast<uint8_t>(currentCentis % 100ULL);
+  }
+  lastDatetimeCentis = currentCentis;
+
+  tmElements_t tm;
+  breakTime(static_cast<time_t>(currentCentis / 100ULL), tm);
+
   sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
-            year(), month(), day(), hour(), minute(), second(), displayCsec);
+            tmYearToCalendar(tm.Year), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second, displayCsec);
+}
+
+// GNSS UTC日時をJSTへ変換したtime_tを作成する
+bool buildGnssJstTime(time_t& outJstTime) {
+  if (!gps.date.isValid() || !gps.time.isValid()) {
+    return false;
+  }
+
+  int gpsYear = gps.date.year();
+  if (!isValidSyncYear(gpsYear)) {
+    return false;
+  }
+
+  tmElements_t tm;
+  tm.Year = CalendarYrToTm(gpsYear);
+  tm.Month = gps.date.month();
+  tm.Day = gps.date.day();
+  tm.Hour = gps.time.hour();
+  tm.Minute = gps.time.minute();
+  tm.Second = gps.time.second();
+
+  time_t utc = makeTime(tm);
+  outJstTime = utc + static_cast<time_t>(time_offset * SECS_PER_HOUR);
+  return true;
+}
+
+// GNSSでの再同期はforward-onlyで行い、過剰な補正を抑制する
+void updateSystemTimeFromGnss() {
+  time_t gnssJst = 0;
+  if (!buildGnssJstTime(gnssJst)) {
+    return;
+  }
+
+  time_t current = now();
+  if (current < 1577836800 || gnssJst > (current + 2)) {  // currentが未初期化または2秒以上先行時のみ補正
+    setTime(gnssJst);
+    ntpSyncDone = true;
+  }
 }
 
 // ディスプレイ表示モード
 uint8_t dispmode = 0;
+
+// ウェイポイント（標高グラフ用）
+struct Waypoint {
+  uint16_t id;
+  float lat;
+  float lng;
+  float alt;
+};
+
+// ウェイポイントデータの最大数（必要に応じて増減させる）
+const size_t MAX_WAYPOINTS = 300;
+Waypoint waypoints[MAX_WAYPOINTS];
+size_t waypointCount = 0;
+float waypointMinAlt = 0.0f;
+float waypointMaxAlt = 0.0f;
+String loadedWaypointLoc = "";
+int nearestWaypointIndex = -1;
+
+// ロケーション識別子に対応するウェイポイントCSVファイルのパスを返す関数
+const char* getWaypointFilePathByLoc(const String& loc) {
+  if (loc == "su") {
+    return "/suzuka_waypoint.csv";
+  }
+  if (loc == "mo") {
+    return "/motegi_waypoint.csv";
+  }
+  return "/toyota_waypoint.csv";
+}
+
+// CSVの1行をパースしてWaypoint構造体に変換する関数
+bool parseWaypointCsvLine(const char* line, Waypoint& outPoint) {
+  int id = 0;
+  float latVal = 0.0f;
+  float lngVal = 0.0f;
+  float altVal = 0.0f;
+  float distanceDummy = 0.0f;
+  int parsed = sscanf(line, "%d,%f,%f,%f,%f", &id, &latVal, &lngVal, &altVal, &distanceDummy);
+  if (parsed < 4 || id <= 0) {
+    return false;
+  }
+
+  outPoint.id = static_cast<uint16_t>(id);
+  outPoint.lat = latVal;
+  outPoint.lng = lngVal;
+  outPoint.alt = altVal;
+  return true;
+}
+
+// ロケーション識別子に対応するウェイポイントCSVファイルをSDカードから読み込む関数
+bool loadWaypointFileForLoc(const String& loc) {
+  if (!LOGGING) {
+    waypointCount = 0;
+    nearestWaypointIndex = -1;
+    loadedWaypointLoc = "";
+    return false;
+  }
+
+  const char* path = getWaypointFilePathByLoc(loc);
+  file_t waypointFile = sd.open(path, O_READ);
+  if (!waypointFile) {
+    Serial.printf("[Waypoint] open failed: %s\n", path);
+    waypointCount = 0;
+    nearestWaypointIndex = -1;
+    loadedWaypointLoc = "";
+    return false;
+  }
+
+  char line[128];
+  size_t loadedCount = 0;
+  float minAlt = 1000000.0f;
+  float maxAlt = -1000000.0f;
+  while (waypointFile.available() && loadedCount < MAX_WAYPOINTS) {
+    int len = waypointFile.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (len <= 0) {
+      continue;
+    }
+    line[len] = '\0';
+    if (line[len - 1] == '\r') {
+      line[len - 1] = '\0';
+    }
+
+    if (line[0] == '\0' || (line[0] >= 'A' && line[0] <= 'Z') || (line[0] >= 'a' && line[0] <= 'z')) {
+      continue;  // ヘッダや空行を読み飛ばす
+    }
+
+    Waypoint point;
+    if (!parseWaypointCsvLine(line, point)) {
+      continue;
+    }
+
+    waypoints[loadedCount] = point;
+    if (point.alt < minAlt) {
+      minAlt = point.alt;
+    }
+    if (point.alt > maxAlt) {
+      maxAlt = point.alt;
+    }
+    loadedCount++;
+  }
+  waypointFile.close();
+
+  waypointCount = loadedCount;
+  nearestWaypointIndex = -1;
+  if (waypointCount == 0) {
+    loadedWaypointLoc = "";
+    return false;
+  }
+
+  if (fabsf(maxAlt - minAlt) < 0.1f) {
+    minAlt -= 1.0f;
+    maxAlt += 1.0f;
+  }
+  waypointMinAlt = minAlt;
+  waypointMaxAlt = maxAlt;
+  loadedWaypointLoc = loc;
+  Serial.printf("[Waypoint] loaded %u points from %s\n", static_cast<unsigned int>(waypointCount), path);
+  return true;
+}
+
+// 現在のロケーションに対応するウェイポイントがロードされていない場合にロードする関数
+void ensureWaypointLoadedForCurrentLoc() {
+  if (Loc.length() == 0) {
+    return;
+  }
+  if (loadedWaypointLoc == Loc && waypointCount > 0) {
+    return;
+  }
+  loadWaypointFileForLoc(Loc);
+}
+
+// 現在位置に最も近いウェイポイントのインデックスを返す関数
+int findNearestWaypointIndex(double lat, double lng) {
+  if (waypointCount == 0) {
+    return -1;
+  }
+
+  int nearest = 0;
+  double minDist2 = 1e18;
+  for (size_t i = 0; i < waypointCount; i++) {
+    double dLat = lat - static_cast<double>(waypoints[i].lat);
+    double dLng = lng - static_cast<double>(waypoints[i].lng);
+    double dist2 = dLat * dLat + dLng * dLng;
+    if (dist2 < minDist2) {
+      minDist2 = dist2;
+      nearest = static_cast<int>(i);
+    }
+  }
+
+  return nearest;
+}
+
+// 標高値をグラフのY座標に変換する関数
+int altitudeToGraphY(float value, float minAlt, float maxAlt, int top, int height) {
+  float normalized = (value - minAlt) / (maxAlt - minAlt);
+  normalized = constrain(normalized, 0.0f, 1.0f);
+  return top + height - 1 - static_cast<int>(normalized * static_cast<float>(height - 1));
+}
+
+// 標高グラフの描画
+void drawAltitudeGraphMode() {
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextSize(1);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.setTextColor(TFT_WHITE);
+
+  const int graphLeft = 10;
+  const int graphTop = 20;
+  const int graphWidth = 300;
+  const int graphHeight = 180;
+
+  lcd_s.drawRect(graphLeft, graphTop, graphWidth, graphHeight, TFT_WHITE);
+  if (waypointCount < 2) {
+    lcd_s.drawString("ウェイポイント未読込", 32, 108);
+    return;
+  }
+
+  for (size_t i = 0; i + 1 < waypointCount; i++) {
+    size_t next = i + 1;  // 右端と左端はつながない
+
+    int x1 = graphLeft + static_cast<int>((static_cast<float>(i) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
+    int y1 = altitudeToGraphY(waypoints[i].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+    int x2 = graphLeft + static_cast<int>((static_cast<float>(next) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
+    int y2 = altitudeToGraphY(waypoints[next].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+    lcd_s.drawLine(x1, y1, x2, y2, TFT_CYAN);
+  }
+
+  int plotIndex = nearestWaypointIndex;
+  if (plotIndex >= 0) {
+    int x = graphLeft + static_cast<int>((static_cast<float>(plotIndex) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
+    int yWaypoint = altitudeToGraphY(waypoints[plotIndex].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+    int yNow = altitudeToGraphY(static_cast<float>(alt), waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
+
+    lcd_s.drawFastVLine(x, graphTop, graphHeight, TFT_DARKGREY);
+    lcd_s.fillCircle(x, yWaypoint, 3, TFT_YELLOW);
+    lcd_s.fillCircle(x, yNow, 4, TFT_RED);
+
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+    lcd_s.setTextDatum(TL_DATUM);
+    lcd_s.setTextColor(TFT_WHITE);
+    lcd_s.setCursor(8, 225);
+    lcd_s.printf("WP:%d/%u route:%.1fm now:%.1fm", waypoints[plotIndex].id,
+                 static_cast<unsigned int>(waypointCount),
+                 waypoints[plotIndex].alt,
+                 static_cast<float>(alt));
+  }
+
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.setCursor(graphLeft, graphTop - 14);
+  lcd_s.printf("max %.1fm", waypointMaxAlt);
+  lcd_s.setCursor(graphLeft, graphTop + graphHeight + 2);
+  lcd_s.printf("min %.1fm", waypointMinAlt);
+}
 
 //==================== 各種関数 =====================
 
@@ -345,58 +723,18 @@ void updateECU() {
 
 // GNSSからの位置・時刻読み取り
 void updateGNSS() {
-  while (Serial2.available() > 0) {
-    if (gps.encode(Serial2.read())) {
+  uint16_t parsedBytes = 0;
+  while (Serial2.available() > 0 && parsedBytes < GNSS_PARSE_BUDGET_BYTES) {
+    char ch = Serial2.read();
+    parsedBytes++;
+    if (gps.encode(ch)) {
       if (gps.time.isUpdated()) {
-        double rawAlt = gps.altitude.meters();
-        if (rawAlt > -500 && rawAlt < 10000.0) { // 標高的に妥当な範囲内かを確認
-          alt = rawAlt;
-        }
+        updateSystemTimeFromGnss();
         if (gps.location.lng() > 120) {  // 異常値除外
           la = gps.location.lat();
           ln = gps.location.lng();
           spd = gps.speed.kmph();
-          uint8_t gnss_day = gps.date.day();
-          uint8_t gnss_month = gps.date.month();
-          uint8_t gnss_year = gps.date.year();
-          uint8_t gnss_hour = gps.time.hour();
-          uint8_t gnss_minute = gps.time.minute();
-          uint8_t gnss_second = gps.time.second();
           uint8_t gnss_csec = gps.time.centisecond();
-          // JST変換
-          gnss_hour = gnss_hour + time_offset;
-          if (gnss_hour > 23) {  // 時間が日付を超える場合
-            gnss_hour -= 24;
-            gnss_day++;
-            if (gnss_month == 2){  // ２月の場合
-              if ( (gnss_year % 4) == 0 ) {
-                if(gnss_day > 28) {
-                  gnss_day = 1;
-                  gnss_month++;
-                }
-              } else {
-                if(gnss_day > 29) {
-                  gnss_day = 1;
-                  gnss_month++;
-                }              
-              }
-            }else if ((gnss_month % 2) == 0){ // ２月以外の偶数月の場合
-              if ( gnss_day > 30 ){
-                gnss_day = 1;
-                gnss_month++;
-                if ( gnss_month > 12 ){
-                  gnss_year++;
-                }
-              }      
-            }else{  //　奇数月の場合
-              if ( gnss_day > 31 ){
-                gnss_day = 1;
-                gnss_month++;          
-              }
-            }
-          }
-          setTime(gnss_hour, gnss_minute, gnss_second, gnss_day, gnss_month, gnss_year);
-          ntpSyncDone = true;  // GPS時刻受信後はNTP同期不要（GPS優先）
           refreshDatetime(gnss_csec);  // デバッグ用Serial出力
         }
         break;
@@ -419,6 +757,220 @@ void updateGNSS() {
   }
 }
 
+// 国土地理院APIを呼び出すために、現在の緯度経度が有効かどうかを判定する
+bool hasValidLocationForGsiApi() {
+  return isfinite(la) && isfinite(ln) && gps.location.isValid() && la >= -90.0 && la <= 90.0 && ln >= -180.0 && ln <= 180.0;
+}
+
+// 検出したセンサーから現在の気圧(Pa)を読み出す
+bool readPressurePa(float& outPressurePa) {
+  if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+    outPressurePa = bmp280.readPressure();
+    return true;
+  }
+  if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+    outPressurePa = bme280.readPressure();
+    return true;
+  }
+  return false;
+}
+
+// 利用中の環境センサーから気圧・気温・湿度を取得する
+void updateEnvironmentSensors() {
+  float pressurePa = NAN;
+  if (readPressurePa(pressurePa) && isfinite(pressurePa) && pressurePa >= 30000.0f && pressurePa <= 120000.0f) {
+    envPressureKPa = pressurePa / 1000.0f;
+  } else {
+    envPressureKPa = NAN;
+  }
+
+  if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+    float temperatureC = bme280.readTemperature();
+    float humidityPct = bme280.readHumidity();
+    envTemperatureC = (isfinite(temperatureC) && temperatureC > -40.0f && temperatureC < 100.0f) ? temperatureC : NAN;
+    envHumidityPct = (isfinite(humidityPct) && humidityPct >= 0.0f && humidityPct <= 100.0f) ? humidityPct : NAN;
+    return;
+  }
+
+  if (pressureSensorType == PRESSURE_SENSOR_BMP280 && isAht20Ready) {
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+    aht20.getEvent(&humidityEvent, &temperatureEvent);
+    envTemperatureC = (isfinite(temperatureEvent.temperature) && temperatureEvent.temperature > -40.0f && temperatureEvent.temperature < 100.0f)
+                        ? temperatureEvent.temperature : NAN;
+    envHumidityPct = (isfinite(humidityEvent.relative_humidity) && humidityEvent.relative_humidity >= 0.0f && humidityEvent.relative_humidity <= 100.0f)
+                        ? humidityEvent.relative_humidity : NAN;
+    return;
+  }
+
+  envTemperatureC = NAN;
+  envHumidityPct = NAN;
+}
+
+// BMP280/BME280から気圧を読み取って高度を更新する
+void updateAltitudeFromBmx280() {
+  if (!isBmx280Ready) {
+    return;
+  }
+  
+  // BMP280/BME280から気圧を読み取る
+  float pressurePa = NAN;
+  if (!readPressurePa(pressurePa)) {
+    return;
+  }
+  if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
+    return;
+  }
+
+  // 気圧から高度を計算する（国際標準大気モデルを使用）
+  float pressureKPa = pressurePa / 1000.0f;
+  float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
+  if (isfinite(rawAltitudeMeters) && rawAltitudeMeters > -1000.0f && rawAltitudeMeters < 12000.0f) {
+    alt = rawAltitudeMeters + altitudeOffsetMeters;
+  }
+}
+
+// 国土地理院APIのレスポンスをパースして標高(m)を取り出す
+bool tryParseGsiElevationResponse(const String& payload, float& outElevationMeters) {
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[GSI] JSON parse failed: %s\n", err.c_str());
+    return false;
+  }
+
+  float elevation = doc["elevation"] | NAN;
+  if (!isfinite(elevation) || elevation < -500.0f || elevation > 10000.0f) {
+    Serial.printf("[GSI] elevation out of range: %.2f\n", elevation);
+    return false;
+  }
+
+  outElevationMeters = elevation;
+  return true;
+}
+
+// 国土地理院APIから標高(m)を取得する（HTTP優先、失敗時はHTTPSフォールバック）
+bool fetchGsiElevationMeters(float& outElevationMeters) {
+  const char* gsiHost = "cyberjapandata2.gsi.go.jp";
+  String query = String("/general/dem/scripts/getelevation.php?lon=") + String(ln, 6) +
+                 String("&lat=") + String(la, 6) +
+                 String("&outtype=JSON");
+  String httpsUrl = String("https://") + gsiHost + query;
+  String httpUrl = String("http://") + gsiHost + query;
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(1200);
+  http.setTimeout(1200);
+
+  WiFiClient plainClient;
+  if (http.begin(plainClient, httpUrl)) {
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      bool ok = tryParseGsiElevationResponse(http.getString(), outElevationMeters);
+      http.end();
+      if (ok) {
+        return true;
+      }
+    } else {
+      Serial.printf("[GSI] HTTP GET failed: %d (%s) RSSI=%d\n", code, http.errorToString(code).c_str(), WiFi.RSSI());
+    }
+    http.end();
+  } else {
+    Serial.println("[GSI] HTTP http.begin failed");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[GSI] skip HTTPS fallback: WiFi disconnected");
+    return false;
+  }
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  if (http.begin(secureClient, httpsUrl)) {
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      bool ok = tryParseGsiElevationResponse(http.getString(), outElevationMeters);
+      http.end();
+      if (ok) {
+        return true;
+      }
+    } else {
+      Serial.printf("[GSI] HTTPS GET failed: %d (%s) RSSI=%d\n", code, http.errorToString(code).c_str(), WiFi.RSSI());
+    }
+    http.end();
+  } else {
+    Serial.println("[GSI] HTTPS http.begin failed");
+  }
+
+  return false;
+}
+
+// 国土地理院API標高とBMP280/BME280生高度との差分を取得し、高度オフセットを固定する
+void tryFetchAltitudeOffsetFromGsi() {
+  // すでに正常に取得している場合は何もしない
+  if (altitudeOffsetFixed) {
+    return;
+  }
+  // 前回の取得から一定時間経過していない場合は何もしない
+  if (millis() < nextAltitudeOffsetFetchAt) {
+    return;
+  }
+
+  // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
+  if (!isBmx280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
+    return;
+  }
+
+  IPAddress resolvedIp;
+  int dnsResult = WiFi.hostByName("cyberjapandata2.gsi.go.jp", resolvedIp);
+  if (dnsResult != 1) {
+    Serial.printf("[GSI] DNS failed: result=%d RSSI=%d\n", dnsResult, WiFi.RSSI());
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  Serial.printf("[GSI] DNS ok: %s RSSI=%d\n", resolvedIp.toString().c_str(), WiFi.RSSI());
+
+  float gsiElevationMeters = NAN;
+  if (!fetchGsiElevationMeters(gsiElevationMeters)) {
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  float pressurePa = NAN;
+  if (!readPressurePa(pressurePa)) {
+    Serial.println("[GSI] pressure sensor read failed while fixing offset");
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+  if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
+    Serial.println("[GSI] BMP280/BME280 pressure invalid while fixing offset");
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  float pressureKPa = pressurePa / 1000.0f;
+  float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
+  if (!isfinite(rawAltitudeMeters) || rawAltitudeMeters < -1000.0f || rawAltitudeMeters > 12000.0f) {
+    Serial.printf("[GSI] BMP280/BME280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  float offset = gsiElevationMeters - rawAltitudeMeters;
+  if (!isfinite(offset) || offset < -3000.0f || offset > 3000.0f) {
+    Serial.printf("[GSI] offset out of range: %.2f (gsi=%.2f raw=%.2f)\n", offset, gsiElevationMeters, rawAltitudeMeters);
+    nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
+    return;
+  }
+
+  altitudeOffsetMeters = offset;
+  altitudeOffsetFixed = true;
+  alt = rawAltitudeMeters + altitudeOffsetMeters;  // 次回ALT周期を待たずに現在値へ反映する
+  Serial.printf("[GSI] altitude offset fixed: %.2fm (gsi=%.2fm raw=%.2fm)\n", altitudeOffsetMeters, gsiElevationMeters, rawAltitudeMeters);
+}
+
 // ディスプレイ更新（表示モードごとに分岐）
 void updateDisplay() {
   lcd_s.fillScreen(TFT_BLACK);
@@ -428,17 +980,32 @@ void updateDisplay() {
   if (M5.BtnB.isPressed()) { dispmode = 0; }
   if (M5.BtnA.isPressed()) { dispmode = 1; }
   if (M5.BtnC.isPressed()) { dispmode = 2; }
+
+  // 標高グラフモードの場合は専用の描画関数を呼び出して終了する
+  if (dispmode == 2) {
+    drawAltitudeGraphMode();      // 標高グラフモードの描画
+    lcd.startWrite();
+    lcd_s.pushSprite(0, 0);
+    lcd.endWrite();
+    return;
+  }
   
   // 接続状況表示
-  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
-  lcd_s.setTextSize(1);
-  lcd_s.setTextDatum(top_right);
-  lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
-  if (ambientpush) lcd_s.drawString("Amb: O", 320, 15);
-  if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 15);
-  if (!ambientpush && !MQTTpush) {lcd_s.drawString("Amb: x", 320, 15); lcd_s.drawString("MQTT: x", 320, 30);}
-  // 標高表示（デバッグ用）
-  // lcd_s.drawString("標高:" + String(alt, 1) + "m", 320, 85);
+  if (dispmode == 0 || dispmode == 1) {
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextSize(1);
+    lcd_s.setTextDatum(TL_DATUM);
+    lcd_s.drawString(Loc == "su" ? "鈴鹿" : (Loc == "mo" ? "茂木" : "豊田"), 10, 0);
+    lcd_s.setTextDatum(top_right);
+    lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
+    lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
+    if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
+    if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
+    if (!ambientpush && !MQTTpush) {
+      lcd_s.drawString("MQTT: x", 320, 30);
+      // lcd_s.drawString("Amb: x", 320, 45);
+    }
+  }
   
   // タイトル表示（表示モードごと）
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
@@ -452,10 +1019,6 @@ void updateDisplay() {
     lcd_s.drawString("回転数(rpm):", 10, 50);
     lcd_s.drawString("噴射時間(ms):", 10, 130);
     lcd_s.drawString("進角角度(CA):", 10, 210);
-  } else if (dispmode == 2) {
-    lcd_s.drawString("速度(km/h):", 10, 50);
-    lcd_s.drawString("回転数(rpm):", 10, 130);
-    lcd_s.drawString("燃費(km/l):", 10, 210);
   }
   
   // 第１表示行
@@ -463,7 +1026,7 @@ void updateDisplay() {
   lcd_s.setTextSize(1);
   lcd_s.setTextDatum(BL_DATUM);
   lcd_s.setCursor(140, 50);
-  if (dispmode == 0 || dispmode == 2) {
+  if (dispmode == 0) {
     lcd_s.print(speed, 1);
     lcd_s.drawRect(9, 54, 302, 12, TFT_WHITE);
     int barLength = (int)((constrain(speed, 0.0, 45.0) / 45.0) * 300.0);
@@ -503,12 +1066,6 @@ void updateDisplay() {
     lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
     lcd_s.fillRect(10, 135, map(INJ_timems, 0, 10, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(INJ_timems, 0, 10, 10, 310), 135, map(INJ_timems, 0, 10, 300, 0), 10, TFT_BLACK);
-  } else if (dispmode == 2) {
-    lcd_s.setCursor(140, 130);
-    lcd_s.print(tachoRpm);
-    lcd_s.drawRect(9, 134, 302, 12, TFT_WHITE);
-    lcd_s.fillRect(10, 135, map(tachoRpm, 0, 6500, 0, 300), 10, TFT_WHITE);
-    lcd_s.fillRect(map(tachoRpm, 0, 6500, 10, 310), 135, map(tachoRpm, 0, 6500, 300, 0), 10, TFT_BLACK);
   }
   
   // 第３表示行（走行時間・進角・燃費）
@@ -532,11 +1089,6 @@ void updateDisplay() {
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
     lcd_s.fillRect(10, 215, map(IGN_CA, 0, 90, 0, 300), 10, TFT_WHITE);
     lcd_s.fillRect(map(IGN_CA, 0, 90, 10, 310), 215, map(IGN_CA, 0, 90, 300, 0), 10, TFT_BLACK);
-  } else if (dispmode == 2) {
-    lcd_s.print(dispergas, 1);
-    lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
-    lcd_s.fillRect(10, 215, map(dispergas, 0, 2000, 0, 300), 10, TFT_WHITE);
-    lcd_s.fillRect(map(dispergas, 0, 2000, 10, 310), 215, map(dispergas, 0, 2000, 300, 0), 10, TFT_BLACK);
   }
   
   // スプライトをLCDへ転送
@@ -558,7 +1110,11 @@ void updateSerialOutput() {
   Serial.print(gasml, 1); Serial.print(",");
   Serial.print(dispergas, 1); Serial.print(",");
   Serial.print(worktime); Serial.print(",");
-  Serial.println(EngTemp, 2);
+  Serial.print(EngTemp, 2); Serial.print(",");
+  Serial.print(isfinite(envPressureKPa) ? String(envPressureKPa, 3) : ""); Serial.print(",");
+  Serial.print(isfinite(envTemperatureC) ? String(envTemperatureC, 2) : ""); Serial.print(",");
+  Serial.print(isfinite(envHumidityPct) ? String(envHumidityPct, 1) : ""); Serial.print(",");
+  Serial.println(datetime);
 }
 
 // SDカードへのログ書き出し
@@ -570,13 +1126,16 @@ void updateSDLog() {
     isNewFile = !sd.exists(fileName);
   }
 
-  logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
+  // ログファイルが開いていない場合は開く（すでに開いている場合は再利用して追記）
+  if (!logFile) {
+    logFile = sd.open(fileName, O_WRITE | O_CREAT | O_APPEND);
+  }
   if (logFile) {
     if (!logFileInitialized) {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,温度"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -593,50 +1152,139 @@ void updateSDLog() {
     logFile.print(dispergas, 1); logFile.print(",");
     logFile.print(la, 7);      logFile.print(",");
     logFile.print(ln, 7);      logFile.print(",");
-    logFile.print(alt, 1);     logFile.print(","); // 高度追加
-    logFile.println(EngTemp, 2);
-    logFile.close();
+    logFile.print(alt, 1);     logFile.print(",");
+    logFile.print(Loc);        logFile.print(",");
+    logFile.print(EngTemp, 2); logFile.print(",");
+    if (isfinite(envPressureKPa)) { logFile.print(envPressureKPa, 3); }
+    logFile.print(",");
+    if (isfinite(envTemperatureC)) { logFile.print(envTemperatureC, 2); }
+    logFile.print(",");
+    if (isfinite(envHumidityPct)) { logFile.print(envHumidityPct, 1); }
+    logFile.println();
+
+    // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
+    sdLinesSinceSync++;
+    if (sdLinesSinceSync >= 5 || (millis() - lastSdSyncAt) >= 5000UL) {
+      logFile.sync();
+      sdLinesSinceSync = 0;
+      lastSdSyncAt = millis();
+    }
   } else {
     Serial.println("SD Log open failed!");
   }
 }
 
 // MQTT送信（非同期リトライ）
+#if MQTT_DIAGNOSTIC_LOG
+void logMqttTlsErrorDetails() {
+  char errBuf[128] = {0};
+  int lastErr = mqttTlsClient.lastError(errBuf, sizeof(errBuf));
+  Serial.printf("MQTT TLS lastError=%d detail=%s\n", lastErr, errBuf[0] ? errBuf : "(none)");
+
+  IPAddress mqttIp;
+  int dnsResult = WiFi.hostByName(mqtt_server, mqttIp);
+  if (dnsResult == 1) {
+    Serial.printf("MQTT DNS ok: %s\n", mqttIp.toString().c_str());
+  } else {
+    Serial.printf("MQTT DNS failed: result=%d\n", dnsResult);
+  }
+}
+
+void logMqttRuntimeStats(const char* phase) {
+  Serial.printf("MQTT[%s] heap=%u minHeap=%u maxAlloc=%u RSSI=%d\n",
+                phase,
+                static_cast<unsigned int>(ESP.getFreeHeap()),
+                static_cast<unsigned int>(ESP.getMinFreeHeap()),
+                static_cast<unsigned int>(ESP.getMaxAllocHeap()),
+                WiFi.RSSI());
+}
+
+void runMqttPathDiagnostics() {
+  static unsigned long lastDiagAt = 0;
+  if (millis() - lastDiagAt < 60000UL) {
+    return;
+  }
+  lastDiagAt = millis();
+
+  WiFiClient tcpClient;
+  bool tcpOk = tcpClient.connect(mqtt_server, mqtt_port);
+  Serial.printf("MQTT diag TCP %s:%d -> %s\n", mqtt_server, mqtt_port, tcpOk ? "ok" : "failed");
+  tcpClient.stop();
+
+  WiFiClientSecure insecureTls;
+  insecureTls.setInsecure();
+  insecureTls.setTimeout(15);
+  bool tlsOk = insecureTls.connect(mqtt_server, mqtt_port);
+  if (tlsOk) {
+    Serial.println("MQTT diag TLS(insecure) -> ok");
+  } else {
+    char errBuf[128] = {0};
+    int lastErr = insecureTls.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("MQTT diag TLS(insecure) -> failed, err=%d detail=%s\n", lastErr, errBuf[0] ? errBuf : "(none)");
+  }
+  insecureTls.stop();
+}
+#endif
+
 void updateMQTT() {
   refreshDatetime();  // MQTT送信前に日時を更新
 
+  // Wi-Fi未接続時は即時復帰し、メインループを止めない
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
   if (!mqttclient.connected()) {
     static unsigned long lastReconnectAttempt = 0;
-    if (millis() - lastReconnectAttempt > 5000) {
+    static unsigned long reconnectInterval = MQTT_RECONNECT_BASE_INTERVAL;
+    if (millis() - lastReconnectAttempt > reconnectInterval) {
       lastReconnectAttempt = millis();
+#if MQTT_DIAGNOSTIC_LOG
+      logMqttRuntimeStats("before-connect");
+#endif
       if (mqttclient.connect(mqtt_deviceID)) {
+        reconnectInterval = MQTT_RECONNECT_BASE_INTERVAL;
         Serial.println("MQTT connected");
       } else {
+        reconnectInterval = min(reconnectInterval * 2UL, MQTT_RECONNECT_MAX_INTERVAL);
         Serial.print("MQTT reconnect failed, state: ");
         Serial.println(mqttclient.state());
+#if MQTT_DIAGNOSTIC_LOG
+        logMqttRuntimeStats("connect-failed");
+        logMqttTlsErrorDetails();
+        runMqttPathDiagnostics();
+#endif
+        mqttTlsClient.stop();
       }
     }
     return;
   }
-  mqttclient.loop();
+
+  // 多重送信ガード: 前回送信から500ms未満の場合はスキップ
+  static unsigned long lastPublishAt = 0;
+  if (millis() - lastPublishAt < 500UL) {
+    return;
+  }
+
   StaticJsonDocument<512> doc;
   doc["timestamp"] = datetime;
-  //doc["Spd_GPS"]   = spd;
-  doc["Spd_PULSE"] = speed;
-  doc["Lapcount"]  = Lapcount;
-  doc["worktime"]  = worktime;
-  doc["tachoRpm"]  = tachoRpm;
-  doc["distance"]  = distance;
-  doc["gasml"]     = gasml;
-  doc["dispergas"] = dispergas;
-  doc["lat"]       = la;
-  doc["lon"]       = ln;
-  doc["alt"]       = alt;
+  //doc["Spd_GPS"]   = (float)spd;
+  doc["Spd_PULSE"] = (float)speed;
+  doc["Lapcount"]  = (int)Lapcount;
+  doc["worktime"]  = (int)worktime;
+  doc["tachoRpm"]  = (int)tachoRpm;
+  doc["distance"]  = (int)distance;
+  doc["gasml"]     = (float)gasml;
+  doc["dispergas"] = (float)dispergas;
+  doc["lat"]       = (float)la;
+  doc["lon"]       = (float)ln;
+  doc["alt"]       = (float)alt;
   doc["loc"]       = Loc;
-  doc["temp"]      = EngTemp;
+  doc["temp"]      = (float)EngTemp;
   String jsonData;
   serializeJson(doc, jsonData);
   mqttclient.publish(mqtt_topic, jsonData.c_str());
+  lastPublishAt = millis();
 }
 
 // Ambient送信
@@ -667,6 +1315,76 @@ void updateAmbient() {
   }
 }
 
+// I2CデバイスからチップIDレジスタ(0xD0)を読み取る
+bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
+  Wire.beginTransmission(i2cAddress);
+  Wire.write(0xD0);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(static_cast<int>(i2cAddress), 1) != 1) {
+    return false;
+  }
+  outChipId = static_cast<uint8_t>(Wire.read());
+  return true;
+}
+
+// BMP280/BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+bool initializePressureSensorForGnssModule() {
+  const uint8_t bmp280ChipId = BMP280_CHIPID;  // 0x58
+  const uint8_t bme280ChipId = 0x60;
+
+  Wire.begin(BMX280_I2C_SDA, BMX280_I2C_SCL, 400000U);
+  Serial.printf("Pressure sensor I2C pin: SDA=%d SCL=%d\n", BMX280_I2C_SDA, BMX280_I2C_SCL);
+
+  const uint8_t addresses[] = {0x76, 0x77};
+  for (uint8_t i = 0; i < sizeof(addresses); i++) {
+    uint8_t chipId = 0;
+    if (!readPressureSensorChipId(addresses[i], chipId)) {
+      continue;
+    }
+
+    // チップIDに応じてBMP280/BME280を初期化する
+    if (chipId == bmp280ChipId) {
+      if (bmp280.begin(addresses[i], BMP280_CHIPID)) {
+        pressureSensorType = PRESSURE_SENSOR_BMP280;
+        Serial.printf("BMP280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+        return true;
+      }
+      Serial.printf("BMP280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      continue;
+    }
+
+    if (chipId == bme280ChipId) {
+      if (bme280.begin(addresses[i], &Wire)) {
+        pressureSensorType = PRESSURE_SENSOR_BME280;
+        Serial.printf("BME280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+        return true;
+      }
+      Serial.printf("BME280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      continue;
+    }
+
+    Serial.printf("Unknown pressure sensor id=0x%02X at addr=0x%02X\n", chipId, addresses[i]);
+  }
+
+  pressureSensorType = PRESSURE_SENSOR_NONE;
+  Serial.println("Pressure sensor init failed on addr 0x76/0x77");
+  return false;
+}
+
+// BMP280使用時の温湿度取得用にAHT20を初期化する
+bool initializeAht20ForGnssModule() {
+  if (aht20.begin(&Wire)) {
+    Serial.println("AHT20 initialized");
+    return true;
+  }
+
+  Serial.println("AHT20 init failed");
+  return false;
+}
+
 //==================== setup() =====================
 void setup() {
   // M5初期化
@@ -676,9 +1394,37 @@ void setup() {
   
   // デバッグ用Serial
   Serial.begin(115200);
-  // ECU, GNSS初期化
+
+  // 気圧センサー初期化（BMP280/BME280を自動判別）
+  if (initializePressureSensorForGnssModule()) {
+    if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+      bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                         Adafruit_BMP280::SAMPLING_X2,
+                         Adafruit_BMP280::SAMPLING_X16,
+                         Adafruit_BMP280::FILTER_X16,
+                         Adafruit_BMP280::STANDBY_MS_500);
+    } else if (pressureSensorType == PRESSURE_SENSOR_BME280) {
+      bme280.setSampling(Adafruit_BME280::MODE_NORMAL,
+                         Adafruit_BME280::SAMPLING_X2,
+                         Adafruit_BME280::SAMPLING_X16,
+                         Adafruit_BME280::SAMPLING_X1,
+                         Adafruit_BME280::FILTER_X16,
+                         Adafruit_BME280::STANDBY_MS_500);
+    }
+    isBmx280Ready = true;
+    if (pressureSensorType == PRESSURE_SENSOR_BMP280) {
+      isAht20Ready = initializeAht20ForGnssModule();
+    }
+  }
+  updateEnvironmentSensors();
+
+  // ECU初期化
   Serial1.begin(115200, SERIAL_8N1, 27, 19);
-  Serial2.begin(115200);  
+  Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
+  
+  // GNSS初期化
+  Serial2.begin(gnss_bps);
+
   // BLE初期化
   #if USE_HARDWARE_BLE
     SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
@@ -692,6 +1438,7 @@ void setup() {
   lcd.setRotation(1);
   lcd.setBrightness(128);
   lcd.fillScreen(TFT_BLACK);
+  // TLS接続時のヒープ確保余裕を増やすため、スプライトを4bitへ縮小
   lcd_s.setColorDepth(8);
   lcd_s.createSprite(lcd.width(), lcd.height());
   lcd.setFont(&fonts::lgfxJapanGothicP_20);
@@ -782,107 +1529,162 @@ void setup() {
       lcd.drawString("Wi-Fi無効", lcd.width()/2, lcd.height()/2);
     }
   }
+
+  if (isWifiConfigSucceeded) {
+    // ESP32の省電力動作でTLS受信が不安定になることがあるため無効化する
+    WiFi.setSleep(false);
+    Serial.println("WiFi modem sleep disabled");
+  }
   
   // Ambient設定
   if (ambientpush && isWifiConfigSucceeded) {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     sprintf(devKey, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client)) {
+    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
       Serial.printf("Cannot get channelId for device %s\n", devKey);
-      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &client)) {
+      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
         M5.update();
         delay(500);
       }
     }
-    ambient.begin(channelId, writeKey, &client);
+    ambient.begin(channelId, writeKey, &ambientClient);
   }
   
   // MQTT設定
   if (MQTTpush && isWifiConfigSucceeded) {
     mqttclient.setBufferSize(MQTT_BUFFER_SIZE);
-    client.setCACert(AWS_CERT_CA);
-    client.setCertificate(AWS_CERT_CRT);
-    client.setPrivateKey(AWS_CERT_PRIVATE);
+    mqttclient.setSocketTimeout(15);
+    mqttclient.setKeepAlive(60);
+    mqttTlsClient.setCACert(AWS_CERT_CA);
+    mqttTlsClient.setCertificate(AWS_CERT_CRT);
+    mqttTlsClient.setPrivateKey(AWS_CERT_PRIVATE);
     mqttclient.setServer(mqtt_server, mqtt_port);
-    updateMQTT();
   }
   
   // NTP同期（Wi-Fi接続成功時、GPS時刻受信前）
   if (isWifiConfigSucceeded && !ntpSyncDone) {
-    configTime(9 * 3600, 0, "pool.ntp.org");  // JST (UTC+9)
-    Serial.println("NTP sync started");
-    // NTP同期待機（最大10秒）
-    unsigned long ntpStart = millis();
-    while (millis() - ntpStart < 10000) {
-      time_t now = time(nullptr);
-      struct tm* timeinfo = localtime(&now);
-      if (timeinfo->tm_year > 70) {  // 1970年以降になったかチェック
-        ntpSyncDone = true;
-        // TimeLibの時刻を更新（datetime バッファ用）
-        setTime(timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec,
-                timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900);
-        // datetime バッファを更新
-        refreshDatetime(0);
-        Serial.print("NTP sync succeeded: ");
-        Serial.println(asctime(timeinfo));
-        break;
-      }
-      M5.update();
-      delay(100);
-    }
-    if (!ntpSyncDone) {
-      Serial.println("NTP sync timeout");
+    if (!trySyncTimeFromNtp(NTP_SYNC_TIMEOUT_MS)) {
+      nextNtpRetryAt = millis() + NTP_RETRY_INTERVAL_MS;
     }
   }
-  
+
+  // 初回MQTT接続はNTP/GNSSで時刻が確定した後に実行する
+  if (MQTTpush && isWifiConfigSucceeded) {
+    delay(300);
+    updateMQTT();
+  }
+
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
-  Serial.println(F("lat, lon, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Temp"));
+  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Pressure, Temp, Humidity, datetime"));
   
   t_Serial = millis();
   t_SD = millis();
   t_MQTT = millis();
   t_amb = millis();
+  t_alt = millis();
+  t_env = millis();
+  lastSdSyncAt = millis();
 }
 
 //==================== loop() =====================
 void loop() {
   M5.update();
-  
+
+  // NTP初回失敗時の再試行（GNSS未受信環境でも時刻が確定するようにする）
+  if (!ntpSyncDone && MQTTpush && isWifiConfigSucceeded && millis() >= nextNtpRetryAt) {
+    if (trySyncTimeFromNtp(5000UL)) {
+      nextNtpRetryAt = 0;
+    } else {
+      nextNtpRetryAt = millis() + NTP_RETRY_INTERVAL_MS;
+    }
+  }
+
+  // MQTTコネクション維持（PubSubClient推奨: loop()を毎回呼ぶ）
+  if (MQTTpush && mqttclient.connected()) {
+    mqttclient.loop();
+  }
+
   updateBLE();
   updateECU();
   updateGNSS();
+
+  ensureWaypointLoadedForCurrentLoc();
+  if (gps.location.isValid() && waypointCount > 0) {
+    nearestWaypointIndex = findNearestWaypointIndex(la, ln);
+  } else {
+    nearestWaypointIndex = -1;
+  }
+
   updateDisplay();
   
+  // デバッグ用Serial出力
   if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
     updateSerialOutput();
-    t_Serial = millis();
+    t_Serial += SERIAL_OUT_INTERVAL;
+    // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+    if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
+      t_Serial = millis();
+    }
   }
   
+  // SDカードへのログ書き出し
   if (LOGGING && (millis() - t_SD >= SD_LOG_INTERVAL)) {
     updateSDLog();
-    t_SD = millis();
+    t_SD += SD_LOG_INTERVAL;
+    // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+    if (millis() - t_SD >= SD_LOG_INTERVAL) {
+      t_SD = millis();
+    }
   }
   
+  // MQTT送信は頻度を変えて実行（周回開始前は低頻度、周回開始後は高頻度）
+  // Wi-Fi接続が必要なため、接続成功している場合のみ更新する
   if (MQTTpush) {
     if (worktime == 0) {
       if (millis() - t_MQTT >= MQTT_INTERVAL_PRE) {
         updateMQTT();
-        t_MQTT = millis();
+        t_MQTT += MQTT_INTERVAL_PRE;
+        // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+        if (millis() - t_MQTT >= MQTT_INTERVAL_PRE) {
+          t_MQTT = millis();
+        }
       }
     } else {
       if (millis() - t_MQTT >= MQTT_INTERVAL_RUN) {
         updateMQTT();
-        t_MQTT = millis();
+        t_MQTT += MQTT_INTERVAL_RUN;
+        // 長時間ブロック後に連続実行（バースト）しないよう再同期する
+        if (millis() - t_MQTT >= MQTT_INTERVAL_RUN) {
+          t_MQTT = millis();
+        }
       }
     }
   }
   
+  // AmbientはWi-Fi接続が必要なため、接続成功している場合のみ更新する
   if (ambientpush && (millis() - t_amb >= AMBIENT_INTERVAL)) {
     updateAmbient();
-    t_amb = millis();
+    t_amb += AMBIENT_INTERVAL;
   }
   
+  // 高度更新はBMP280/BME280が正常に初期化されている場合のみ実行する
+  if (millis() - t_alt >= ALTITUDE_INTERVAL) {
+    updateAltitudeFromBmx280();
+    t_alt += ALTITUDE_INTERVAL;
+  }
+  // 環境センサー更新はBMP280/BME280のいずれかが正常に初期化されている場合のみ実行する
+  if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
+    updateEnvironmentSensors();
+    t_env += ENV_SENSOR_INTERVAL;
+    if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
+      t_env = millis();
+    }
+  }
+
+  // 国土地理院API呼び出しはBMP280/BME280接続時のみ低頻度で実行し、成功したら以後実行しない
+  if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
+
   delay(10);
 }

@@ -4,7 +4,10 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 - ECU からの走行データ取得 (Serial1)
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
+- 高度推定 (BME280を用いた気圧→高度換算)
+- インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
 - BLE 経由のエンジン温度受信 (SoftwareSerial or HardwareSerial)
+- BME280を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
 - LCD (M5Unified + LovyanGFX) への複数モード表示
@@ -12,10 +15,13 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 ## 主な機能概要
 
 | 機能 | 内容 |
-|------|------|
+| ---- | ---- |
 | 周回/距離管理 | 位置範囲からサーキット判定 (鈴鹿/茂木/その他) と周回数・走行時間計算 |
-| 表示モード切替 | Aボタン=`モード 0` 回転数/噴射時間/進角(セッティング向け)<BR>Bボタン=`モード 1` 速度/残周回/走行時間(デフォルト)<BR>Cボタン=`モード 2` 速度/回転数/燃費(燃費確認用) |
+| 表示モード切替 | Bボタン=`モード 0` 速度/残周回/走行時間(デフォルト)<BR>Aボタン=`モード 1` 回転数/噴射時間/進角(セッティング向け)<BR>Cボタン=`モード 2` 走行ルート標高グラフ + 現在地標高プロット |
+| ウェイポイント標高グラフ | `sd`ディレクトリのウェイポイントCSV (`suzuka_waypoint.csv` / `motegi_waypoint.csv` / `toyota_waypoint.csv`) を読み込み、横軸=ウェイポイントID、縦軸=標高で表示。現在地の緯度経度を最も近いIDへ割り当てて標高を重ねて表示 |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
+| 高度推定 | BME280 気圧から高度推定 (標準大気式) |
+| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、BME280高度との差分でオフセット補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
 | Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値除外<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
@@ -25,8 +31,10 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - 基板: M5Stack Core2 (ESP32, PSRAM 使用)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
-- GNSS: Serial2 115200 bps (標準ピン, モジュール仕様に合わせて接続)
-- BLE 温度センサ: RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可)
+- GNSS: Serial2 115200 bps (RX=13, TX=14)
+- BME280(気圧/気温/湿度センサ) / BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22
+  - 運用注記: M5Core2のI2C 0x38はタッチセンサと競合するため、AHT20は使用しない
+- BLE 温度センサ: M5Core2 PortA RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可 M5Stack Basicには32,33ピンが存在しないため使用不可)
 - ボタン: A/B/C でモード選択 + 起動時設定
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
@@ -40,6 +48,8 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - [EspSoftwareSerial](https://github.com/plerup/espsoftwareserial)
 - [SdFat](https://github.com/greiman/SdFat)
 - [WiFiManager](https://github.com/tzapu/WiFiManager) (同梱ライブラリ `lib/WiFiManager`)
+- [Adafruit BME280 Library](https://github.com/adafruit/Adafruit_BME280_Library)
+- [Adafruit Unified Sensor](https://github.com/adafruit/Adafruit_Sensor)
 
 ## ビルド & 実行 (PlatformIO)
 
@@ -51,13 +61,22 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 ### デバッグ
 
-- シリアル出力: CSV形式 `lat,lon,loc,Spd_GPS,rpm,Spd_PULSE,distance,gasml,dispergas,worktime,Temp`
+- シリアル出力: CSV形式 `lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, EngTemp, Pressure, Temp, Humidity, datetime`
 - 例外デコード: `monitor_filters = esp32_exception_decoder`
+
+## 高度推定 / 国土地理院API補正
+
+- 高度は GNSS ではなく BME280 の気圧から算出
+- 海面気圧は初期値 `101.325kPa` を使用
+- Wi-Fi接続済みかつGNSS座標が有効なときのみ、国土地理院API (`getelevation.php`) で標高取得を低頻度で試行
+- 標高取得成功時、その時点のBME280生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
+- 以後の表示/ログ高度は `BME280生高度 + オフセット` で算出
+- API取得は HTTPS を優先し、失敗時は HTTP フォールバック
 
 ## 起動時の Wi-Fi 操作
 
 | 操作 | 説明 |
-|------|------|
+| ---- | ---- |
 | A ボタン | Wi-Fi 設定ポータル (AP モード, QR コードで簡易接続) |
 | C ボタン | Wi-Fi 無効 (Ambient / MQTT も無効) |
 | 無操作 (5秒) | 自動接続 (保存済 SSID) / 失敗時は接続先SSIDを設定するWebUIへのQRコードを表示 |
@@ -66,16 +85,95 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 1. モード 0: 速度, 残り周回 (最後は G/FINISH), 走行時間進行バー
 2. モード 1: 回転数, 噴射時間, 進角角度バー
-3. モード 2: 速度, 回転数, 燃費 (距離/燃料) バー
+3. モード 2: 走行ルートの標高グラフ（ウェイポイントID基準）と現在地標高を重ねて表示
+
+### モード2(標高グラフ)の仕様
+
+- サーキット判定 (`Loc`: su / mo / to) に応じて対応CSVを自動読み込み
+- 現在地の緯度経度をもとに、ウェイポイントの最近傍IDを算出
+- グラフ内に「ルート標高」と「現在地標高」を同時プロット
+- 右端と左端は接続せず、先頭IDから末尾IDまでを表示
+
+### モード2(標高グラフ)の画面例
+
+<p align="center" width="100%">
+<video src="https://github.com/user-attachments/assets/a7fdfc0b-4c62-4426-a9e1-d857ddd0c710" width="100%" controls></video>
+</p>
+
+- 水色線: ウェイポイントファイルの標高プロファイル
+- 黄色点: 最近傍ウェイポイントIDの標高
+- 赤色点: 現在地標高
+- 下部テキスト: `WP:現在ID/総ポイント数 route:ルート標高 now:現在地標高`
 
 ## ログファイル仕様 (SD)
 
-ヘッダ: `記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,温度`
+ヘッダ: `記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度`
 
 - 記録日時: GNSS + JST補正 (`YYYY/M/D hh:mm:ss.cc`)
+- `alt`: EKF 融合高度
+- `loc`: サーキット判定結果 (`su` / `mo` / `to`)
 - 走行時間: ECU送信の積算秒
 - 燃費: コード中 `dispergas` (km/L 指定の閾値 2000 スケールバー)
 - タイムスタンプは `logFile.timestamp()` によりファイル更新時にも設定
+- SD書き込みはファイルを開きっぱなしで運用し、定期 `sync()` で書き込み確定  
+  （電源切では`sync()`実行済みのログを残す）
+
+## 高度推定仕様
+
+- 実装ファイル:
+  - `include/AltitudeEKF.h`: 気圧→高度変換と2状態EKF本体
+  - `src/main.cpp`: BME280ドライバ、国土地理院GSI API取得、センサ融合ロジック
+- 融合の流れ（1ループ）:
+  1. IMU の Y軸加速度から重力成分を除去して予測ステップ
+  2. BME280 気圧高度で更新（高頻度）
+  3. 絶対高度で更新（`GSI標高API` 優先、失敗時は `GNSS高度`）
+- 絶対高度ソース:
+  - Wi-Fi接続かつ位置有効時は国土地理院APIを約10秒周期で取得
+  - API取得は HTTP 優先、HTTP失敗時に HTTPS へフォールバック
+  - API取得失敗時はGNSS高度を使用（自動フォールバック）
+- ドリフト抑制（実装済）:
+  - 低速時 (`LOW_SPEED_FREEZE_KMPH`) はIMU鉛直加速度の寄与を凍結
+  - 小加速度はデッドバンド (`ALT_ACCEL_DEADBAND`) で無効化
+  - GSI更新間隔中も保持観測 (`R_GSI_HOLD`) を入れて絶対高度を維持
+  - GSIから大きく外れた場合は強制再ロック (`GSI_HARD_GATE_M`, `R_GSI_HARD`)
+- 現在の実走向け初期パラメータ（`src/main.cpp`）:
+  - `R_BARO = 0.36`
+  - `R_BARO_WITH_ABS = 4.0`
+  - `R_GSI = 4.0`
+  - `R_GSI_HOLD = 9.0`
+  - `R_GSI_HARD = 0.25`
+  - `R_GNSS = 36.0`
+  - `EKF_PROCESS_SIGMA_A = 1.2`
+  - `ALT_ACCEL_DEADBAND = 0.35`
+  - `LOW_SPEED_FREEZE_KMPH = 3.0`
+  - `GSI_HARD_GATE_M = 3.0`
+
+## 実装ログを使ったチューニング手順
+
+条件: 屋根なし野外、地表上の水平移動、速度 1.0-80 km/h。
+
+1. ログを取得する
+2. 1セットを最低3区間で構成する: 停止1分、40km/h巡航1分、80km/h巡航1分
+3. 監視するログ列を固定する: `alt`（融合高度）、`Spd_PULSE`、`lat/lon`、`worktime`
+4. まず `R_BARO` を調整する
+5. 停止区間の `alt` の短周期揺れが大きい場合は `R_BARO` を上げる
+6. 速度変化時の追従が遅い場合は `R_BARO` を下げる
+7. 次に `EKF_PROCESS_SIGMA_A` を調整する
+8. 路面振動で `alt` が過敏に上下する場合は `EKF_PROCESS_SIGMA_A` を上げる
+9. 加減速イベントで高度の位相遅れが大きい場合は `EKF_PROCESS_SIGMA_A` を下げる
+10. 最後に `R_GNSS` を調整する
+11. 絶対高度更新タイミングで段差が出る場合は `R_GNSS` を上げる
+12. 長時間で絶対高度からずれる場合は `R_GNSS` を下げる
+13. 変更は1項目ずつ行う（推奨刻み: `R_BARO ±0.05-0.1`, `R_GNSS ±4-8`, `SIGMA_A ±0.1-0.2`）
+14. 3区間ログを再取得し、同じ指標で比較する
+
+### 目安（実走スタート値）
+
+| パラメータ | 現在値 | 変更の方向 |
+| --- | ---: | --- |
+| `R_BARO` | `0.36` | 揺れ大: 上げる / 追従遅い: 下げる |
+| `R_GNSS` | `36.0` | 段差大: 上げる / 長期ずれ: 下げる |
+| `EKF_PROCESS_SIGMA_A` | `1.2` | 振動過敏: 上げる / 応答遅い: 下げる |
 
 ## MQTT 送信仕様
 
@@ -101,6 +199,7 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
   "dispergas": 21.3,
   "lat": 34.1234567,
   "lon": 136.1234567,
+  "alt": 123.4,
   "loc": "su",
   "temp": 92.5
 }
@@ -155,20 +254,28 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 ## トラブルシュート
 
 | 症状 | 対処 |
-|------|------|
+| ---- | ---- |
 | SD init failed | FAT/exFAT フォーマット <BR> SPI 接続確認, 遅延を長くする検討 |
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
+| MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
 | 温度 0.0 固定 | BLE センサ未送信 or タイムアウト <BR>  (>10s でリセット) |
+| `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
+
+### MQTT 診断ログ運用
+
+- 本番運用では `src/main.cpp` の `MQTT_DIAGNOSTIC_LOG` を `0` のまま使用 (既定)
+- AWS IoT接続トラブルの切り分け時のみ `1` に変更して再ビルド
+- 診断で確認する主なログ: `MQTT TLS lastError`, `MQTT DNS`, `MQTT diag TCP/TLS(insecure)`, `heap/minHeap/maxAlloc`
 
 ## 既知の課題 (改善予定)
 
-1. SD カード初期化: 挿入済でも最大 3 秒待機しているため、`sd.begin()` 成功時に即時ブレークし後続処理へ進むよう最適化する
+1. 電源断耐性: 開きっぱなし運用のため、電源断時は最後の `sync()` 以降の数秒分が欠損する可能性がある
 2. BLE 温度欠損: SoftwareSerial 経由で温度値の欠損が発生。対策として FreeRTOS タスク分離 / HardwareSerial への移行 / リングバッファ導入を検討
 
 ## 次ステップ (改善案)
 
-- GNSS 高度 (altitude) の取得と JSON / SD ログへの追加
+- 停止操作で `sync/close` を明示実行する安全停止フローの追加
 - 速度(`Spd_PULSE`)を 0.1 km/h 単位で記録・送信 (必要ならスケール変更)
 - GNSS 日付処理の簡素化 (標準ライブラリ活用)
 - 証明書有効期限チェック機能
