@@ -12,6 +12,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
+#include <string.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_AHTX0.h>
@@ -28,8 +29,8 @@
 #define USE_HARDWARE_BLE 0
 
 // 各タスクの更新間隔（ミリ秒）
-#define SERIAL_OUT_INTERVAL 1000
-#define SD_LOG_INTERVAL     1000
+#define SERIAL_OUT_INTERVAL 100
+#define SD_LOG_INTERVAL     100
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define MQTT_RECONNECT_BASE_INTERVAL 5000UL
@@ -37,10 +38,18 @@
 #define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
 #define ENV_SENSOR_INTERVAL 1000
+#define DISPLAY_INTERVAL    100
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
-#define GNSS_PARSE_BUDGET_BYTES 256
+#define GNSS_PARSE_BUDGET_BYTES 512
 #define BMX280_I2C_SDA 21
 #define BMX280_I2C_SCL 22
+#define BLE_BUFFER_SIZE 16
+#define ECU_LINE_BUFFER_SIZE 128
+#define SD_LINE_BUFFER_SIZE 256
+#define SD_BATCH_BUFFER_SIZE 1024
+#define SD_SYNC_LINE_THRESHOLD 40
+#define SD_SYNC_TIME_MS 5000UL
+#define LOG_PREALLOC_BYTES (2UL * 1024UL * 1024UL)
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -100,8 +109,11 @@ unsigned long t_MQTT   = 0;
 unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
 unsigned long t_env    = 0;
+unsigned long t_display = 0;
 unsigned long lastSdSyncAt = 0;
 uint16_t sdLinesSinceSync = 0;
+char sdBatchBuffer[SD_BATCH_BUFFER_SIZE];
+size_t sdBatchLen = 0;
 
 // シリアル（ECU, GNSS, BLE）
 unsigned long receiveECUtime = 0;
@@ -548,13 +560,14 @@ bool isBLEValueChar(char c)
 }
 
 // BLEから受信した文字列が有効な温度データかどうかを判定し変換する
-bool tryParseBLETemperature(const String& raw, float& outTemp) {
-  if (raw.length() == 0) {                      // 空文字は無効
+bool tryParseBLETemperature(const char* raw, float& outTemp) {
+  if (raw == nullptr || raw[0] == '\0') {      // 空文字は無効
     return false;
   }
 
   bool hasDigit = false;
-  for (size_t i = 0; i < raw.length(); i++) {   // 有効な文字以外が混入していないかチェック
+  size_t rawLen = strlen(raw);
+  for (size_t i = 0; i < rawLen; i++) {         // 有効な文字以外が混入していないかチェック
     char c = raw[i];
     if (isBLEValueChar(c)) {                      // 有効な文字の場合は数字が含まれているかもチェック
       if (c >= '0' && c <= '9') {
@@ -573,8 +586,8 @@ bool tryParseBLETemperature(const String& raw, float& outTemp) {
   }
 
   char* endPtr = nullptr;                       // 変換後の文字列の末尾を指すポインタ
-  float parsed = strtof(raw.c_str(), &endPtr);  // 文字列をfloatに変換
-  if (endPtr == raw.c_str()) {                  // 変換できなかった場合は無効
+  float parsed = strtof(raw, &endPtr);          // 文字列をfloatに変換
+  if (endPtr == raw) {                          // 変換できなかった場合は無効
     return false;
   }
   while (*endPtr != '\0') {                     // 変換後の文字列の末尾以降に有効な文字が混入していないかチェック
@@ -589,37 +602,89 @@ bool tryParseBLETemperature(const String& raw, float& outTemp) {
 }
 
 // BLEから受信した文字列を処理してエンジン温度に変換する
-void processBLEPayload(String& payload, bool timeoutPath) { 
-  while (payload.length() > 0 && (payload[payload.length() - 1] == '\n' || payload[payload.length() - 1] == '\r')) {  // 末尾の改行コードを削除
-    payload.remove(payload.length() - 1);   // これにより、改行コードが複数重なっている場合でもすべて削除される
+void processBLEPayload(char* payload, bool timeoutPath) {
+  if (payload == nullptr) {
+    return;
   }
-  payload.trim();                         // 前後の空白を削除
-  if (payload.length() == 0) {
+
+  // 前後の空白と改行を削除
+  size_t len = strlen(payload);
+  while (len > 0 && (payload[len - 1] == '\n' || payload[len - 1] == '\r' || payload[len - 1] == ' ' || payload[len - 1] == '\t')) {
+    payload[len - 1] = '\0';
+    len--;
+  }
+  size_t start = 0;
+  while (payload[start] == ' ' || payload[start] == '\t' || payload[start] == '\n' || payload[start] == '\r') {
+    start++;
+  }
+  if (start > 0) {
+    memmove(payload, payload + start, strlen(payload + start) + 1);
+  }
+
+  if (payload[0] == '\0') {
     return;
   }
 
   float tempValue = 0.0;                  // 変換後の温度値を格納する変数
   if (!tryParseBLETemperature(payload, tempValue)) {  // 文字列が有効な温度データでない場合はエラーとして処理
-    payload = "";
+    payload[0] = '\0';
     return;
   }
 
   if (tempValue >= 10.0 && tempValue <= 150.0) {  // 有効な温度範囲内かチェック
     EngTemp = tempValue;                          // グローバル変数にエンジン温度を保存
     if (timeoutPath) {                            // タイムアウト経路で受信したデータはログに残す
-      Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);  // タイムアウト経路で受信したデータはログに残す（SDカードに記録されるため）
+      Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", payload, EngTemp);  // タイムアウト経路で受信したデータはログに残す（SDカードに記録されるため）
     } else {
-      Serial.printf("[BLE] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);          // 通常経路で受信したデータはログに残さない（SDカードに記録されるため）
+      Serial.printf("[BLE] RX: %s -> %.2f°C\n", payload, EngTemp);          // 通常経路で受信したデータはログに残さない（SDカードに記録されるため）
     }
   } else {
     if (timeoutPath) {
-      Serial.printf("[BLE TIMEOUT] OUT OF RANGE: %s -> %.2f\n", payload.c_str(), tempValue);
+      Serial.printf("[BLE TIMEOUT] OUT OF RANGE: %s -> %.2f\n", payload, tempValue);
     } else {
-      Serial.printf("[BLE] OUT OF RANGE: %s -> %.2f\n", payload.c_str(), tempValue);
+      Serial.printf("[BLE] OUT OF RANGE: %s -> %.2f\n", payload, tempValue);
     }
   }
 
-  payload = "";
+  payload[0] = '\0';
+}
+
+// ECU 1行CSVをパースする（期待フォーマット: 8項目）
+bool tryParseEcuCsvLine(char* line) {
+  if (line == nullptr || line[0] == '\0') {
+    return false;
+  }
+
+  uint8_t index = 0;
+  char* savePtr = nullptr;
+  char* token = strtok_r(line, ",", &savePtr);
+  while (token != nullptr && index < 8) {
+    while (*token == ' ' || *token == '\t') {
+      token++;
+    }
+
+    switch (index) {
+      case 0: tachoRpm = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 1: INJ_timems = strtof(token, nullptr); break;
+      case 2: IGN_CA = static_cast<uint8_t>(strtoul(token, nullptr, 10)); break;
+      case 3: speed = strtof(token, nullptr); break;
+      case 4: distance = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 5: gasml = strtof(token, nullptr); break;
+      case 6: dispergas = strtof(token, nullptr); break;
+      case 7: worktime = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      default: break;
+    }
+
+    index++;
+    token = strtok_r(nullptr, ",", &savePtr);
+  }
+
+  if (index < 8) {
+    return false;
+  }
+
+  Lapcount = distance / max(static_cast<uint16_t>(1), static_cast<uint16_t>(goal / totallaps));
+  return true;
 }
 
 // 次回ログ番号の読み込み（起動時の採番高速化用）
@@ -655,7 +720,8 @@ void saveNextLogIndex(int nextIndex) {
 
 // BLEからのデータ読み取り（バッファ＋タイムアウト処理）
 void updateBLE() {
-  static String bleBuffer = "";
+  static char bleBuffer[BLE_BUFFER_SIZE] = {0};
+  static uint8_t bleLen = 0;
   static unsigned long lastBLETime = 0;
   
   while (SerialBLE.available() > 0) {
@@ -664,6 +730,7 @@ void updateBLE() {
 
     if (c == '\n') {
       processBLEPayload(bleBuffer, false);
+      bleLen = 0;
       continue;
     }
 
@@ -672,52 +739,66 @@ void updateBLE() {
     }
 
     if (isBLEValueChar(c)) {
-      bleBuffer += c;
-      if (bleBuffer.length() > 15) {
-        bleBuffer = "";
+      if (bleLen < (BLE_BUFFER_SIZE - 1)) {
+        bleBuffer[bleLen++] = c;
+        bleBuffer[bleLen] = '\0';
+      } else {
+        bleLen = 0;
+        bleBuffer[0] = '\0';
       }
     }
   }
 
   // 不完全なデータの部分タイムアウト処理(100ミリ秒以上経過)
-  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {
+  if (millis() - lastBLETime > 100 && bleLen > 0) {
     processBLEPayload(bleBuffer, true);
+    bleLen = 0;
   }
   // データ受信完全ロス時のリセット処理(2秒以上経過)
   if (millis() - lastBLETime > 2000) {
     EngTemp = 0.0;  // エンジン温度をリセット
-    bleBuffer = "";
+    bleLen = 0;
+    bleBuffer[0] = '\0';
   }
 }
 
 // ECUからのデータ読み取り
 void updateECU() {
-  if (Serial1.available()) {
+  static char ecuLine[ECU_LINE_BUFFER_SIZE] = {0};
+  static uint8_t ecuLen = 0;
+
+  while (Serial1.available() > 0) {
+    char ch = Serial1.read();
     receiveECUtime = millis();
-    String str = Serial1.readStringUntil('\n');
-    str.trim();
-    for (uint8_t i = 0; i < 8; i++) {
-      int commaIndex = str.indexOf(",");
-      String data = str.substring(0, commaIndex);
-      data.trim();
-      str = str.substring(commaIndex + 1);
-      if (i == 0) { tachoRpm = data.toInt(); }
-      if (i == 1) { INJ_timems = data.toFloat(); }
-      if (i == 2) { IGN_CA = data.toInt(); }
-      if (i == 3) { speed = data.toFloat(); }
-      if (i == 4) { distance = data.toInt(); }
-      if (i == 5) { gasml = data.toFloat(); }
-      if (i == 6) { dispergas = data.toFloat(); }
-      if (i == 7) { worktime = data.toInt(); }
+
+    if (ch == '\r') {
+      continue;
     }
-    Lapcount = distance / (goal / totallaps);
-  } else {
-    if (millis() - receiveECUtime > 2000) {
-      tachoRpm = 0;
-      INJ_timems = 0;
-      IGN_CA = 0;
-      speed = 0.0;
+
+    if (ch == '\n') {
+      ecuLine[ecuLen] = '\0';
+      if (ecuLen > 0) {
+        tryParseEcuCsvLine(ecuLine);
+      }
+      ecuLen = 0;
+      ecuLine[0] = '\0';
+      continue;
     }
+
+    if (ecuLen < (ECU_LINE_BUFFER_SIZE - 1)) {
+      ecuLine[ecuLen++] = ch;
+      ecuLine[ecuLen] = '\0';
+    } else {
+      ecuLen = 0;
+      ecuLine[0] = '\0';
+    }
+  }
+
+  if (millis() - receiveECUtime > 2000) {
+    tachoRpm = 0;
+    INJ_timems = 0;
+    IGN_CA = 0;
+    speed = 0.0;
   }
 }
 
@@ -1111,10 +1192,33 @@ void updateSerialOutput() {
   Serial.print(dispergas, 1); Serial.print(",");
   Serial.print(worktime); Serial.print(",");
   Serial.print(EngTemp, 2); Serial.print(",");
-  Serial.print(isfinite(envPressureKPa) ? String(envPressureKPa, 3) : ""); Serial.print(",");
-  Serial.print(isfinite(envTemperatureC) ? String(envTemperatureC, 2) : ""); Serial.print(",");
-  Serial.print(isfinite(envHumidityPct) ? String(envHumidityPct, 1) : ""); Serial.print(",");
+  if (isfinite(envPressureKPa)) { Serial.print(envPressureKPa, 3); }
+  Serial.print(",");
+  if (isfinite(envTemperatureC)) { Serial.print(envTemperatureC, 2); }
+  Serial.print(",");
+  if (isfinite(envHumidityPct)) { Serial.print(envHumidityPct, 1); }
+  Serial.print(",");
   Serial.println(datetime);
+}
+
+// SDバッチをフラッシュする（必要時のみsync）
+void flushSdBatch(bool doSync) {
+  if (!logFile || sdBatchLen == 0) {
+    return;
+  }
+
+  size_t written = logFile.write(reinterpret_cast<const uint8_t*>(sdBatchBuffer), sdBatchLen);
+  if (written != sdBatchLen) {
+    Serial.printf("SD batch write short: %u/%u\n", static_cast<unsigned int>(written), static_cast<unsigned int>(sdBatchLen));
+  }
+  sdBatchLen = 0;
+
+  if (doSync) {
+    logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
+    logFile.sync();
+    sdLinesSinceSync = 0;
+    lastSdSyncAt = millis();
+  }
 }
 
 // SDカードへのログ書き出し
@@ -1133,6 +1237,9 @@ void updateSDLog() {
   if (logFile) {
     if (!logFileInitialized) {
       if (isNewFile) {
+        if (!logFile.preAllocate(LOG_PREALLOC_BYTES)) {
+          Serial.println("SD preAllocate skipped");
+        }
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
         logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%)"));
@@ -1141,33 +1248,49 @@ void updateSDLog() {
       logFileInitialized = true;
     }
 
-    logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
-    logFile.print(datetime); logFile.print(",");
-    logFile.print(speed, 1);    logFile.print(",");
-    logFile.print(Lapcount); logFile.print(",");
-    logFile.print(worktime); logFile.print(",");
-    logFile.print(tachoRpm); logFile.print(",");
-    logFile.print(distance, 1); logFile.print(",");
-    logFile.print(gasml, 1);   logFile.print(",");
-    logFile.print(dispergas, 1); logFile.print(",");
-    logFile.print(la, 7);      logFile.print(",");
-    logFile.print(ln, 7);      logFile.print(",");
-    logFile.print(alt, 1);     logFile.print(",");
-    logFile.print(Loc);        logFile.print(",");
-    logFile.print(EngTemp, 2); logFile.print(",");
-    if (isfinite(envPressureKPa)) { logFile.print(envPressureKPa, 3); }
-    logFile.print(",");
-    if (isfinite(envTemperatureC)) { logFile.print(envTemperatureC, 2); }
-    logFile.print(",");
-    if (isfinite(envHumidityPct)) { logFile.print(envHumidityPct, 1); }
-    logFile.println();
+    char pressureStr[16] = {0};
+    char tempStr[16] = {0};
+    char humStr[16] = {0};
+    if (isfinite(envPressureKPa)) { dtostrf(envPressureKPa, 0, 3, pressureStr); }
+    if (isfinite(envTemperatureC)) { dtostrf(envTemperatureC, 0, 2, tempStr); }
+    if (isfinite(envHumidityPct)) { dtostrf(envHumidityPct, 0, 1, humStr); }
 
-    // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
+    char logLine[SD_LINE_BUFFER_SIZE] = {0};
+    int lineLen = snprintf(logLine,
+                           sizeof(logLine),
+                           "%s,%.1f,%u,%u,%u,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s\n",
+                           datetime,
+                           speed,
+                           static_cast<unsigned int>(Lapcount),
+                           static_cast<unsigned int>(worktime),
+                           static_cast<unsigned int>(tachoRpm),
+                           static_cast<unsigned int>(distance),
+                           gasml,
+                           dispergas,
+                           la,
+                           ln,
+                           alt,
+                           Loc.c_str(),
+                           EngTemp,
+                           pressureStr,
+                           tempStr,
+                           humStr);
+
+    if (lineLen <= 0 || lineLen >= static_cast<int>(sizeof(logLine))) {
+      Serial.println("SD log line build failed");
+      return;
+    }
+
+    if (sdBatchLen + static_cast<size_t>(lineLen) > SD_BATCH_BUFFER_SIZE) {
+      flushSdBatch(false);
+    }
+    memcpy(sdBatchBuffer + sdBatchLen, logLine, static_cast<size_t>(lineLen));
+    sdBatchLen += static_cast<size_t>(lineLen);
+
+    // 一定行数または一定時間でのみsyncして負荷を下げる
     sdLinesSinceSync++;
-    if (sdLinesSinceSync >= 5 || (millis() - lastSdSyncAt) >= 5000UL) {
-      logFile.sync();
-      sdLinesSinceSync = 0;
-      lastSdSyncAt = millis();
+    if (sdLinesSinceSync >= SD_SYNC_LINE_THRESHOLD || (millis() - lastSdSyncAt) >= SD_SYNC_TIME_MS) {
+      flushSdBatch(true);
     }
   } else {
     Serial.println("SD Log open failed!");
@@ -1585,6 +1708,7 @@ void setup() {
   t_amb = millis();
   t_alt = millis();
   t_env = millis();
+  t_display = millis();
   lastSdSyncAt = millis();
 }
 
@@ -1617,7 +1741,13 @@ void loop() {
     nearestWaypointIndex = -1;
   }
 
-  updateDisplay();
+  if (millis() - t_display >= DISPLAY_INTERVAL) {
+    updateDisplay();
+    t_display += DISPLAY_INTERVAL;
+    if (millis() - t_display >= DISPLAY_INTERVAL) {
+      t_display = millis();
+    }
+  }
   
   // デバッグ用Serial出力
   if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
@@ -1686,5 +1816,5 @@ void loop() {
   // 国土地理院API呼び出しはBMP280/BME280接続時のみ低頻度で実行し、成功したら以後実行しない
   if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
 
-  delay(10);
+  delay(1);
 }
