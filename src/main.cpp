@@ -22,10 +22,20 @@
 #define SD_SPI_SPEED SD_SCK_MHZ(25)
 #define SD_CONFIG SdSpiConfig(GPIO_NUM_4, SHARED_SPI, SD_SPI_SPEED)
   
-// BLE用ピンと利用モード（1: ハードウェアUART使用; 0: SoftwareSerial使用）
-#define BLE_RX_PIN 32
-#define BLE_TX_PIN 33
-#define USE_HARDWARE_BLE 0
+// BLE中継機(M5NanoC6)とのI2C通信仕様（NanoC6側がI2Cスレーブ, addr=0x08で動作）
+#if defined(ARDUINO_M5STACK_Core2)    // NanoC6(BLE中継機)接続用Port AのI2Cピン（M5Stack Core2）
+constexpr uint8_t BLE_I2C_SDA = 32;
+constexpr uint8_t BLE_I2C_SCL = 33;
+#elif defined(ARDUINO_M5Stack_Core_ESP32)   // NanoC6(BLE中継機)接続用Port AのI2Cピン（M5Stack Basic 気圧センサー用Wireバスと同一ピン）
+constexpr uint8_t BLE_I2C_SDA = 21;
+constexpr uint8_t BLE_I2C_SCL = 22;
+#else
+#error "Unsupported board: BLE_I2C_SDA/SCL is not defined for this target"
+#endif
+#define BLE_I2C_SLAVE_ADDR 0x08
+#define BLE_I2C_FRAME_SIZE 32
+#define BLE_I2C_CMD_ENGINE_TEMP 0x01
+#define BLE_I2C_POLL_INTERVAL 200  // NanoC6への要求間隔（ミリ秒）
 
 // 各タスクの更新間隔（ミリ秒）
 #define SERIAL_OUT_INTERVAL 1000
@@ -103,14 +113,16 @@ unsigned long t_env    = 0;
 unsigned long lastSdSyncAt = 0;
 uint16_t sdLinesSinceSync = 0;
 
-// シリアル（ECU, GNSS, BLE）
+// シリアル（ECU, GNSS）
 unsigned long receiveECUtime = 0;
-#if USE_HARDWARE_BLE
-// BLE通信にハードウェアUARTを使う場合（※UART0: Serialはデバッグ用なので避ける）
-HardwareSerial SerialBLE(2);  // ※環境に応じてUART番号とピンを再設定
+
+// BLE中継機(NanoC6)用I2Cバスの選択
+// Port AのSDA/SCLが気圧センサー用Wireバス(BMX280_I2C_SDA/SCL)と同一ピンの機種（M5Stack Basic）は
+// Wireバスを共用し、異なる機種（M5Stack Core2）は専用バスWire1を使う
+#if BLE_I2C_SDA == BMX280_I2C_SDA && BLE_I2C_SCL == BMX280_I2C_SCL
+  #define BleI2C Wire
 #else
-#include <SoftwareSerial.h>
-SoftwareSerial SerialBLE(BLE_RX_PIN, BLE_TX_PIN);
+  #define BleI2C Wire1
 #endif
 
 // ECU受信データ
@@ -588,40 +600,6 @@ bool tryParseBLETemperature(const String& raw, float& outTemp) {
   return true;
 }
 
-// BLEから受信した文字列を処理してエンジン温度に変換する
-void processBLEPayload(String& payload, bool timeoutPath) { 
-  while (payload.length() > 0 && (payload[payload.length() - 1] == '\n' || payload[payload.length() - 1] == '\r')) {  // 末尾の改行コードを削除
-    payload.remove(payload.length() - 1);   // これにより、改行コードが複数重なっている場合でもすべて削除される
-  }
-  payload.trim();                         // 前後の空白を削除
-  if (payload.length() == 0) {
-    return;
-  }
-
-  float tempValue = 0.0;                  // 変換後の温度値を格納する変数
-  if (!tryParseBLETemperature(payload, tempValue)) {  // 文字列が有効な温度データでない場合はエラーとして処理
-    payload = "";
-    return;
-  }
-
-  if (tempValue >= 10.0 && tempValue <= 150.0) {  // 有効な温度範囲内かチェック
-    EngTemp = tempValue;                          // グローバル変数にエンジン温度を保存
-    if (timeoutPath) {                            // タイムアウト経路で受信したデータはログに残す
-      Serial.printf("[BLE TIMEOUT] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);  // タイムアウト経路で受信したデータはログに残す（SDカードに記録されるため）
-    } else {
-      Serial.printf("[BLE] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);          // 通常経路で受信したデータはログに残さない（SDカードに記録されるため）
-    }
-  } else {
-    if (timeoutPath) {
-      Serial.printf("[BLE TIMEOUT] OUT OF RANGE: %s -> %.2f\n", payload.c_str(), tempValue);
-    } else {
-      Serial.printf("[BLE] OUT OF RANGE: %s -> %.2f\n", payload.c_str(), tempValue);
-    }
-  }
-
-  payload = "";
-}
-
 // 次回ログ番号の読み込み（起動時の採番高速化用）
 int loadNextLogIndex() {
   file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_READ);  // インデックスファイルを開く
@@ -653,40 +631,58 @@ void saveNextLogIndex(int nextIndex) {
   indexFile.close();                  // インデックスファイルを閉じる
 }
 
-// BLEからのデータ読み取り（バッファ＋タイムアウト処理）
+// BLE中継機(NanoC6)へコマンドを送信し、応答フレーム(32byte)を読み取る
+bool requestBleI2CFrame(uint8_t command, uint8_t (&frame)[BLE_I2C_FRAME_SIZE]) {
+  BleI2C.beginTransmission(BLE_I2C_SLAVE_ADDR);
+  BleI2C.write(command);
+  if (BleI2C.endTransmission() != 0) {
+    return false;
+  }
+
+  if (BleI2C.requestFrom(static_cast<int>(BLE_I2C_SLAVE_ADDR), static_cast<int>(BLE_I2C_FRAME_SIZE)) != BLE_I2C_FRAME_SIZE) {
+    return false;
+  }
+  for (uint8_t i = 0; i < BLE_I2C_FRAME_SIZE; i++) {
+    frame[i] = BleI2C.available() ? static_cast<uint8_t>(BleI2C.read()) : 0;
+  }
+  return true;
+}
+
+// BLE中継機(NanoC6)からI2C経由でエンジン温度データを取得する（一定間隔でポーリング＋タイムアウト処理）
 void updateBLE() {
-  static String bleBuffer = "";
-  static unsigned long lastBLETime = 0;
-  
-  while (SerialBLE.available() > 0) {
-    char c = SerialBLE.read();
-    lastBLETime = millis();
+  static unsigned long lastPollAt = 0;
+  static unsigned long lastValidDataAt = 0;
 
-    if (c == '\n') {
-      processBLEPayload(bleBuffer, false);
-      continue;
-    }
+  if (millis() - lastPollAt >= BLE_I2C_POLL_INTERVAL) {
+    lastPollAt = millis();
 
-    if (c == '\r') {
-      continue;
-    }
+    uint8_t frame[BLE_I2C_FRAME_SIZE];
+    if (requestBleI2CFrame(BLE_I2C_CMD_ENGINE_TEMP, frame)) {
+      uint8_t len = frame[0];
+      if (len > 0 && len <= BLE_I2C_FRAME_SIZE - 1) {
+        String payload;
+        payload.reserve(len);
+        for (uint8_t i = 0; i < len; i++) {
+          payload += static_cast<char>(frame[1 + i]);
+        }
 
-    if (isBLEValueChar(c)) {
-      bleBuffer += c;
-      if (bleBuffer.length() > 15) {
-        bleBuffer = "";
+        float tempValue = 0.0;
+        if (tryParseBLETemperature(payload, tempValue) && tempValue >= 10.0 && tempValue <= 150.0) {
+          EngTemp = tempValue;
+          lastValidDataAt = millis();
+          Serial.printf("[BLE I2C] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);
+        } else {
+          Serial.printf("[BLE I2C] INVALID/OUT OF RANGE: %s\n", payload.c_str());
+        }
       }
+    } else {
+      Serial.println("[BLE I2C] request failed");
     }
   }
 
-  // 不完全なデータの部分タイムアウト処理(100ミリ秒以上経過)
-  if (millis() - lastBLETime > 100 && bleBuffer.length() > 0) {
-    processBLEPayload(bleBuffer, true);
-  }
   // データ受信完全ロス時のリセット処理(2秒以上経過)
-  if (millis() - lastBLETime > 2000) {
-    EngTemp = 0.0;  // エンジン温度をリセット
-    bleBuffer = "";
+  if (millis() - lastValidDataAt > 2000) {
+    EngTemp = 0.0;
   }
 }
 
@@ -1425,14 +1421,12 @@ void setup() {
   // GNSS初期化
   Serial2.begin(gnss_bps);
 
-  // BLE初期化
-  #if USE_HARDWARE_BLE
-    SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
-  #else
-    // バッファサイズを512バイトに拡大してデータロス対策
-    SerialBLE.begin(115200, SWSERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN, false, 512);
+  // BLE中継機(NanoC6)用I2Cバスの初期化
+  // Basicは気圧センサー用Wireバスと同一ピンのため、Wire.begin()の再呼び出しによる速度低下(400kHz→100kHz)を避けて共用する
+  #if BLE_I2C_SDA != BMX280_I2C_SDA || BLE_I2C_SCL != BMX280_I2C_SCL
+    BleI2C.begin(BLE_I2C_SDA, BLE_I2C_SCL);
   #endif
-  
+
   // LCD初期化
   lcd.init();
   lcd.setRotation(1);

@@ -1,12 +1,13 @@
-﻿# Chibi-T Furoshiki Logger (M5Stack Core2)
+﻿# Chibi-T Furoshiki Logger (M5Stack Core2 / Basic)
 
-M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リアルタイム表示システムです。以下を統合しています:
+M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー兼リアルタイム表示システムです。  
+以下を統合しています:
 
 - ECU からの走行データ取得 (Serial1)
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
 - 高度推定 (BME280を用いた気圧→高度換算)
 - インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
-- BLE 経由のエンジン温度受信 (SoftwareSerial or HardwareSerial)
+- BLE 経由のエンジン温度受信 (M5NanoC6 BLE中継機とPort A経由のI2C通信)
 - BME280を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
@@ -28,13 +29,16 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 ## ハードウェア / 接続
 
-- 基板: M5Stack Core2 (ESP32, PSRAM 使用)
+- 基板: M5Stack Core2 (ESP32, PSRAM 使用) / M5Stack Basic (Gray)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
 - GNSS: Serial2 115200 bps (RX=13, TX=14)
 - BME280(気圧/気温/湿度センサ) / BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22
   - 運用注記: M5Core2のI2C 0x38はタッチセンサと競合するため、AHT20は使用しない
-- BLE 温度センサ: M5Core2 PortA RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可 M5Stack Basicには32,33ピンが存在しないため使用不可)
+- BLE 中継機 [M5NanoC6_BLE_Central](https://github.com/todateman/M5NanoC6_BLE_Central) (M5NanoC6): Port A 経由の I2C で接続（NanoC6側がI2Cスレーブ, addr=`0x08`）
+  - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。BME280/BMP280用バスとはピンが異なるため)
+  - M5Stack Basic: SDA=21, SCL=22 (BME280/BMP280用`Wire`バスと共用。Port Aのピンが同一のため)
+  - `CMD_ENGINE_TEMP` (`0x01`) を200ms間隔で送信し、32byte固定フレーム（`[0]`=データ長, `[1..]`=文字列データ）でエンジン温度を取得
 - ボタン: A/B/C でモード選択 + 起動時設定
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
@@ -45,17 +49,19 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 - [TimeLib](https://github.com/derickr/timelib)
 - [PubSubClient](https://github.com/knolleary/pubsubclient)
 - [ArduinoJson v7](https://github.com/bblanchon/ArduinoJson)
-- [EspSoftwareSerial](https://github.com/plerup/espsoftwareserial)
 - [SdFat](https://github.com/greiman/SdFat)
 - [WiFiManager](https://github.com/tzapu/WiFiManager) (同梱ライブラリ `lib/WiFiManager`)
 - [Adafruit BME280 Library](https://github.com/adafruit/Adafruit_BME280_Library)
+- [Adafruit BMP280 Library](https://github.com/adafruit/Adafruit_BMP280_Library)
+- [Adafruit AHTX0](https://github.com/adafruit/Adafruit_AHTX0)
 - [Adafruit Unified Sensor](https://github.com/adafruit/Adafruit_Sensor)
 
 ## ビルド & 実行 (PlatformIO)
 
 1. VS Code + PlatformIO をインストール
 2. 本リポジトリを開く
-3. board: `m5stack-core2` を指定 (既に `platformio.ini` 設定済み)
+3. board: `m5stack-core2` (既定) または `m5stack-basic` を指定  
+   (`platformio.ini` の `default_envs` で切替、`pio run -e <env>` でも指定可)
 4. Upload (書き込み) / Monitor (115200bps) で動作確認
 5. 初回起動時 SD カードが挿入されていることを確認
 
@@ -259,7 +265,7 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
 | MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
-| 温度 0.0 固定 | BLE センサ未送信 or タイムアウト <BR>  (>10s でリセット) |
+| 温度 0.0 固定 | NanoC6とのI2C通信失敗、またはNanoC6がまだBLE Notifyを受信していない <BR> (有効データ未取得が2秒以上継続でリセット) |
 | `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
 
 ### MQTT 診断ログ運用
@@ -271,7 +277,7 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 ## 既知の課題 (改善予定)
 
 1. 電源断耐性: 開きっぱなし運用のため、電源断時は最後の `sync()` 以降の数秒分が欠損する可能性がある
-2. BLE 温度欠損: SoftwareSerial 経由で温度値の欠損が発生。対策として FreeRTOS タスク分離 / HardwareSerial への移行 / リングバッファ導入を検討
+2. BLE中継データの鮮度検知: NanoC6とのI2C通信自体が正常でも、NanoC6内部でBLE Notifyが途絶えた場合は検知できず、古い温度値を返し続ける可能性がある（NanoC6側にNotifyタイムアウト検知機能が無いため。詳細は [M5NanoC6_BLE_Central](https://github.com/todateman/M5NanoC6_BLE_Central) の今後の改善案を参照）
 
 ## 次ステップ (改善案)
 
