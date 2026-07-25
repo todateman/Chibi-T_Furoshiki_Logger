@@ -30,10 +30,11 @@ M5Stack Core2 上で動作するエコラン競技車両向けロガー兼リア
 
 - 基板: M5Stack Core2 (ESP32, PSRAM 使用)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
-- ECU: Serial1 115200 bps (RX=27, TX=19) ※コード参照
+- ECU: Serial1 115200 bps、RXピンはボード依存  
+  (M5Stack Core2: RX=2, TX=0 / M5Stack Basic: RX=15, TX=0)  
+  ※M5Stack Basicの起動不良対策としてGPIO12を使用しないため分岐 (コード参照)
 - GNSS: Serial2 115200 bps (RX=13, TX=14)
-- BME280(気圧/気温/湿度センサ) / BMP280(気圧センサ): I2C 0x76 SDA=21, SCL=22
-  - 運用注記: M5Core2のI2C 0x38はタッチセンサと競合するため、AHT20は使用しない
+- BME280(気圧/気温/湿度センサ): I2C 0x76、SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
 - BLE 温度センサ: M5Core2 PortA RX=32, TX=33 (SoftwareSerial 既定, `USE_HARDWARE_BLE=1` で UART2 を利用可 M5Stack Basicには32,33ピンが存在しないため使用不可)
 - ボタン: A/B/C でモード選択 + 起動時設定
 
