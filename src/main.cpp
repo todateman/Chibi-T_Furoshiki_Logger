@@ -21,10 +21,23 @@
 #define pi 3.141592653589793
 #define SD_SPI_SPEED SD_SCK_MHZ(25)
 #define SD_CONFIG SdSpiConfig(GPIO_NUM_4, SHARED_SPI, SD_SPI_SPEED)
-  
+
+// ECU用ピンとボーレート（M5Stack Basicの起動不良対策でGPIO12の使用禁止）
+#if defined(ARDUINO_M5STACK_Core2)
+constexpr uint8_t ECU_RX_PIN 2;
+constexpr uint8_t ECU_TX_PIN 0;
+#elif defined(ARDUINO_M5Stack_Core)
+constexpr uint8_t ECU_RX_PIN 15;
+constexpr uint8_t ECU_TX_PIN 0;
+#else
+#error "Unsupported board: ECU_UART_PIN is not defined for this target"
+#endif
+#define ECU_BPS 115200
+
 // BLE用ピンと利用モード（1: ハードウェアUART使用; 0: SoftwareSerial使用）
 #define BLE_RX_PIN 32
 #define BLE_TX_PIN 33
+#define BLE_BPS 115200
 #define USE_HARDWARE_BLE 0
 
 // 各タスクの更新間隔（ミリ秒）
@@ -38,9 +51,9 @@
 #define ALTITUDE_INTERVAL   500
 #define ENV_SENSOR_INTERVAL 1000
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
+
+// GNSS受信バッファサイズ（TinyGPS++の内部バッファサイズに合わせる）
 #define GNSS_PARSE_BUDGET_BYTES 256
-#define BMX280_I2C_SDA 21
-#define BMX280_I2C_SCL 22
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -1335,8 +1348,7 @@ bool initializePressureSensorForGnssModule() {
   const uint8_t bmp280ChipId = BMP280_CHIPID;  // 0x58
   const uint8_t bme280ChipId = 0x60;
 
-  Wire.begin(BMX280_I2C_SDA, BMX280_I2C_SCL, 400000U);
-  Serial.printf("Pressure sensor I2C pin: SDA=%d SCL=%d\n", BMX280_I2C_SDA, BMX280_I2C_SCL);
+  Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());
 
   const uint8_t addresses[] = {0x76, 0x77};
   for (uint8_t i = 0; i < sizeof(addresses); i++) {
@@ -1419,7 +1431,7 @@ void setup() {
   updateEnvironmentSensors();
 
   // ECU初期化
-  Serial1.begin(115200, SERIAL_8N1, 27, 19);
+  Serial1.begin(ECU_BPS, SERIAL_8N1, ECU_RX_PIN, ECU_TX_PIN);
   Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
   
   // GNSS初期化
@@ -1427,10 +1439,10 @@ void setup() {
 
   // BLE初期化
   #if USE_HARDWARE_BLE
-    SerialBLE.begin(115200, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
+    SerialBLE.begin(BLE_BPS, SERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN);
   #else
     // バッファサイズを512バイトに拡大してデータロス対策
-    SerialBLE.begin(115200, SWSERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN, false, 512);
+    SerialBLE.begin(BLE_BPS, SWSERIAL_8N1, BLE_RX_PIN, BLE_TX_PIN, false, 512);
   #endif
   
   // LCD初期化
