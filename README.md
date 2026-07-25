@@ -7,7 +7,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
 - 高度推定 (BME280を用いた気圧→高度換算)
 - インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
-- BLE 経由のエンジン温度受信 (M5NanoC6 BLE中継機とPort A経由のI2C通信)
+- BLE 経由のエンジン温度・1次側/2次側空気圧・燃圧受信 (M5NanoC6 BLE中継機とPort A経由のI2C通信)
 - BME280を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
@@ -38,7 +38,15 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - BLE 中継機 [M5NanoC6_BLE_Central](https://github.com/todateman/M5NanoC6_BLE_Central) (M5NanoC6): Port A 経由の I2C で接続（NanoC6側がI2Cスレーブ, addr=`0x08`）
   - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。BME280/BMP280用バスとはピンが異なるため)
   - M5Stack Basic: SDA=21, SCL=22 (BME280/BMP280用`Wire`バスと共用。Port Aのピンが同一のため)
-  - `CMD_ENGINE_TEMP` (`0x01`) を200ms間隔で送信し、32byte固定フレーム（`[0]`=データ長, `[1..]`=文字列データ）でエンジン温度を取得
+  - 200ms間隔で以下4コマンドを順に送信し、それぞれ32byte固定フレーム（`[0]`=データ長, `[1..]`=文字列データ）でデータを取得。いずれも2秒以上有効データを取得できない場合は該当値を`0.0`にリセットする
+
+    | コマンド | データ | 単位 | 有効範囲(範囲外は破棄) |
+    | ---- | ---- | ---- | ---- |
+    | `CMD_ENGINE_TEMP` (`0x01`) | エンジン温度 ([Chibi-T_Furoshiki_Heater](https://github.com/todateman/Chibi-T_Furoshiki_Heater)経由) | ℃ | 10.0 〜 150.0 |
+    | `CMD_PRI_PRE` (`0x02`) | 1次側空気圧 ([Chibi-T_Furoshiki_AutoAirAdjust](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust)経由) | MPa | 0.01 〜 0.72 |
+    | `CMD_SEC_PRE` (`0x03`) | 2次側空気圧 (同上) | MPa | 0.01 〜 0.72 |
+    | `CMD_FUEL_PRE` (`0x04`) | 燃圧 (同上) | MPa | -0.02 〜 1.05 |
+
 - ボタン: A/B/C でモード選択 + 起動時設定
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
@@ -67,7 +75,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 ### デバッグ
 
-- シリアル出力: CSV形式 `lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, EngTemp, Pressure, Temp, Humidity, datetime`
+- シリアル出力: CSV形式 `lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, EngTemp, Pressure, Temp, Humidity, PRI, SEC, FUEL, datetime`
 - 例外デコード: `monitor_filters = esp32_exception_decoder`
 
 ## 高度推定 / 国土地理院API補正
@@ -113,7 +121,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 ## ログファイル仕様 (SD)
 
-ヘッダ: `記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度`
+ヘッダ: `記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)`
 
 - 記録日時: GNSS + JST補正 (`YYYY/M/D hh:mm:ss.cc`)
 - `alt`: EKF 融合高度
@@ -207,7 +215,10 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
   "lon": 136.1234567,
   "alt": 123.4,
   "loc": "su",
-  "temp": 92.5
+  "temp": 92.5,
+  "pri": 0.55,
+  "sec": 0.52,
+  "fuel": 0.35
 }
 ```
 
@@ -265,7 +276,7 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
 | MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
-| 温度 0.0 固定 | NanoC6とのI2C通信失敗、またはNanoC6がまだBLE Notifyを受信していない <BR> (有効データ未取得が2秒以上継続でリセット) |
+| 温度/PRI/SEC/FUEL が 0.0 固定 | NanoC6とのI2C通信失敗、またはNanoC6が対応するBLEペリフェラル(Heater/AutoAirAdjust)からNotifyをまだ受信していない <BR> (該当値ごとに有効データ未取得が2秒以上継続でリセット) |
 | `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
 
 ### MQTT 診断ログ運用

@@ -34,7 +34,10 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #endif
 #define BLE_I2C_SLAVE_ADDR 0x08
 #define BLE_I2C_FRAME_SIZE 32
-#define BLE_I2C_CMD_ENGINE_TEMP 0x01
+#define BLE_I2C_CMD_ENGINE_TEMP 0x01  // エンジン温度（Chibi-T_Furoshiki_Heater経由）
+#define BLE_I2C_CMD_PRI_PRE  0x02  // 1次側空気圧（AutoAirAdjust経由）
+#define BLE_I2C_CMD_SEC_PRE  0x03  // 2次側空気圧（AutoAirAdjust経由）
+#define BLE_I2C_CMD_FUEL_PRE 0x04  // 燃圧（AutoAirAdjust経由）
 #define BLE_I2C_POLL_INTERVAL 200  // NanoC6への要求間隔（ミリ秒）
 
 // 各タスクの更新間隔（ミリ秒）
@@ -138,7 +141,10 @@ uint16_t Lapcount = 0;  // 周回数
 uint8_t totallaps = 3;  // 周回数（サーキットごとに設定値を上書き）
 uint16_t goal = 1000;   // 走行距離 [m]（サーキットごとに設定値を上書き）
 uint16_t limittime = 100; // 制限時間 [s]（サーキットごとに設定値を上書き）
-float EngTemp = 0.0;    // エンジン温度 [°C]
+float EngTemp = 0.0;    // エンジン温度 [°C]（Chibi-T_Furoshiki_Heater経由）
+float PriPre  = 0.0;    // 1次側空気圧 [MPa]（AutoAirAdjust経由）
+float SecPre  = 0.0;    // 2次側空気圧 [MPa]（AutoAirAdjust経由）
+float FuelPre = 0.0;    // 燃圧 [MPa]（AutoAirAdjust経由）
 
 // GPS用
 TinyGPSPlus gps;
@@ -553,14 +559,14 @@ void showMessage(String msg)
   lcd.print("C");
 }
 
-// BLEから受信した文字が温度データとして有効な文字かどうかを判定する
+// BLEから受信した文字が数値データとして有効な文字かどうかを判定する
 bool isBLEValueChar(char c)
 {
   return (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-';
 }
 
-// BLEから受信した文字列が有効な温度データかどうかを判定し変換する
-bool tryParseBLETemperature(const String& raw, float& outTemp) {
+// BLEから受信した文字列が有効な数値データかどうかを判定し変換する（温度・PRI/SEC/FUEL共用）
+bool tryParseBLEFloatValue(const String& raw, float& outValue) {
   if (raw.length() == 0) {                      // 空文字は無効
     return false;
   }
@@ -596,7 +602,7 @@ bool tryParseBLETemperature(const String& raw, float& outTemp) {
     endPtr++;
   }
 
-  outTemp = parsed;
+  outValue = parsed;
   return true;
 }
 
@@ -648,41 +654,61 @@ bool requestBleI2CFrame(uint8_t command, uint8_t (&frame)[BLE_I2C_FRAME_SIZE]) {
   return true;
 }
 
-// BLE中継機(NanoC6)からI2C経由でエンジン温度データを取得する（一定間隔でポーリング＋タイムアウト処理）
+// BLE中継機(NanoC6)経由で取得する1系統分のデータ定義（コマンド・格納先・有効範囲・最終有効受信時刻）
+struct BleI2CChannel {
+  uint8_t command;
+  const char* label;
+  float* value;
+  float rangeMin;
+  float rangeMax;
+  unsigned long lastValidAt;
+};
+// BLE中継機(NanoC6)経由で取得するデータの定義（コマンド・格納先・有効範囲・最終有効受信時刻）
+static BleI2CChannel bleChannels[] = {
+  { BLE_I2C_CMD_ENGINE_TEMP, "ENGINE_TEMP", &EngTemp, 10.0f,  150.0f, 0 },
+  { BLE_I2C_CMD_PRI_PRE,     "PRI",         &PriPre,   0.01f, 0.72f,  0 },
+  { BLE_I2C_CMD_SEC_PRE,     "SEC",         &SecPre,   0.01f, 0.72f,  0 },
+  { BLE_I2C_CMD_FUEL_PRE,    "FUEL",        &FuelPre, -0.02f, 1.05f,  0 },
+};
+
+// BLE中継機(NanoC6)からI2C経由でエンジン温度・PRI/SEC/FUELデータを取得する（一定間隔でポーリング＋タイムアウト処理）
 void updateBLE() {
   static unsigned long lastPollAt = 0;
-  static unsigned long lastValidDataAt = 0;
 
   if (millis() - lastPollAt >= BLE_I2C_POLL_INTERVAL) {
     lastPollAt = millis();
 
-    uint8_t frame[BLE_I2C_FRAME_SIZE];
-    if (requestBleI2CFrame(BLE_I2C_CMD_ENGINE_TEMP, frame)) {
-      uint8_t len = frame[0];
-      if (len > 0 && len <= BLE_I2C_FRAME_SIZE - 1) {
-        String payload;
-        payload.reserve(len);
-        for (uint8_t i = 0; i < len; i++) {
-          payload += static_cast<char>(frame[1 + i]);
-        }
+    for (BleI2CChannel& ch : bleChannels) {
+      uint8_t frame[BLE_I2C_FRAME_SIZE];
+      if (requestBleI2CFrame(ch.command, frame)) {
+        uint8_t len = frame[0];
+        if (len > 0 && len <= BLE_I2C_FRAME_SIZE - 1) {
+          String payload;
+          payload.reserve(len);
+          for (uint8_t i = 0; i < len; i++) {
+            payload += static_cast<char>(frame[1 + i]);
+          }
 
-        float tempValue = 0.0;
-        if (tryParseBLETemperature(payload, tempValue) && tempValue >= 10.0 && tempValue <= 150.0) {
-          EngTemp = tempValue;
-          lastValidDataAt = millis();
-          Serial.printf("[BLE I2C] RX: %s -> %.2f°C\n", payload.c_str(), EngTemp);
-        } else {
-          Serial.printf("[BLE I2C] INVALID/OUT OF RANGE: %s\n", payload.c_str());
+          float parsedValue = 0.0;
+          if (tryParseBLEFloatValue(payload, parsedValue) && parsedValue >= ch.rangeMin && parsedValue <= ch.rangeMax) {
+            *ch.value = parsedValue;
+            ch.lastValidAt = millis();
+            Serial.printf("[BLE I2C] RX %s: %s -> %.2f\n", ch.label, payload.c_str(), parsedValue);
+          } else {
+            Serial.printf("[BLE I2C] %s INVALID/OUT OF RANGE: %s\n", ch.label, payload.c_str());
+          }
         }
+      } else {
+        Serial.printf("[BLE I2C] %s request failed\n", ch.label);
       }
-    } else {
-      Serial.println("[BLE I2C] request failed");
     }
   }
 
-  // データ受信完全ロス時のリセット処理(2秒以上経過)
-  if (millis() - lastValidDataAt > 2000) {
-    EngTemp = 0.0;
+  // データ受信完全ロス時のリセット処理(2秒以上経過、チャンネルごとに判定)
+  for (BleI2CChannel& ch : bleChannels) {
+    if (millis() - ch.lastValidAt > 2000) {
+      *ch.value = 0.0;
+    }
   }
 }
 
@@ -1110,6 +1136,9 @@ void updateSerialOutput() {
   Serial.print(isfinite(envPressureKPa) ? String(envPressureKPa, 3) : ""); Serial.print(",");
   Serial.print(isfinite(envTemperatureC) ? String(envTemperatureC, 2) : ""); Serial.print(",");
   Serial.print(isfinite(envHumidityPct) ? String(envHumidityPct, 1) : ""); Serial.print(",");
+  Serial.print(PriPre, 2);  Serial.print(",");
+  Serial.print(SecPre, 2);  Serial.print(",");
+  Serial.print(FuelPre, 2); Serial.print(",");
   Serial.println(datetime);
 }
 
@@ -1131,7 +1160,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%)"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -1156,6 +1185,10 @@ void updateSDLog() {
     if (isfinite(envTemperatureC)) { logFile.print(envTemperatureC, 2); }
     logFile.print(",");
     if (isfinite(envHumidityPct)) { logFile.print(envHumidityPct, 1); }
+    logFile.print(",");
+    logFile.print(PriPre, 2);  logFile.print(",");
+    logFile.print(SecPre, 2);  logFile.print(",");
+    logFile.print(FuelPre, 2);
     logFile.println();
 
     // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
@@ -1277,6 +1310,9 @@ void updateMQTT() {
   doc["alt"]       = (float)alt;
   doc["loc"]       = Loc;
   doc["temp"]      = (float)EngTemp;
+  doc["pri"]       = (float)PriPre;
+  doc["sec"]       = (float)SecPre;
+  doc["fuel"]      = (float)FuelPre;
   String jsonData;
   serializeJson(doc, jsonData);
   mqttclient.publish(mqtt_topic, jsonData.c_str());
@@ -1571,7 +1607,7 @@ void setup() {
 
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
-  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Pressure, Temp, Humidity, datetime"));
+  Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Pressure, Temp, Humidity, PRI, SEC, FUEL, datetime"));
   
   t_Serial = millis();
   t_SD = millis();
