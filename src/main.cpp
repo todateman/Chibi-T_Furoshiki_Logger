@@ -12,6 +12,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
+#include <string.h>
 #include <Adafruit_BME280.h>
 #include "secrets.h"
 
@@ -51,8 +52,8 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define BLE_I2C_POLL_INTERVAL 200  // NanoC6への要求間隔（ミリ秒）
 
 // 各タスクの更新間隔（ミリ秒）
-#define SERIAL_OUT_INTERVAL 1000
-#define SD_LOG_INTERVAL     1000
+#define SERIAL_OUT_INTERVAL 100
+#define SD_LOG_INTERVAL     100
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define MQTT_RECONNECT_BASE_INTERVAL 5000UL
@@ -60,10 +61,19 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
 #define ENV_SENSOR_INTERVAL 1000
+#define DISPLAY_INTERVAL    100
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 
-// GNSS受信バッファサイズ（TinyGPS++の内部バッファサイズに合わせる）
-#define GNSS_PARSE_BUDGET_BYTES 256
+// GNSS受信バッファサイズ（1ループあたりの最大パース量。10Hzロギングでの取りこぼし防止のため広めに確保）
+#define GNSS_PARSE_BUDGET_BYTES 512
+
+// ECU/SDログ処理の高速化用バッファ・しきい値（10Hzロギング対応）
+#define ECU_LINE_BUFFER_SIZE 128
+#define SD_LINE_BUFFER_SIZE 256
+#define SD_BATCH_BUFFER_SIZE 1024
+#define SD_SYNC_LINE_THRESHOLD 40
+#define SD_SYNC_TIME_MS 5000UL
+#define LOG_PREALLOC_BYTES (2UL * 1024UL * 1024UL)
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -123,8 +133,11 @@ unsigned long t_MQTT   = 0;
 unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
 unsigned long t_env    = 0;
+unsigned long t_display = 0;
 unsigned long lastSdSyncAt = 0;
 uint16_t sdLinesSinceSync = 0;
+char sdBatchBuffer[SD_BATCH_BUFFER_SIZE];
+size_t sdBatchLen = 0;
 
 // シリアル（ECU, GNSS）
 unsigned long receiveECUtime = 0;
@@ -607,6 +620,44 @@ bool tryParseBLEFloatValue(const String& raw, float& outValue) {
   return true;
 }
 
+// ECU 1行CSVをパースする（期待フォーマット: 8項目）
+bool tryParseEcuCsvLine(char* line) {
+  if (line == nullptr || line[0] == '\0') {
+    return false;
+  }
+
+  uint8_t index = 0;
+  char* savePtr = nullptr;
+  char* token = strtok_r(line, ",", &savePtr);
+  while (token != nullptr && index < 8) {
+    while (*token == ' ' || *token == '\t') {
+      token++;
+    }
+
+    switch (index) {
+      case 0: tachoRpm = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 1: INJ_timems = strtof(token, nullptr); break;
+      case 2: IGN_CA = static_cast<uint8_t>(strtoul(token, nullptr, 10)); break;
+      case 3: speed = strtof(token, nullptr); break;
+      case 4: distance = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 5: gasml = strtof(token, nullptr); break;
+      case 6: dispergas = strtof(token, nullptr); break;
+      case 7: worktime = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      default: break;
+    }
+
+    index++;
+    token = strtok_r(nullptr, ",", &savePtr);
+  }
+
+  if (index < 8) {
+    return false;
+  }
+
+  Lapcount = distance / max(static_cast<uint16_t>(1), static_cast<uint16_t>(goal / totallaps));
+  return true;
+}
+
 // 次回ログ番号の読み込み（起動時の採番高速化用）
 int loadNextLogIndex() {
   file_t indexFile = sd.open(NEXT_LOG_INDEX_FILE, O_READ);  // インデックスファイルを開く
@@ -715,32 +766,41 @@ void updateBLE() {
 
 // ECUからのデータ読み取り
 void updateECU() {
-  if (Serial1.available()) {
+  static char ecuLine[ECU_LINE_BUFFER_SIZE] = {0};
+  static uint8_t ecuLen = 0;
+
+  while (Serial1.available() > 0) {
+    char ch = Serial1.read();
     receiveECUtime = millis();
-    String str = Serial1.readStringUntil('\n');
-    str.trim();
-    for (uint8_t i = 0; i < 8; i++) {
-      int commaIndex = str.indexOf(",");
-      String data = str.substring(0, commaIndex);
-      data.trim();
-      str = str.substring(commaIndex + 1);
-      if (i == 0) { tachoRpm = data.toInt(); }
-      if (i == 1) { INJ_timems = data.toFloat(); }
-      if (i == 2) { IGN_CA = data.toInt(); }
-      if (i == 3) { speed = data.toFloat(); }
-      if (i == 4) { distance = data.toInt(); }
-      if (i == 5) { gasml = data.toFloat(); }
-      if (i == 6) { dispergas = data.toFloat(); }
-      if (i == 7) { worktime = data.toInt(); }
+
+    if (ch == '\r') {
+      continue;
     }
-    Lapcount = distance / (goal / totallaps);
-  } else {
-    if (millis() - receiveECUtime > 2000) {
-      tachoRpm = 0;
-      INJ_timems = 0;
-      IGN_CA = 0;
-      speed = 0.0;
+
+    if (ch == '\n') {
+      ecuLine[ecuLen] = '\0';
+      if (ecuLen > 0) {
+        tryParseEcuCsvLine(ecuLine);
+      }
+      ecuLen = 0;
+      ecuLine[0] = '\0';
+      continue;
     }
+
+    if (ecuLen < (ECU_LINE_BUFFER_SIZE - 1)) {
+      ecuLine[ecuLen++] = ch;
+      ecuLine[ecuLen] = '\0';
+    } else {
+      ecuLen = 0;
+      ecuLine[0] = '\0';
+    }
+  }
+
+  if (millis() - receiveECUtime > 2000) {
+    tachoRpm = 0;
+    INJ_timems = 0;
+    IGN_CA = 0;
+    speed = 0.0;
   }
 }
 
@@ -1119,13 +1179,36 @@ void updateSerialOutput() {
   Serial.print(dispergas, 1); Serial.print(",");
   Serial.print(worktime); Serial.print(",");
   Serial.print(EngTemp, 2); Serial.print(",");
-  Serial.print(isfinite(envPressureKPa) ? String(envPressureKPa, 3) : ""); Serial.print(",");
-  Serial.print(isfinite(envTemperatureC) ? String(envTemperatureC, 2) : ""); Serial.print(",");
-  Serial.print(isfinite(envHumidityPct) ? String(envHumidityPct, 1) : ""); Serial.print(",");
+  if (isfinite(envPressureKPa)) { Serial.print(envPressureKPa, 3); }
+  Serial.print(",");
+  if (isfinite(envTemperatureC)) { Serial.print(envTemperatureC, 2); }
+  Serial.print(",");
+  if (isfinite(envHumidityPct)) { Serial.print(envHumidityPct, 1); }
+  Serial.print(",");
   Serial.print(PriPre, 2);  Serial.print(",");
   Serial.print(SecPre, 2);  Serial.print(",");
   Serial.print(FuelPre, 2); Serial.print(",");
   Serial.println(datetime);
+}
+
+// SDバッチをフラッシュする（必要時のみsync）
+void flushSdBatch(bool doSync) {
+  if (!logFile || sdBatchLen == 0) {
+    return;
+  }
+
+  size_t written = logFile.write(reinterpret_cast<const uint8_t*>(sdBatchBuffer), sdBatchLen);
+  if (written != sdBatchLen) {
+    Serial.printf("SD batch write short: %u/%u\n", static_cast<unsigned int>(written), static_cast<unsigned int>(sdBatchLen));
+  }
+  sdBatchLen = 0;
+
+  if (doSync) {
+    logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
+    logFile.sync();
+    sdLinesSinceSync = 0;
+    lastSdSyncAt = millis();
+  }
 }
 
 // SDカードへのログ書き出し
@@ -1144,6 +1227,9 @@ void updateSDLog() {
   if (logFile) {
     if (!logFileInitialized) {
       if (isNewFile) {
+        if (!logFile.preAllocate(LOG_PREALLOC_BYTES)) {
+          Serial.println("SD preAllocate skipped");
+        }
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
         logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)"));
@@ -1152,37 +1238,52 @@ void updateSDLog() {
       logFileInitialized = true;
     }
 
-    logFile.timestamp(T_WRITE, year(), month(), day(), hour(), minute(), second());
-    logFile.print(datetime); logFile.print(",");
-    logFile.print(speed, 1);    logFile.print(",");
-    logFile.print(Lapcount); logFile.print(",");
-    logFile.print(worktime); logFile.print(",");
-    logFile.print(tachoRpm); logFile.print(",");
-    logFile.print(distance, 1); logFile.print(",");
-    logFile.print(gasml, 1);   logFile.print(",");
-    logFile.print(dispergas, 1); logFile.print(",");
-    logFile.print(la, 7);      logFile.print(",");
-    logFile.print(ln, 7);      logFile.print(",");
-    logFile.print(alt, 1);     logFile.print(",");
-    logFile.print(Loc);        logFile.print(",");
-    logFile.print(EngTemp, 2); logFile.print(",");
-    if (isfinite(envPressureKPa)) { logFile.print(envPressureKPa, 3); }
-    logFile.print(",");
-    if (isfinite(envTemperatureC)) { logFile.print(envTemperatureC, 2); }
-    logFile.print(",");
-    if (isfinite(envHumidityPct)) { logFile.print(envHumidityPct, 1); }
-    logFile.print(",");
-    logFile.print(PriPre, 2);  logFile.print(",");
-    logFile.print(SecPre, 2);  logFile.print(",");
-    logFile.print(FuelPre, 2);
-    logFile.println();
+    char pressureStr[16] = {0};
+    char tempStr[16] = {0};
+    char humStr[16] = {0};
+    if (isfinite(envPressureKPa)) { dtostrf(envPressureKPa, 0, 3, pressureStr); }
+    if (isfinite(envTemperatureC)) { dtostrf(envTemperatureC, 0, 2, tempStr); }
+    if (isfinite(envHumidityPct)) { dtostrf(envHumidityPct, 0, 1, humStr); }
 
-    // 毎回closeせずに一定間隔でsyncし、書き込み遅延と周期ばらつきを抑える
+    char logLine[SD_LINE_BUFFER_SIZE] = {0};
+    int lineLen = snprintf(logLine,
+                           sizeof(logLine),
+                           "%s,%.1f,%u,%u,%u,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.2f,%.2f,%.2f\n",
+                           datetime,
+                           speed,
+                           static_cast<unsigned int>(Lapcount),
+                           static_cast<unsigned int>(worktime),
+                           static_cast<unsigned int>(tachoRpm),
+                           static_cast<unsigned int>(distance),
+                           gasml,
+                           dispergas,
+                           la,
+                           ln,
+                           alt,
+                           Loc.c_str(),
+                           EngTemp,
+                           pressureStr,
+                           tempStr,
+                           humStr,
+                           PriPre,
+                           SecPre,
+                           FuelPre);
+
+    if (lineLen <= 0 || lineLen >= static_cast<int>(sizeof(logLine))) {
+      Serial.println("SD log line build failed");
+      return;
+    }
+
+    if (sdBatchLen + static_cast<size_t>(lineLen) > SD_BATCH_BUFFER_SIZE) {
+      flushSdBatch(false);
+    }
+    memcpy(sdBatchBuffer + sdBatchLen, logLine, static_cast<size_t>(lineLen));
+    sdBatchLen += static_cast<size_t>(lineLen);
+
+    // 一定行数または一定時間でのみsyncして負荷を下げる
     sdLinesSinceSync++;
-    if (sdLinesSinceSync >= 5 || (millis() - lastSdSyncAt) >= 5000UL) {
-      logFile.sync();
-      sdLinesSinceSync = 0;
-      lastSdSyncAt = millis();
+    if (sdLinesSinceSync >= SD_SYNC_LINE_THRESHOLD || (millis() - lastSdSyncAt) >= SD_SYNC_TIME_MS) {
+      flushSdBatch(true);
     }
   } else {
     Serial.println("SD Log open failed!");
@@ -1411,6 +1512,9 @@ void setup() {
   #if defined(ARDUINO_M5STACK_Core2)
     BleI2C.begin(BLE_I2C_SDA, BLE_I2C_SCL);
   #endif
+  // NanoC6未接続/無応答時にI2Cタイムアウトの既定値(50ms)×4チャンネル分ブロックし、
+  // loop()の実行間隔が伸びてボタン反応が悪化する（M5.update()の呼び出し頻度が落ちる）ことを防ぐ
+  BleI2C.setTimeOut(20);
 
   // LCD初期化
   lcd.init();
@@ -1564,6 +1668,7 @@ void setup() {
   t_amb = millis();
   t_alt = millis();
   t_env = millis();
+  t_display = millis();
   lastSdSyncAt = millis();
 }
 
@@ -1596,7 +1701,13 @@ void loop() {
     nearestWaypointIndex = -1;
   }
 
-  updateDisplay();
+  if (millis() - t_display >= DISPLAY_INTERVAL) {
+    updateDisplay();
+    t_display += DISPLAY_INTERVAL;
+    if (millis() - t_display >= DISPLAY_INTERVAL) {
+      t_display = millis();
+    }
+  }
   
   // デバッグ用Serial出力
   if (millis() - t_Serial >= SERIAL_OUT_INTERVAL) {
@@ -1665,5 +1776,5 @@ void loop() {
   // 国土地理院API呼び出しはBME280接続時のみ低頻度で実行し、成功したら以後実行しない
   if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
 
-  delay(10);
+  delay(1);
 }
