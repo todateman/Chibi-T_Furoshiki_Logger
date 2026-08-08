@@ -689,21 +689,39 @@ void saveNextLogIndex(int nextIndex) {
   indexFile.close();                  // インデックスファイルを閉じる
 }
 
-// BLE中継機(NanoC6)へコマンドを送信し、応答フレーム(32byte)を読み取る
+// BLE中継機(NanoC6)へコマンドを送信し、応答フレーム(32byte)を読み取る。
+// NanoC6側は応答フレーム末尾1byte(frame[BLE_I2C_FRAME_SIZE-1])に要求されたコマンドを
+// そのままエコーバックする仕様になっている。バスノイズ等により応答が別コマンドの
+// ものとズレて配信されることがあるため、エコーが要求コマンドと一致するか確認し、
+// 不一致なら1回だけ読み直す
 bool requestBleI2CFrame(uint8_t command, uint8_t (&frame)[BLE_I2C_FRAME_SIZE]) {
-  BleI2C.beginTransmission(BLE_I2C_SLAVE_ADDR);
-  BleI2C.write(command);
-  if (BleI2C.endTransmission() != 0) {
-    return false;
-  }
+  const uint8_t maxAttempts = 2;  // 初回 + ズレ検知時のリトライ1回
+  for (uint8_t attempt = 0; attempt < maxAttempts; attempt++) {
+    BleI2C.beginTransmission(BLE_I2C_SLAVE_ADDR);
+    BleI2C.write(command);
+    if (BleI2C.endTransmission() != 0) {
+      return false;
+    }
 
-  if (BleI2C.requestFrom(static_cast<int>(BLE_I2C_SLAVE_ADDR), static_cast<int>(BLE_I2C_FRAME_SIZE)) != BLE_I2C_FRAME_SIZE) {
-    return false;
+    // NanoC6側は応答フレームをタスクコンテキストで非同期に用意している（ISR内では
+    // ESP-IDFのi2c_slave_transmit()を呼べないため）。書き込み直後すぐに読み出すと
+    // 準備が間に合わず、応答フレームが1コマンド分ズレて配信されることがあるため、
+    // 読み出し開始前にごく短い待ち時間を入れて余裕を持たせる
+    delayMicroseconds(2000);
+
+    if (BleI2C.requestFrom(static_cast<int>(BLE_I2C_SLAVE_ADDR), static_cast<int>(BLE_I2C_FRAME_SIZE)) != BLE_I2C_FRAME_SIZE) {
+      return false;
+    }
+    for (uint8_t i = 0; i < BLE_I2C_FRAME_SIZE; i++) {
+      frame[i] = BleI2C.available() ? static_cast<uint8_t>(BleI2C.read()) : 0;
+    }
+
+    if (frame[BLE_I2C_FRAME_SIZE - 1] == command) {
+      return true;
+    }
+    // コマンドエコーが不一致 = 別コマンドの応答とズレて配信された。もう一度要求し直す
   }
-  for (uint8_t i = 0; i < BLE_I2C_FRAME_SIZE; i++) {
-    frame[i] = BleI2C.available() ? static_cast<uint8_t>(BleI2C.read()) : 0;
-  }
-  return true;
+  return false;  // リトライしても改善しなかった
 }
 
 // BLE中継機(NanoC6)経由で取得する1系統分のデータ定義（コマンド・格納先・有効範囲・最終有効受信時刻）
@@ -734,7 +752,9 @@ void updateBLE() {
       uint8_t frame[BLE_I2C_FRAME_SIZE];
       if (requestBleI2CFrame(ch.command, frame)) {
         uint8_t len = frame[0];
-        if (len > 0 && len <= BLE_I2C_FRAME_SIZE - 1) {
+        // frame[BLE_I2C_FRAME_SIZE-1]はコマンドエコー用に予約されているため、
+        // データ本体はそれを除いた BLE_I2C_FRAME_SIZE-2 byteまでが上限
+        if (len > 0 && len <= BLE_I2C_FRAME_SIZE - 2) {
           String payload;
           payload.reserve(len);
           for (uint8_t i = 0; i < len; i++) {
