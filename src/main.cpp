@@ -693,9 +693,11 @@ void saveNextLogIndex(int nextIndex) {
 // NanoC6側は応答フレーム末尾1byte(frame[BLE_I2C_FRAME_SIZE-1])に要求されたコマンドを
 // そのままエコーバックする仕様になっている。バスノイズ等により応答が別コマンドの
 // ものとズレて配信されることがあるため、エコーが要求コマンドと一致するか確認し、
-// 不一致なら1回だけ読み直す
+// 不一致なら読み直す
 bool requestBleI2CFrame(uint8_t command, uint8_t (&frame)[BLE_I2C_FRAME_SIZE]) {
-  const uint8_t maxAttempts = 2;  // 初回 + ズレ検知時のリトライ1回
+  // 初回 + リトライ3回。1回あたりのコストは僅か(待機2ms+実通信)で、
+  // バスノイズによる偶発的なズレを吸収しやすくするため上限を広げてある
+  const uint8_t maxAttempts = 4;
   for (uint8_t attempt = 0; attempt < maxAttempts; attempt++) {
     BleI2C.beginTransmission(BLE_I2C_SLAVE_ADDR);
     BleI2C.write(command);
@@ -1535,6 +1537,11 @@ void setup() {
   // NanoC6未接続/無応答時にI2Cタイムアウトの既定値(50ms)×4チャンネル分ブロックし、
   // loop()の実行間隔が伸びてボタン反応が悪化する（M5.update()の呼び出し頻度が落ちる）ことを防ぐ
   BleI2C.setTimeOut(20);
+  // M5Unified側の初期化で400kHz(Fast Mode)になっている可能性が高い。Groveケーブル経由の
+  // 配線ではFast Modeはノイズ・リンギングの影響を受けやすく、NanoC6側で本来存在しない
+  // コマンドバイトを誤検出する一因になっていると考えられるため、Standard Mode(100kHz)に
+  // 明示的に固定してノイズ耐性のマージンを広げる（共有バスのBME280も100kHzで問題なく動作する）
+  BleI2C.setClock(100000);
 
   // LCD初期化
   lcd.init();
