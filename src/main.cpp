@@ -73,11 +73,11 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define SD_BATCH_BUFFER_SIZE 1024
 #define SD_SYNC_LINE_THRESHOLD 40
 #define SD_SYNC_TIME_MS 5000UL
-#define LOG_PREALLOC_BYTES (2UL * 1024UL * 1024UL)
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
 #define MQTT_DIAGNOSTIC_LOG 0  // 本番:0, 切り分け時のみ1
+#define BLE_I2C_DIAGNOSTIC_LOG 0  // 本番:0, BLE I2C切り分け時のみ1
 
 // PROGMEMに格納する定数文字列
 const char MSG_WIFI_CONFIG[] PROGMEM = "このアクセスポイントに接続して\nWi-Fiの設定をしてください\nSSID: ";
@@ -767,13 +767,19 @@ void updateBLE() {
           if (tryParseBLEFloatValue(payload, parsedValue) && parsedValue >= ch.rangeMin && parsedValue <= ch.rangeMax) {
             *ch.value = parsedValue;
             ch.lastValidAt = millis();
+#if BLE_I2C_DIAGNOSTIC_LOG
             Serial.printf("[BLE I2C] RX %s: %s -> %.2f\n", ch.label, payload.c_str(), parsedValue);
+#endif
           } else {
+#if BLE_I2C_DIAGNOSTIC_LOG
             Serial.printf("[BLE I2C] %s INVALID/OUT OF RANGE: %s\n", ch.label, payload.c_str());
+#endif
           }
         }
       } else {
+#if BLE_I2C_DIAGNOSTIC_LOG
         Serial.printf("[BLE I2C] %s request failed\n", ch.label);
+#endif
       }
     }
   }
@@ -1249,9 +1255,6 @@ void updateSDLog() {
   if (logFile) {
     if (!logFileInitialized) {
       if (isNewFile) {
-        if (!logFile.preAllocate(LOG_PREALLOC_BYTES)) {
-          Serial.println("SD preAllocate skipped");
-        }
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
         logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)"));

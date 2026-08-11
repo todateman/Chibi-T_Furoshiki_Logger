@@ -130,8 +130,10 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - 走行時間: ECU送信の積算秒
 - 燃費: コード中 `dispergas` (km/L 指定の閾値 2000 スケールバー)
 - タイムスタンプは `logFile.timestamp()` によりファイル更新時にも設定
+- ログ周期は 10Hz (`SD_LOG_INTERVAL=100ms`)
 - SD書き込みはファイルを開きっぱなしで運用し、複数行をバッファして定期 `sync()` で書き込み確定  
   （電源切では`sync()`実行済みのログを残す）
+- SdFatの `preAllocate()` は使用しない。`O_APPEND` と併用すると予約領域ぶんCSV本体が後方へずれ、先頭にバイナリ/ゼロ領域が残るため
 
 ## 高度推定仕様
 
@@ -234,6 +236,7 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | 症状 | 対処 |
 | ---- | ---- |
 | SD init failed | FAT/exFAT フォーマット <BR> SPI 接続確認, 遅延を長くする検討 |
+| CSVログの先頭が文字化け/バイナリになる | 旧実装で `preAllocate()` されたログの可能性。CSV本体が予約領域後に残っている場合は、該当オフセット以降を切り出して復旧する |
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
 | MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
@@ -245,6 +248,12 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 - 本番運用では `src/main.cpp` の `MQTT_DIAGNOSTIC_LOG` を `0` のまま使用 (既定)
 - AWS IoT接続トラブルの切り分け時のみ `1` に変更して再ビルド
 - 診断で確認する主なログ: `MQTT TLS lastError`, `MQTT DNS`, `MQTT diag TCP/TLS(insecure)`, `heap/minHeap/maxAlloc`
+
+### BLE I2C 診断ログ運用
+
+- 本番運用では `src/main.cpp` の `BLE_I2C_DIAGNOSTIC_LOG` を `0` のまま使用 (既定)
+- BLE中継機との通信切り分け時のみ `1` に変更して再ビルド
+- `1` にすると `[BLE I2C]` で始まる受信/範囲外/要求失敗ログをSerialへ出力するため、Serial CSVを保存する運用では混入に注意する
 
 ## 既知の課題 (改善予定)
 
