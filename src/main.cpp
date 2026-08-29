@@ -63,6 +63,8 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define ENV_SENSOR_INTERVAL 1000
 #define DISPLAY_INTERVAL    100
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
+#define LAP_CROSS_DEBOUNCE_MS 10000UL       // ラップカウントの多重カウント防止用クールダウン時間
+#define LAP_CROSS_TELEPORT_GUARD_M 100.0    // GPSロスト後の誤検出防止用の最大移動距離しきい値[m]
 
 // GNSS受信バッファサイズ（1ループあたりの最大パース量。10Hzロギングでの取りこぼし防止のため広めに確保）
 #define GNSS_PARSE_BUDGET_BYTES 512
@@ -160,8 +162,8 @@ uint16_t distance = 0;  // 走行距離 [m]
 float gasml = 0.0;      // 燃料消費量 [ml]（燃料噴射時間から推定）※あくまで目安で、実際の消費量とは異なる可能性が高い
 float dispergas = 0.0;  // 燃料消費率 [ml/km]（燃料消費量 / 走行距離）※あくまで目安で、実際の消費率とは異なる可能性が高い
 uint16_t worktime = 0;  // 走行時間 [s]（エンジン始動以降の時間を累積）
-uint16_t Lapcount = 0;  // 周回数
-uint8_t totallaps = 3;  // 周回数（サーキットごとに設定値を上書き）
+uint8_t Lapcount = 0;   // 現在の周回数
+uint8_t totallaps = 3;  // 規定周回数（サーキットごとに設定値を上書き）
 uint16_t goal = 1000;   // 走行距離 [m]（サーキットごとに設定値を上書き）
 uint16_t limittime = 100; // 制限時間 [s]（サーキットごとに設定値を上書き）
 float EngTemp = 0.0;    // エンジン温度 [°C]（Chibi-T_Furoshiki_Heater経由）
@@ -191,8 +193,20 @@ bool altitudeOffsetFixed = false;                 // 標高オフセットが確
 unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
 
 // サーキットごとの設定
-const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの周回数
-const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの周回数
+const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの規定周回数
+const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの規定周回数
+const float controlline_la1_su = 34.845093;  // 鈴鹿サーキット東コースのコントロールライン(外側)の緯度
+const float controlline_ln1_su = 136.538735;  // 鈴鹿サーキット東コースのコントロールライン(外側)の経度
+const float controlline_la2_su = 34.844847;  // 鈴鹿サーキット東コースのコントロールライン(内側)の緯度
+const float controlline_ln2_su = 136.538379;  // 鈴鹿サーキット東コースのコントロールライン(内側)の経度
+const float controlline_la1_mo = 36.532698;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の緯度
+const float controlline_ln1_mo = 140.226047;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の経度
+const float controlline_la2_mo = 36.533111;  // ツインリンクもてぎオーバルコースのコントロールライン(内側)の緯度
+const float controlline_ln2_mo = 140.226982;  // ツインリンクもてぎオーバルコースのコントロールライン(内側)の経度
+const float controlline_la1_to = 35.082069;  // 豊田市SENTANのコントロールライン(外側)の緯度
+const float controlline_ln1_to = 137.159997;  // 豊田市SENTANのコントロールライン(外側)の経度
+const float controlline_la2_to = 35.082060;  // 豊田市SENTANのコントロールライン(内側)の緯度
+const float controlline_ln2_to = 137.160227;  // 豊田市SENTANのコントロールライン(内側)の経度
 const uint16_t goal_su = 17616; // 鈴鹿サーキット東コースの走行距離 [m]
 const uint16_t goal_mo = 16389; // ツインリンクもてぎオーバルコースの走行距離 [m]
 const uint16_t limittime_su = 2536; // 鈴鹿サーキット東コースの制限時間 [s]
@@ -654,7 +668,8 @@ bool tryParseEcuCsvLine(char* line) {
     return false;
   }
 
-  Lapcount = distance / max(static_cast<uint16_t>(1), static_cast<uint16_t>(goal / totallaps));
+  // Lapcountはコントロールライン通過検知（updateGNSS内のupdateLapCountByControlLineCrossing）で更新するため、
+  // ここでは更新しない（旧: 走行距離ベースの周回数推定）
   return true;
 }
 
@@ -832,8 +847,106 @@ void updateECU() {
   }
 }
 
+// コントロールライン通過判定（ラップカウント用）
+
+// 3点の向き（時計回り/反時計回り/一直線）を判定する関数（外積の符号で判定）
+int8_t orientation(double ax, double ay, double bx, double by, double cx, double cy) {
+  double val = (by - ay) * (cx - bx) - (bx - ax) * (cy - by);
+  if (fabs(val) < 1e-12) return 0;   // 一直線上（ほぼ0とみなす許容誤差）
+  return (val > 0) ? 1 : 2;          // 1:時計回り, 2:反時計回り
+}
+
+// 点qが線分pr上にあるか判定する関数（orientationが0（一直線）の場合のみ呼び出す）
+bool onSegment(double px, double py, double qx, double qy, double rx, double ry) {
+  return (qx <= max(px, rx) && qx >= min(px, rx) &&
+          qy <= max(py, ry) && qy >= min(py, ry));
+}
+
+// 線分p1-p2と線分q1-q2が交差しているか判定する関数（外積を用いた一般的な線分交差判定アルゴリズム）
+bool segmentsIntersect(double p1x, double p1y, double p2x, double p2y,
+                        double q1x, double q1y, double q2x, double q2y) {
+  int8_t o1 = orientation(p1x, p1y, p2x, p2y, q1x, q1y);
+  int8_t o2 = orientation(p1x, p1y, p2x, p2y, q2x, q2y);
+  int8_t o3 = orientation(q1x, q1y, q2x, q2y, p1x, p1y);
+  int8_t o4 = orientation(q1x, q1y, q2x, q2y, p2x, p2y);
+
+  if (o1 != o2 && o3 != o4) return true;  // 一般ケース
+
+  // 特殊ケース（端点が相手の線分上に重なる場合）
+  if (o1 == 0 && onSegment(p1x, p1y, q1x, q1y, p2x, p2y)) return true;
+  if (o2 == 0 && onSegment(p1x, p1y, q2x, q2y, p2x, p2y)) return true;
+  if (o3 == 0 && onSegment(q1x, q1y, p1x, p1y, q2x, q2y)) return true;
+  if (o4 == 0 && onSegment(q1x, q1y, p2x, p2y, q2x, q2y)) return true;
+
+  return false;
+}
+
+// 現在のロケーションに対応するコントロールライン座標を取得する関数（未定義ロケーションではfalseを返す）
+bool getControlLineForLoc(const String& loc, double& outLa1, double& outLn1, double& outLa2, double& outLn2) {
+  if (loc == "su") {
+    outLa1 = controlline_la1_su; outLn1 = controlline_ln1_su;
+    outLa2 = controlline_la2_su; outLn2 = controlline_ln2_su;
+    return true;
+  }
+  if (loc == "mo") {
+    outLa1 = controlline_la1_mo; outLn1 = controlline_ln1_mo;
+    outLa2 = controlline_la2_mo; outLn2 = controlline_ln2_mo;
+    return true;
+  }
+  if (loc == "to") {
+    outLa1 = controlline_la1_to; outLn1 = controlline_ln1_to;
+    outLa2 = controlline_la2_to; outLn2 = controlline_ln2_to;
+    return true;
+  }
+  return false;
+}
+
+// GPSの前回位置→今回位置を結ぶ線分がコントロールラインと交差したか判定し、
+// 交差していればLapcountをインクリメントする関数（多重カウント防止のデバウンス・GPSロスト後の誤検出防止のテレポートガード付き）
+void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, double prevLng) {
+  static bool hasPriorFix = false;
+  static unsigned long lastLapCrossedAt = 0;
+
+  if (!positionUpdated) {
+    return;  // 今回GPSの新規測位がない場合は判定しない（誤検出防止）
+  }
+
+  if (!hasPriorFix) {
+    hasPriorFix = true;  // 初回の有効な測位では前回位置が無いため判定をスキップする
+    return;
+  }
+
+  double clLa1, clLn1, clLa2, clLn2;
+  if (!getControlLineForLoc(Loc, clLa1, clLn1, clLa2, clLn2)) {
+    return;  // コントロールライン座標が未定義のロケーションでは判定しない
+  }
+
+  if (millis() - lastLapCrossedAt < LAP_CROSS_DEBOUNCE_MS) {
+    return;  // クールダウン時間内の連続検出は多重カウント防止のため無視する
+  }
+
+  // GPSロスト後の再測位による「テレポート」誤検出を防止（前回位置からの概算移動距離が閾値超なら判定しない）
+  double dLat = la - prevLat;
+  double dLng = ln - prevLng;
+  double metersPerDegLat = 111320.0;
+  double metersPerDegLng = 111320.0 * cos(la * pi / 180.0);
+  double movedMeters = sqrt(pow(dLat * metersPerDegLat, 2) + pow(dLng * metersPerDegLng, 2));
+  if (movedMeters > LAP_CROSS_TELEPORT_GUARD_M) {
+    return;
+  }
+
+  if (segmentsIntersect(prevLat, prevLng, la, ln, clLa1, clLn1, clLa2, clLn2)) {
+    Lapcount++;
+    lastLapCrossedAt = millis();
+  }
+}
+
 // GNSSからの位置・時刻読み取り
 void updateGNSS() {
+  double prevLa = la;   // ラップカウント判定用に前回位置を退避
+  double prevLn = ln;
+  bool positionUpdated = false;
+
   uint16_t parsedBytes = 0;
   while (Serial2.available() > 0 && parsedBytes < GNSS_PARSE_BUDGET_BYTES) {
     char ch = Serial2.read();
@@ -841,12 +954,13 @@ void updateGNSS() {
     if (gps.encode(ch)) {
       if (gps.time.isUpdated()) {
         updateSystemTimeFromGnss();
-        if (gps.location.lng() > 120) {  // 異常値除外
+        if (gps.location.lng() > 120 && gps.location.isValid()) {  // 異常値・未固定を除外
           la = gps.location.lat();
           ln = gps.location.lng();
           spd = gps.speed.kmph();
           uint8_t gnss_csec = gps.time.centisecond();
           refreshDatetime(gnss_csec);  // デバッグ用Serial出力
+          positionUpdated = true;
         }
         break;
       }
@@ -866,6 +980,8 @@ void updateGNSS() {
   } else {
     Loc = "to";
   }
+
+  updateLapCountByControlLineCrossing(positionUpdated, prevLa, prevLn);
 }
 
 // 国土地理院APIを呼び出すために、現在の緯度経度が有効かどうかを判定する
