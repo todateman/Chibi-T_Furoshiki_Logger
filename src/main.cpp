@@ -1412,7 +1412,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa),噴射終了角(CA)"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -1428,12 +1428,15 @@ void updateSDLog() {
     char logLine[SD_LINE_BUFFER_SIZE] = {0};
     int lineLen = snprintf(logLine,
                            sizeof(logLine),
-                           "%s,%.1f,%u,%u,%u,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.2f,%.2f,%.2f,%d\n",
+                           "%s,%.1f,%u,%u,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f\n",
                            datetime,
                            speed,
                            static_cast<unsigned int>(Lapcount),
                            static_cast<unsigned int>(worktime),
                            static_cast<unsigned int>(tachoRpm),
+                           INJ_timems,
+                           static_cast<unsigned int>(IGN_CA),
+                           static_cast<int>(injEndCA),
                            static_cast<unsigned int>(distance),
                            gasml,
                            dispergas,
@@ -1447,8 +1450,7 @@ void updateSDLog() {
                            humStr,
                            PriPre,
                            SecPre,
-                           FuelPre,
-                           static_cast<int>(injEndCA));
+                           FuelPre);
 
     if (lineLen <= 0 || lineLen >= static_cast<int>(sizeof(logLine))) {
       Serial.println("SD log line build failed");
