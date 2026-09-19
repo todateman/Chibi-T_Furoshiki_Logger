@@ -34,6 +34,9 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - ECU: Serial1 115200 bps、RXピンはボード依存  
   (M5Stack Core2: RX=2, TX=0 / M5Stack Basic: RX=15, TX=0)  
   ※M5Stack Basicの起動不良対策としてGPIO12を使用しないため分岐 (コード参照)
+  - 受信フォーマット (10Hz): `rpm,inj(ms),ign_ca,inj_end_ca,speed,distance,fuel(ml),km/L,worktime*XX`  
+    `XX` は先頭から `*` 直前までのXOR (16進2桁)。不一致・項目不足の行は破棄する。EFI側と同時に更新すること (旧形式とは非互換)  
+    RXバッファは1024Bに拡大 (MQTT/HTTP中の取りこぼし対策)
 - GNSS: Serial2 115200 bps (RX=13, TX=14)
 - BME280(気圧/気温/湿度センサ): I2C 0x76、SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
 - BLE 中継機 [M5NanoC6_BLE_Central](https://github.com/todateman/M5NanoC6_BLE_Central) (M5NanoC6): Port A 経由の I2C で接続（NanoC6側がI2Cスレーブ, addr=`0x08`）
@@ -133,12 +136,13 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 ## ログファイル仕様 (SD)
 
-ヘッダ: `記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)`
+ヘッダ: `記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa),噴射終了角(CA)`
 
 - 記録日時: GNSS + JST補正 (`YYYY/M/D hh:mm:ss.cc`)
 - `alt`: BME280高度 + 国土地理院APIで確定したオフセット
 - `loc`: サーキット判定結果 (`su` / `mo` / `to`)
 - 走行時間: ECU送信の積算秒
+- 噴射終了角(CA): ECU送信の燃料噴射終了角。ECU無信号時は0
 - 燃費: コード中 `dispergas` (km/L 指定の閾値 2000 スケールバー)
 - タイムスタンプは `logFile.timestamp()` によりファイル更新時にも設定
 - ログ周期は 10Hz (`SD_LOG_INTERVAL=100ms`)

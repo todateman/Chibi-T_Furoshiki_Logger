@@ -157,6 +157,7 @@ unsigned long receiveECUtime = 0;
 uint16_t tachoRpm = 0;  // エンジン回転数 [rpm]
 float INJ_timems = 0.0; // 燃料噴射時間 [ms]（燃料噴射量の指標として利用）
 uint8_t IGN_CA = 0;     // 点火時期 [°CA]（クランク角度）
+int16_t injEndCA = 0;    // 燃料噴射終了角 [°CA]（クランク角度）
 float speed = 0.0;      // 車軸パルスから算出した車速 [km/h]
 uint16_t distance = 0;  // 走行距離 [m]
 float gasml = 0.0;      // 燃料消費量 [ml]（燃料噴射時間から推定）※あくまで目安で、実際の消費量とは異なる可能性が高い
@@ -634,29 +635,56 @@ bool tryParseBLEFloatValue(const String& raw, float& outValue) {
   return true;
 }
 
-// ECU 1行CSVをパースする（期待フォーマット: 8項目）
+// ECU 1行CSVをパースする
+// 期待フォーマット: rpm,inj,ign,inj_end,speed,distance,gasml,dispergas,worktime*XX
+// XX は先頭から'*'直前までのXOR（16進2桁）。不一致・項目不足の行は捨て、グローバルは更新しない。
 bool tryParseEcuCsvLine(char* line) {
   if (line == nullptr || line[0] == '\0') {
     return false;
   }
 
+  char* star = strrchr(line, '*');
+  if (star == nullptr || strlen(star) != 3) {
+    return false;
+  }
+  char* csEnd = nullptr;
+  unsigned long expected = strtoul(star + 1, &csEnd, 16);
+  if (*csEnd != '\0') {
+    return false;
+  }
+  uint8_t cs = 0;
+  for (const char* p = line; p < star; p++) {
+    cs ^= static_cast<uint8_t>(*p);
+  }
+  if (cs != expected) {
+    return false;
+  }
+  *star = '\0';
+
+  // 欠けた行でグローバルが部分更新されないよう、全項目そろうまではローカルに溜める
+  uint16_t rpm = 0, dist = 0, work = 0;
+  float inj = 0.0f, spd = 0.0f, gas = 0.0f, dispGas = 0.0f;
+  uint8_t ign = 0;
+  int16_t injEnd = 0;
+
   uint8_t index = 0;
   char* savePtr = nullptr;
   char* token = strtok_r(line, ",", &savePtr);
-  while (token != nullptr && index < 8) {
+  while (token != nullptr && index < 9) {
     while (*token == ' ' || *token == '\t') {
       token++;
     }
 
     switch (index) {
-      case 0: tachoRpm = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
-      case 1: INJ_timems = strtof(token, nullptr); break;
-      case 2: IGN_CA = static_cast<uint8_t>(strtoul(token, nullptr, 10)); break;
-      case 3: speed = strtof(token, nullptr); break;
-      case 4: distance = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
-      case 5: gasml = strtof(token, nullptr); break;
-      case 6: dispergas = strtof(token, nullptr); break;
-      case 7: worktime = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 0: rpm = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 1: inj = strtof(token, nullptr); break;
+      case 2: ign = static_cast<uint8_t>(strtoul(token, nullptr, 10)); break;
+      case 3: injEnd = static_cast<int16_t>(strtol(token, nullptr, 10)); break;
+      case 4: spd = strtof(token, nullptr); break;
+      case 5: dist = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 6: gas = strtof(token, nullptr); break;
+      case 7: dispGas = strtof(token, nullptr); break;
+      case 8: work = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
       default: break;
     }
 
@@ -664,9 +692,19 @@ bool tryParseEcuCsvLine(char* line) {
     token = strtok_r(nullptr, ",", &savePtr);
   }
 
-  if (index < 8) {
+  if (index < 9) {
     return false;
   }
+
+  tachoRpm = rpm;
+  INJ_timems = inj;
+  IGN_CA = ign;
+  injEndCA = injEnd;
+  speed = spd;
+  distance = dist;
+  gasml = gas;
+  dispergas = dispGas;
+  worktime = work;
 
   // Lapcountはコントロールライン通過検知（updateGNSS内のupdateLapCountByControlLineCrossing）で更新するため、
   // ここでは更新しない（旧: 走行距離ベースの周回数推定）
@@ -843,6 +881,7 @@ void updateECU() {
     tachoRpm = 0;
     INJ_timems = 0;
     IGN_CA = 0;
+    injEndCA = 0;
     speed = 0.0;
   }
 }
@@ -1373,7 +1412,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数,走行時間,回転数,走行距離,積算燃料,燃費,lat,lon,alt,loc,温度,気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa),噴射終了角(CA)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -1389,7 +1428,7 @@ void updateSDLog() {
     char logLine[SD_LINE_BUFFER_SIZE] = {0};
     int lineLen = snprintf(logLine,
                            sizeof(logLine),
-                           "%s,%.1f,%u,%u,%u,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.2f,%.2f,%.2f\n",
+                           "%s,%.1f,%u,%u,%u,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.2f,%.2f,%.2f,%d\n",
                            datetime,
                            speed,
                            static_cast<unsigned int>(Lapcount),
@@ -1408,7 +1447,8 @@ void updateSDLog() {
                            humStr,
                            PriPre,
                            SecPre,
-                           FuelPre);
+                           FuelPre,
+                           static_cast<int>(injEndCA));
 
     if (lineLen <= 0 || lineLen >= static_cast<int>(sizeof(logLine))) {
       Serial.println("SD log line build failed");
@@ -1642,6 +1682,8 @@ void setup() {
   updateEnvironmentSensors();
 
   // ECU初期化
+  // MQTT/HTTP等のブロッキング中もECUの行を取りこぼさないよう、begin()より前にRXバッファを拡大する
+  Serial1.setRxBufferSize(1024);
   Serial1.begin(ECU_BPS, SERIAL_8N1, ECU_RX_PIN, ECU_TX_PIN);
   Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
   
