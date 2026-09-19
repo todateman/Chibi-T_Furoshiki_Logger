@@ -182,7 +182,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 ```json
 {
   "timestamp": "2025/11/09 12:34:56.12",
-  "Spd_PULSE": 42,
+  "Spd_PULSE": 42.5,
   "Lapcount": 3,
   "worktime": 375,
   "tachoRpm": 5200,
@@ -278,7 +278,6 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 ## 次ステップ (改善案)
 
 - 停止操作で `sync/close` を明示実行する安全停止フローの追加
-- 速度(`Spd_PULSE`)を 0.1 km/h 単位で記録・送信 (必要ならスケール変更)
 - GNSS 日付処理の簡素化 (標準ライブラリ活用)
 - 証明書有効期限チェック機能
 
