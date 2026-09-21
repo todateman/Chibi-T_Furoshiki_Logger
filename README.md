@@ -34,7 +34,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - ECU: Serial1 115200 bps、RXピンはボード依存  
   (M5Stack Core2: RX=2, TX=0 / M5Stack Basic: RX=15, TX=0)  
   ※M5Stack Basicの起動不良対策としてGPIO12を使用しないため分岐 (コード参照)
-  - 受信フォーマット (10Hz): `rpm,inj(ms),ign_ca,inj_end_ca,speed,distance,fuel(ml),km/L,worktime*XX`  
+  - 受信フォーマット (10Hz): `rpm,inj(ms),ign_ca,inj_end_ca,speed,distance,fuel(ml),km/L,worktime*XX` (`worktime` は0.1秒単位の小数秒。例 `267.3`。整数秒でも受理)  
     `XX` は先頭から `*` 直前までのXOR (16進2桁)。不一致・項目不足の行は破棄する。EFI側と同時に更新すること (旧形式とは非互換)  
     RXバッファは1024Bに拡大 (MQTT/HTTP中の取りこぼし対策)
 - GNSS: Serial2 115200 bps (RX=13, TX=14)
@@ -138,10 +138,10 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 ヘッダ: `記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)` (22列)
 
-- 記録日時: GNSS + JST補正 (`YYYY/M/D hh:mm:ss.cc`)
+- 記録日時: GNSS/NTP同期時刻を基準にmillis()で連続算出 + JST補正 (`YYYY/M/D hh:mm:ss.cc`)。SDログ行は10Hzでも重複しない (厳密単調増加)
 - `alt`: BME280高度 + 国土地理院APIで確定したオフセット
 - `loc`: サーキット判定結果 (`su` / `mo` / `to`)
-- 走行時間: ECU送信の積算秒
+- 走行時間: ECU送信の積算秒 (0.1秒単位、小数1桁。例 `267.3`)。LCD表示・MQTT/Ambient送信は整数秒
 - 燃料噴射時間(ms) / 点火進角角度(CA) / 燃料噴射終了角度(CA): ECU送信値。ECU無信号時は0 (燃料噴射時間は小数1桁)
 - 燃費: コード中 `dispergas` (km/L 指定の閾値 2000 スケールバー)
 - タイムスタンプは `logFile.timestamp()` によりファイル更新時にも設定

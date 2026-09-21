@@ -162,7 +162,7 @@ float speed = 0.0;      // 車軸パルスから算出した車速 [km/h]
 uint16_t distance = 0;  // 走行距離 [m]
 float gasml = 0.0;      // 燃料消費量 [ml]（燃料噴射時間から推定）※あくまで目安で、実際の消費量とは異なる可能性が高い
 float dispergas = 0.0;  // 燃料消費率 [ml/km]（燃料消費量 / 走行距離）※あくまで目安で、実際の消費率とは異なる可能性が高い
-uint16_t worktime = 0;  // 走行時間 [s]（エンジン始動以降の時間を累積）
+float worktime = 0.0f;  // 走行時間 [s]（エンジン始動以降の時間を累積。ECUから0.1秒単位で受信）
 uint8_t Lapcount = 0;   // 現在の周回数
 uint8_t totallaps = 3;  // 規定周回数（サーキットごとに設定値を上書き）
 uint16_t goal = 1000;   // 走行距離 [m]（サーキットごとに設定値を上書き）
@@ -217,6 +217,13 @@ const int time_offset = 9;  // JST
 // 時刻表示用バッファ
 char datetime[23];
 uint64_t lastDatetimeCentis = 0;  // CSV時刻の逆行防止（1/100秒単位）
+uint64_t lastSdCentis = 0;        // SDログ行の時刻重複防止（1/100秒単位）
+
+// 時刻の基準クロック: 壁時計[1/100秒] = millis()/10 + clockOffsetCentis
+// GNSS/NTP同期時にアンカーし、以後はmillis()から連続的に算出する（呼び出し経路ごとの値のズレを防ぐ）
+int64_t clockOffsetCentis = 0;
+bool clockAnchored = false;
+const int64_t CLOCK_REANCHOR_THRESHOLD_CENTIS = 100;  // 推定値とのずれがこの値(1秒)を超えたときのみ再アンカー
 
 // NTP同期フラグ（GPS受信後は更新しない）
 bool ntpSyncDone = false;
@@ -232,8 +239,25 @@ bool isValidSyncYear(int year) {
   return year >= VALID_TIME_YEAR_MIN && year <= 2099;
 }
 
-// 日時バッファ更新関数の宣言（必要に応じてセンチ秒を指定可能）
-void refreshDatetime(uint8_t csec);
+// 基準クロックの現在値（1/100秒）を返す
+uint64_t clockNowCentis() {
+  return static_cast<uint64_t>(static_cast<int64_t>(millis() / 10UL) + clockOffsetCentis);
+}
+
+// 基準クロックを同期時刻(JST)にアンカーする
+// 未アンカー、または推定値とのずれが1秒を超えたときのみ更新し、小さなずれでは動かさない
+void anchorClock(time_t jstSec, uint8_t csec) {
+  int64_t targetCentis = static_cast<int64_t>(jstSec) * 100LL + static_cast<int64_t>(csec);
+  int64_t newOffset = targetCentis - static_cast<int64_t>(millis() / 10UL);
+  int64_t diff = newOffset - clockOffsetCentis;
+  if (!clockAnchored || diff > CLOCK_REANCHOR_THRESHOLD_CENTIS || diff < -CLOCK_REANCHOR_THRESHOLD_CENTIS) {
+    clockOffsetCentis = newOffset;
+    clockAnchored = true;
+  }
+}
+
+// 日時バッファ更新関数の宣言
+void refreshDatetime();
 
 // NTPサーバーからの時刻同期を試みる関数（成功した場合はtrueを返す）
 bool trySyncTimeFromNtp(unsigned long timeoutMs) {
@@ -254,8 +278,10 @@ bool trySyncTimeFromNtp(unsigned long timeoutMs) {
       if (isValidSyncYear(calendarYear)) {
         ntpSyncDone = true;
         // TimeLib側はJST基準で扱う（GNSS同期経路と同じ基準）
-        setTime(static_cast<time_t>(epoch) + static_cast<time_t>(time_offset * SECS_PER_HOUR));
-        refreshDatetime(0);
+        time_t jstEpoch = static_cast<time_t>(epoch) + static_cast<time_t>(time_offset * SECS_PER_HOUR);
+        setTime(jstEpoch);
+        anchorClock(jstEpoch, 0);
+        refreshDatetime();
         Serial.printf("NTP sync succeeded: %04d/%02d/%02d %02d:%02d:%02d\n",
                       calendarYear,
                       timeinfo.tm_mon + 1,
@@ -275,47 +301,48 @@ bool trySyncTimeFromNtp(unsigned long timeoutMs) {
   return false;
 }
 
-// 日時バッファ更新（必要に応じてセンチ秒を指定）
-void refreshDatetime(uint8_t csec = 255) {
-  time_t currentSecond = now();
-  uint8_t displayCsec = csec;
-  if (displayCsec > 99) {
+// 1/100秒単位の時刻をdatetimeバッファへ整形する
+void formatDatetime(uint64_t centis) {
+  tmElements_t tm;
+  breakTime(static_cast<time_t>(centis / 100ULL), tm);
+
+  sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
+            tmYearToCalendar(tm.Year), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second,
+            static_cast<unsigned int>(centis % 100ULL));
+}
+
+// 日時バッファ更新
+// 同期済みなら基準クロック(millis由来)から算出し、呼び出し元によらず同じ時間軸で値を返す
+void refreshDatetime() {
+  uint64_t currentCentis;
+  if (clockAnchored) {
+    currentCentis = clockNowCentis();
+  } else {
+    // 未同期時のフォールバック: 現在秒の先頭からの経過時間でセンチ秒を算出する
     static time_t centiBaseSecond = 0;
     static unsigned long centiBaseMillis = 0;
+    time_t currentSecond = now();
     unsigned long nowMs = millis();
-
-    // センチ秒が指定されていない場合は、現在秒の先頭からの経過時間で算出する
-    // 1Hzロギング時に "毎秒+0.01" ずつ増える見え方を防ぐ
+    uint8_t csec = 0;
     if (currentSecond != centiBaseSecond) {
       centiBaseSecond = currentSecond;
       centiBaseMillis = nowMs;
-      displayCsec = 0;
     } else {
       unsigned long elapsedMs = nowMs - centiBaseMillis;
-      if (elapsedMs > 990) {
-        elapsedMs = 990;
-      }
-      displayCsec = static_cast<uint8_t>(elapsedMs / 10);
+      csec = static_cast<uint8_t>(elapsedMs > 990 ? 99 : elapsedMs / 10);
     }
+    currentCentis = static_cast<uint64_t>(currentSecond) * 100ULL + csec;
   }
 
-  // GNSS/NTP再同期で秒が戻った場合でも、ログ時刻文字列は単調増加を維持する
+  // 再アンカー等で時刻が戻った場合でも、ログ時刻文字列は単調増加を維持する
   // NOTE: ここで setTime() は呼ばない。呼ぶと同一秒内の多重呼び出しで秒が人工的に進み、
   //       CSV時刻のバースト/空白を生むため。
-  uint64_t currentCentis = static_cast<uint64_t>(currentSecond) * 100ULL + static_cast<uint64_t>(displayCsec);
   if (currentCentis < lastDatetimeCentis) {
     currentCentis = lastDatetimeCentis;
-    displayCsec = static_cast<uint8_t>(lastDatetimeCentis % 100ULL);
-  } else {
-    displayCsec = static_cast<uint8_t>(currentCentis % 100ULL);
   }
   lastDatetimeCentis = currentCentis;
 
-  tmElements_t tm;
-  breakTime(static_cast<time_t>(currentCentis / 100ULL), tm);
-
-  sprintf_P(datetime, PSTR("%d/%d/%d %02d:%02d:%02d.%02d"),
-            tmYearToCalendar(tm.Year), tm.Month, tm.Day, tm.Hour, tm.Minute, tm.Second, displayCsec);
+  formatDatetime(currentCentis);
 }
 
 // GNSS UTC日時をJSTへ変換したtime_tを作成する
@@ -662,8 +689,8 @@ bool tryParseEcuCsvLine(char* line) {
   *star = '\0';
 
   // 欠けた行でグローバルが部分更新されないよう、全項目そろうまではローカルに溜める
-  uint16_t rpm = 0, dist = 0, work = 0;
-  float inj = 0.0f, spd = 0.0f, gas = 0.0f, dispGas = 0.0f;
+  uint16_t rpm = 0, dist = 0;
+  float inj = 0.0f, spd = 0.0f, gas = 0.0f, dispGas = 0.0f, work = 0.0f;
   uint8_t ign = 0;
   int16_t injEnd = 0;
 
@@ -684,7 +711,7 @@ bool tryParseEcuCsvLine(char* line) {
       case 5: dist = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
       case 6: gas = strtof(token, nullptr); break;
       case 7: dispGas = strtof(token, nullptr); break;
-      case 8: work = static_cast<uint16_t>(strtoul(token, nullptr, 10)); break;
+      case 8: work = strtof(token, nullptr); break;
       default: break;
     }
 
@@ -692,7 +719,7 @@ bool tryParseEcuCsvLine(char* line) {
     token = strtok_r(nullptr, ",", &savePtr);
   }
 
-  if (index < 9) {
+  if (index < 9 || !isfinite(work) || work < 0.0f) {
     return false;
   }
 
@@ -993,12 +1020,14 @@ void updateGNSS() {
     if (gps.encode(ch)) {
       if (gps.time.isUpdated()) {
         updateSystemTimeFromGnss();
+        time_t gnssJst = 0;
+        if (buildGnssJstTime(gnssJst)) {
+          anchorClock(gnssJst, gps.time.centisecond());  // 基準クロックをGNSS時刻に同期
+        }
         if (gps.location.lng() > 120 && gps.location.isValid()) {  // 異常値・未固定を除外
           la = gps.location.lat();
           ln = gps.location.lng();
           spd = gps.speed.kmph();
-          uint8_t gnss_csec = gps.time.centisecond();
-          refreshDatetime(gnss_csec);  // デバッグ用Serial出力
           positionUpdated = true;
         }
         break;
@@ -1325,16 +1354,17 @@ void updateDisplay() {
   lcd_s.setTextDatum(BL_DATUM);
   lcd_s.setCursor(140, 210);
   if (dispmode == 0) {
-    uint8_t workmin = worktime / 60;
-    uint8_t worksec = worktime % 60;
-    lcd_s.setTextColor((map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0)) ? TFT_WHITE : TFT_MAGENTA);
+    const uint16_t worktimeSec = static_cast<uint16_t>(worktime);  // 表示は秒単位
+    uint8_t workmin = worktimeSec / 60;
+    uint8_t worksec = worktimeSec % 60;
+    lcd_s.setTextColor((map(distance, 0, goal, 300, 0) <= map(worktimeSec, 0, limittime, 300, 0)) ? TFT_WHITE : TFT_MAGENTA);
     lcd_s.printf("%02d:%02d", workmin, worksec);
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
-    if (map(distance, 0, goal, 300, 0) <= map(worktime, 0, limittime, 300, 0))
-      lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_WHITE);
+    if (map(distance, 0, goal, 300, 0) <= map(worktimeSec, 0, limittime, 300, 0))
+      lcd_s.fillRect(10, 215, map(worktimeSec, 0, limittime, 300, 0), 10, TFT_WHITE);
     else
-      lcd_s.fillRect(10, 215, map(worktime, 0, limittime, 300, 0), 10, TFT_MAGENTA);
-    lcd_s.fillRect(map(worktime, 0, limittime, 310, 10), 215, map(worktime, 0, limittime, 0, 300), 10, TFT_BLACK);
+      lcd_s.fillRect(10, 215, map(worktimeSec, 0, limittime, 300, 0), 10, TFT_MAGENTA);
+    lcd_s.fillRect(map(worktimeSec, 0, limittime, 310, 10), 215, map(worktimeSec, 0, limittime, 0, 300), 10, TFT_BLACK);
   } else if (dispmode == 1) {
     lcd_s.print(IGN_CA);
     lcd_s.drawRect(9, 214, 302, 12, TFT_WHITE);
@@ -1350,6 +1380,7 @@ void updateDisplay() {
 
 // デバッグ用Serial送信（CSV形式）
 void updateSerialOutput() {
+  refreshDatetime();  // 出力する日時を更新
   Serial.print(la, 7); Serial.print(",");
   Serial.print(ln, 7); Serial.print(",");
   Serial.print(alt, 1); Serial.print(",");
@@ -1360,7 +1391,7 @@ void updateSerialOutput() {
   Serial.print(distance); Serial.print(",");
   Serial.print(gasml, 1); Serial.print(",");
   Serial.print(dispergas, 1); Serial.print(",");
-  Serial.print(worktime); Serial.print(",");
+  Serial.print(worktime, 1); Serial.print(",");
   Serial.print(EngTemp, 2); Serial.print(",");
   if (isfinite(envPressureKPa)) { Serial.print(envPressureKPa, 3); }
   Serial.print(",");
@@ -1396,7 +1427,15 @@ void flushSdBatch(bool doSync) {
 
 // SDカードへのログ書き出し
 void updateSDLog() {
-  refreshDatetime();  // MQTT送信前に日時を更新
+  refreshDatetime();  // 日時を更新
+
+  // SD行の時刻は厳密単調増加にする（同一10ms内の連続呼び出しでも重複させない）
+  if (lastDatetimeCentis <= lastSdCentis) {
+    formatDatetime(lastSdCentis + 1ULL);
+    lastSdCentis++;
+  } else {
+    lastSdCentis = lastDatetimeCentis;
+  }
 
   bool isNewFile = false;
   if (!logFileInitialized) {
@@ -1428,11 +1467,11 @@ void updateSDLog() {
     char logLine[SD_LINE_BUFFER_SIZE] = {0};
     int lineLen = snprintf(logLine,
                            sizeof(logLine),
-                           "%s,%.1f,%u,%u,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f\n",
+                           "%s,%.1f,%u,%.1f,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f\n",
                            datetime,
                            speed,
                            static_cast<unsigned int>(Lapcount),
-                           static_cast<unsigned int>(worktime),
+                           worktime,
                            static_cast<unsigned int>(tachoRpm),
                            INJ_timems,
                            static_cast<unsigned int>(IGN_CA),
@@ -1596,7 +1635,7 @@ void updateAmbient() {
     ambient.set(1, speed);
     ambient.set(2, EngTemp);
     ambient.set(3, Lapcount);
-    ambient.set(4, worktime);
+    ambient.set(4, static_cast<int>(worktime));
     ambient.set(5, tachoRpm);
     ambient.set(6, distance);
     ambient.set(7, gasml);
@@ -1922,7 +1961,7 @@ void loop() {
   // MQTT送信は頻度を変えて実行（周回開始前は低頻度、周回開始後は高頻度）
   // Wi-Fi接続が必要なため、接続成功している場合のみ更新する
   if (MQTTpush) {
-    if (worktime == 0) {
+    if (worktime <= 0.0f) {
       if (millis() - t_MQTT >= MQTT_INTERVAL_PRE) {
         updateMQTT();
         t_MQTT += MQTT_INTERVAL_PRE;
