@@ -3,11 +3,11 @@
 M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー兼リアルタイム表示システムです。  
 以下を統合しています:
 
-- ECU からの走行データ取得 (Serial1)
+- [ECU](https://github.com/todateman/UNOR4_Chibi-T_EFI) からの走行データ取得 (Serial1)
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
 - 高度推定 (BME280を用いた気圧→高度換算)
 - インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
-- BLE 経由のエンジン温度・1次側/2次側空気圧・燃圧受信 (M5NanoC6 BLE中継機とPort A経由のI2C通信)
+- BLE 経由の[エンジン温度](https://github.com/todateman/Chibi-T_Furoshiki_Heater)・[1次側/2次側空気圧・燃圧](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust)受信 ([nF52840 BLE中継機](https://github.com/todateman/nRF52840_BLE_Central)とPort A経由のI2C通信)
 - BME280を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
@@ -29,7 +29,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 ## ハードウェア / 接続
 
-- 基板: M5Stack Core2 (ESP32, PSRAM 使用) / M5Stack Basic (Gray)
+- 基板: M5Stack Basic (Gray) / M5Stack Core2 (ESP32, PSRAM 使用)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps、RXピンはボード依存  
   (M5Stack Core2: RX=2, TX=0 / M5Stack Basic: RX=15, TX=0)  
@@ -39,7 +39,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
     RXバッファは1024Bに拡大 (MQTT/HTTP中の取りこぼし対策)
 - GNSS: Serial2 115200 bps (RX=13, TX=14)
 - BME280(気圧/気温/湿度センサ): I2C 0x76、SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
-- BLE 中継機 [M5NanoC6_BLE_Central](https://github.com/todateman/M5NanoC6_BLE_Central) (M5NanoC6): Port A 経由の I2C で接続（NanoC6側がI2Cスレーブ, addr=`0x08`）
+- BLE 中継機 [nRF52840_BLE_Central](https://github.com/todateman/nRF52840_BLE_Central) (XIAO nRF52840): Port A 経由の I2C で接続（XIAO nRF52840側がI2Cスレーブ, addr=`0x08`）
   - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。BME280用バスとはピンが異なるため)
   - M5Stack Basic: SDA=21, SCL=22 (BME280用`Wire`バスと共用。Port Aのピンが同一のため)
   - 200ms間隔で以下4コマンドを順に送信し、それぞれ32byte固定フレーム（`[0]`=データ長, `[1..]`=文字列データ）でデータを取得。いずれも2秒以上有効データを取得できない場合は該当値を`0.0`にリセットする
@@ -255,7 +255,8 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
 | MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
 | Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
-| 温度/PRI/SEC/FUEL が 0.0 固定 | NanoC6とのI2C通信失敗、またはNanoC6が対応するBLEペリフェラル(Heater/AutoAirAdjust)からNotifyをまだ受信していない <BR> (該当値ごとに有効データ未取得が2秒以上継続でリセット) |
+| 温度/PRI/SEC/FUEL が 0.0 固定 | BLE中継機(XIAO nRF52840)とのI2C通信失敗、またはBLE中継機が対応するBLEペリフェラル(Heater/AutoAirAdjust)からNotifyを受信できていない <BR> (該当値ごとに有効データ未取得が2秒以上継続でリセット。BLE中継機は切断時や3秒以上更新のないデータを長さ0で返すため、ペリフェラル側が止まった場合もここに該当する) |
+| 温度だけが同じ値のまま変化しない (例: LOG0645 の 79.50 固定) | BLE中継機の旧ファームウェアの不具合。AutoAirAdjust 接続中に Heater だけ切断されると再接続されず、切断前の値を返し続けていた <BR> [nRF52840_BLE_Central](https://github.com/todateman/nRF52840_BLE_Central) を最新版(2026-10-03 以降)へ更新する |
 | `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
 
 ### MQTT 診断ログ運用
@@ -273,7 +274,6 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 ## 既知の課題 (改善予定)
 
 1. 電源断耐性: 開きっぱなし運用のため、電源断時は最後の `sync()` 以降の数秒分が欠損する可能性がある
-2. BLE中継データの鮮度検知: NanoC6とのI2C通信自体が正常でも、NanoC6内部でBLE Notifyが途絶えた場合は検知できず、古い温度値を返し続ける可能性がある（NanoC6側にNotifyタイムアウト検知機能が無いため。詳細は [M5NanoC6_BLE_Central](https://github.com/todateman/M5NanoC6_BLE_Central) の今後の改善案を参照）
 
 ## 次ステップ (改善案)
 
