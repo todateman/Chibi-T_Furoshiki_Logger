@@ -15,5 +15,9 @@
         "algorithm": "cpp",
         "sstream": "cpp"
     },
-    "cmake.sourceDirectory": "C:/Users/todat/vscode/PlatformIO/Chibi-T_Furoshiki_Logger/.pio/libdeps/m5stack-core2/M5Unified"
+    "cmake.sourceDirectory": "C:/Users/todat/vscode/PlatformIO/Chibi-T_Furoshiki_Logger/.pio/libdeps/m5stack-core2/M5Unified",
+    "git.pruneOnFetch": true,
+    "git.autofetch": true,
+    "git.autofetchPeriod": 600,
+    "git.enabled": true,
 }
