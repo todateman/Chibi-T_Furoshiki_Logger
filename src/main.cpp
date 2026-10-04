@@ -1054,20 +1054,25 @@ void drawStrategyMode() {
   const int restlaps = max(0, static_cast<int>(totallaps) - static_cast<int>(Lapcount));
   lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
   lcd_s.setTextDatum(TL_DATUM);
-  lcd_s.drawString(restlaps == 1 ? "最終周" : "残り", 8, 168);
-  lcd_s.drawString("走行時間", 84, 168);
+  lcd_s.drawString(restlaps == 1 ? "最終周" : "残り", 8, 162);
+  lcd_s.drawString("走行時間", 84, 162);
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd_s.setTextSize(2);
   snprintf(buf, sizeof(buf), "%d周", restlaps);
-  lcd_s.drawString(buf, 8, 190);
+  lcd_s.drawString(buf, 8, 182);
 
   // 走行時間（直近の通過が遅れていればマゼンタ）
+  const int timeColor = (plainBg && out.bumpKmh > 0.0f) ? TFT_MAGENTA : fg;
   formatMinSec(buf, sizeof(buf), worktime);
-  if (plainBg && out.bumpKmh > 0.0f) {
-    lcd_s.setTextColor(TFT_MAGENTA);
-  }
-  lcd_s.drawString(buf, 84, 190);
+  lcd_s.setTextColor(timeColor);
+  lcd_s.drawString(buf, 84, 182);
   lcd_s.setTextColor(fg);
+
+  // 規定時間までの残り時間の帯。位置バーの現在地と同じ向きにそろえ、時間が進むと左から右へ短くなる
+  const float elapsedRatio = (limittime > 0) ? constrain(worktime / static_cast<float>(limittime), 0.0f, 1.0f) : 0.0f;
+  const int elapsedPx = static_cast<int>(elapsedRatio * barW);
+  lcd_s.drawRect(barX - 1, 226, barW + 2, 12, fg);
+  lcd_s.fillRect(barX + elapsedPx, 227, barW - elapsedPx, 10, timeColor);
 
   // 直近の通過タイムと目標との差。まだ通過していなければ加速開始位置の一覧
   lcd_s.setTextDatum(TR_DATUM);
@@ -1082,25 +1087,25 @@ void drawStrategyMode() {
     } else if (plainBg && out.bumpKmh < 0.0f) {
       lcd_s.setTextColor(TFT_CYAN);
     }
-    lcd_s.drawString(buf, 316, 190);
+    lcd_s.drawString(buf, 316, 182);
     lcd_s.setTextColor(fg);
     lcd_s.setTextSize(1);
     lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
     char splitStr[8];
     formatMinSec(splitStr, sizeof(splitStr), out.splitS);
     snprintf(buf, sizeof(buf), "%u周 %s", static_cast<unsigned int>(out.splitLap), splitStr);
-    lcd_s.drawString(buf, 316, 168);
+    lcd_s.drawString(buf, 316, 162);
   } else {
     lcd_s.setTextSize(1);
     lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
-    lcd_s.drawString("加速位置(m)", 316, 168);
+    lcd_s.drawString("加速位置(m)", 316, 162);
     lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
     int len = 0;
     buf[0] = '\0';
     for (uint8_t i = 0; i < pattern.markCount && len < static_cast<int>(sizeof(buf)) - 8; i++) {
       len += snprintf(buf + len, sizeof(buf) - len, i == 0 ? "%d" : "/%d", static_cast<int>(pattern.marksM[i]));
     }
-    lcd_s.drawString(buf, 316, 200);
+    lcd_s.drawString(buf, 316, 192);
   }
   lcd_s.setTextSize(1);
 }
