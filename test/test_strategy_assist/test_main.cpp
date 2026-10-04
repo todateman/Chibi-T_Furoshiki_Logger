@@ -71,7 +71,7 @@ struct Runner {
     return step();
   }
 
-  // 加速して停止速度の手前でエンジンを止めるまでを進める
+  // 加速して加速停止速度の手前でエンジンを止めるまでを進める
   void burn(float seconds = 2.0f) {
     in.engineOn = true;
     step(seconds);
@@ -161,7 +161,7 @@ void test_skip_mark_when_fast() {
   Runner r;
   const Output& o = r.assist.output();
   r.at(390.0f, 31.0f);
-  r.at(400.0f, 31.0f);  // 停止速度まで 2 km/h 未満
+  r.at(400.0f, 31.0f);  // 加速停止速度まで 2 km/h 未満
   TEST_ASSERT_TRUE(o.cue == Cue::Coast);
   TEST_ASSERT_EQUAL_INT(1, o.nextMark);
 }
@@ -387,7 +387,7 @@ void test_fuel_pressure_warning() {
 }
 
 void test_optional_features_off_when_not_configured() {
-  // 保険の速度・燃圧のしきい値・目標通過タイムを設定しなければ、それぞれの機能は働かない
+  // 最低限界速度・燃圧のしきい値・目標通過タイムを設定しなければ、それぞれの機能は働かない
   Config cfg;
   cfg.enabled = true;
   cfg.lapM = 2341.38f;

@@ -77,7 +77,7 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define SD_SYNC_LINE_THRESHOLD 40
 #define SD_SYNC_TIME_MS 5000UL
 
-// 走行支援（加速開始位置・停止速度・通過タイムの合図）
+// 走行支援（加速開始位置・加速停止速度・通過タイムの合図）
 #ifndef STRATEGY_SIM
 #define STRATEGY_SIM 0  // 机上確認用の仮想走行（0:無効, 1以上:時間の倍率）。本番は必ず0
 #endif
@@ -939,7 +939,7 @@ void drawStrategyMode() {
   snprintf(buf, sizeof(buf), "SD:%c GNSS:%c MQ:%c", LOGGING ? 'O' : 'x', positionFresh ? 'O' : 'x', MQTTpush ? 'O' : 'x');
   lcd_s.drawString(buf, 318, 0);
 
-  // 速度と、今の周の停止速度
+  // 速度と、今の周の加速停止速度
   lcd_s.setFont(&fonts::Font7);
   lcd_s.setTextDatum(TR_DATUM);
   snprintf(buf, sizeof(buf), "%.1f", speed);
@@ -961,7 +961,7 @@ void drawStrategyMode() {
   lcd_s.setTextColor(fg);
   lcd_s.setTextSize(1);
 
-  // 速度バー（0〜45 km/h）と、保険の速度・停止速度の目盛り
+  // 速度バー（0〜45 km/h）と、最低限界速度・加速停止速度の目盛り
   const int barX = 10;
   const int barW = 300;
   const float barMaxKmh = 45.0f;
@@ -1529,7 +1529,7 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
     lastLapCrossedAt = millis();
     lapCountDistanceBase = distance;
     lapCountDistanceBaseValid = true;
-    strategy.onLapCrossed(Lapcount, worktime);  // 通過タイムを保持し、次の周の停止速度を決める
+    strategy.onLapCrossed(Lapcount, worktime);  // 通過タイムを保持し、次の周の加速停止速度を決める
   }
 }
 

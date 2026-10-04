@@ -16,10 +16,10 @@ constexpr uint32_t ENGINE_HOLD_MS = 300;    // 噴射0が一瞬混じっても�
 constexpr uint32_t BURN_CONFIRM_MS = 1500;  // これだけ噴射が続いたら始動成功とみなす（スタータのタイムアウト1秒より長く）
 constexpr uint32_t FUEL_CHECK_DELAY_MS = 1000;  // 加速開始からこの時間は燃圧を判定しない
 constexpr float FUEL_VALID_MIN_MPA = 0.05f; // これ以下の燃圧は「未受信」として扱う（BLE途絶時は0.0になる）
-constexpr float STOPPED_KMH = 3.0f;         // これ未満は停車中とみなし、保険の合図を出さない
+constexpr float STOPPED_KMH = 3.0f;         // これ未満は停車中とみなし、最低限界速度の合図を出さない
 constexpr float MAX_EARLY_S = 120.0f;       // 目標よりこれ以上早い通過タイムは、時間基準か周回数のずれとみなして使わない
 
-// 加速パターン（開始位置と停止速度）
+// 加速パターン（開始位置と加速停止速度）
 struct Pattern {
   float vOffKmh = 0.0f;        // エンジンを止める速度 [km/h]
   uint8_t markCount = 0;       // 加速開始位置の数
@@ -31,8 +31,8 @@ struct Config {
   bool enabled = false;
   float lapM = 0.0f;           // 1周の距離 [m]
   uint8_t totalLaps = 0;       // 規定周回数
-  float guardKmh = 0.0f;       // 保険: この速度まで落ちたら場所によらず加速（0で無効）
-  float skipKmh = 2.0f;        // 目印通過時に停止速度までこれ未満しか残っていなければ加速しない
+  float guardKmh = 0.0f;       // 最低限界速度: この速度まで落ちたら場所によらず加速（0で無効）
+  float skipKmh = 2.0f;        // 目印通過時に加速停止速度までこれ未満しか残っていなければ加速しない
   float approachM = 100.0f;    // 目印のこの距離手前から予告する
   float missWindowM = 200.0f;  // 目印を過ぎてもこの距離までは「加速」を出し続ける
   Pattern primary;             // 通常パターン
@@ -44,7 +44,7 @@ struct Config {
   bool beep = true;
 };
 
-// 周回通過時の遅れ（+ が遅れ）から、次の周の停止速度の上げ幅 [km/h] を決める
+// 周回通過時の遅れ（+ が遅れ）から、次の周の加速停止速度の上げ幅 [km/h] を決める
 inline float paceBumpKmh(float delayS) {
   if (delayS > 35.0f) return 3.0f;
   if (delayS > 20.0f) return 2.0f;
@@ -66,9 +66,9 @@ enum class Cue : uint8_t {
   Approach,    // 次の目印が近い
   BurnNow,     // 加速せよ
   Burning,     // 加速中
-  CutNow,      // 停止せよ（停止速度に到達）
+  CutNow,      // 停止せよ（加速停止速度に到達）
   CoastHome,   // 最終周: このまま惰行でゴール
-  NoPosition,  // 位置不明（保険の速度と目視で走る）
+  NoPosition,  // 位置不明（最低限界速度の合図と目視で走る）
   Finished,    // 規定周回を完了
 };
 
@@ -84,9 +84,9 @@ struct Input {
 
 struct Output {
   Cue cue = Cue::Off;
-  float vOffKmh = 0.0f;      // 今の周の停止速度（補正込み）
-  float bumpKmh = 0.0f;      // 停止速度の補正量
-  bool guard = false;        // 保険の速度で「加速」を出している
+  float vOffKmh = 0.0f;      // 今の周の加速停止速度（補正込み）
+  float bumpKmh = 0.0f;      // 加速停止速度の補正量
+  bool guard = false;        // 最低限界速度で「加速」を出している
   int8_t nextMark = -1;      // 次の目印の番号（無ければ -1）
   float nextMarkDistM = NAN; // 次の目印までの距離 [m]
   uint8_t activeMarks = 0;   // 今の周で有効な目印の数
@@ -133,7 +133,7 @@ public:
     bumpKmh_ = 0.0f;
     if (lapsDone >= 1 && lapsDone <= cfg_.splitCount) {
       const float delayS = splitS - cfg_.splitsS[lapsDone - 1];
-      // ECUの再起動で走行時間が0に戻った場合などに、停止速度を誤って下げない
+      // ECUの再起動で走行時間が0に戻った場合などに、加速停止速度を誤って下げない
       if (delayS >= -MAX_EARLY_S) {
         delayS_ = delayS;
         bumpKmh_ = paceBumpKmh(delayS);
