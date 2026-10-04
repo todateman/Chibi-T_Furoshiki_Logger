@@ -1,0 +1,16 @@
+{
+  "lap_m": 2341.38,
+  "v_off": 32.5,
+  "marks_m": [400, 800, 1400],
+  "final_lap_marks": 2,
+  "final_extra_if_split_over_s": 1965,
+  "guard_kmh": 16.0,
+  "splits_s": [309, 630, 951, 1272, 1593, 1914],
+  "fallback": {
+    "v_off": 30.0,
+    "marks_m": [200, 600, 1000, 1400],
+    "final_lap_marks": 3
+  },
+  "fuel_warn_mpa": 0.30,
+  "beep": true
+}

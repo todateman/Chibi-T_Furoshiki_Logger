@@ -14,6 +14,7 @@
 #include <Wire.h>
 #include <string.h>
 #include <Adafruit_BME280.h>
+#include "StrategyAssist.h"
 #include "secrets.h"
 
 //==================== 定数・マクロ ====================
@@ -75,6 +76,21 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define SD_BATCH_BUFFER_SIZE 1024
 #define SD_SYNC_LINE_THRESHOLD 40
 #define SD_SYNC_TIME_MS 5000UL
+
+// 走行支援（加速開始位置・停止速度・通過タイムの合図）
+#ifndef STRATEGY_SIM
+#define STRATEGY_SIM 0  // 机上確認用の仮想走行（0:無効, 1以上:時間の倍率）。本番は必ず0
+#endif
+#define STRATEGY_FILE_BUFFER_SIZE 1536        // 走行支援の設定ファイル(JSON)の最大サイズ
+#define STRATEGY_POSITION_MAX_AGE_MS 3000UL   // GNSS測位がこれより古ければ位置不明として扱う
+#define STRATEGY_OFF_COURSE_M 60.0            // ウェイポイントを結んだ線からこれ以上離れていればコース外として扱う
+#define STRATEGY_BEEP_REPEAT_MS 2000UL        // 「加速」「停止」が続いている間のブザーの繰り返し間隔
+// ブザーはM5Stack Basicのみ。Core2は内蔵スピーカのI2S(GPIO0/2)がECU用UARTと同じピンのため鳴らさない
+#if defined(ARDUINO_M5Stack_Core_ESP32)
+  #define STRATEGY_BEEP_AVAILABLE 1
+#else
+  #define STRATEGY_BEEP_AVAILABLE 0
+#endif
 
 // MQTT設定
 #define MQTT_BUFFER_SIZE  512 // MQTT送受信のバッファサイズ
@@ -392,6 +408,7 @@ struct Waypoint {
   float lat;
   float lng;
   float alt;
+  float dist;  // 先頭ウェイポイントからの距離 [m]（CSVに距離列が無い場合はNAN）
 };
 
 // ウェイポイントデータの最大数（必要に応じて増減させる）
@@ -402,6 +419,24 @@ float waypointMinAlt = 0.0f;
 float waypointMaxAlt = 0.0f;
 String loadedWaypointLoc = "";
 int nearestWaypointIndex = -1;
+float waypointRawLapMeters = 0.0f;  // ウェイポイントCSV上の1周の距離 [m]（距離列が無い場合は0）
+
+// 走行支援
+StrategyAssist::Assist strategy;
+String loadedStrategyLoc = "";
+enum StrategySource : uint8_t { STRATEGY_SRC_NONE, STRATEGY_SRC_SD, STRATEGY_SRC_SD_ERROR };
+StrategySource strategySource = STRATEGY_SRC_NONE;  // 設定ファイルの読み込み結果（無し / 読み込み済み / 内容に異常）
+bool positionFresh = false;         // 現在位置が新しい測位に基づいているか
+uint32_t positionAgeMs = 0;         // 現在位置の測位からの経過時間 [ms]
+uint16_t lapCountDistanceBase = 0;  // 前回の周回カウント時のECU走行距離 [m]
+bool lapCountDistanceBaseValid = true;
+
+// 2点間の概算距離 [m]（サーキット内の短距離用）
+double approxDistanceMeters(double lat1, double lng1, double lat2, double lng2) {
+  double dLat = (lat2 - lat1) * 111320.0;
+  double dLng = (lng2 - lng1) * 111320.0 * cos(lat1 * pi / 180.0);
+  return sqrt(dLat * dLat + dLng * dLng);
+}
 
 // ロケーション識別子に対応するウェイポイントCSVファイルのパスを返す関数
 const char* getWaypointFilePathByLoc(const String& loc) {
@@ -420,8 +455,8 @@ bool parseWaypointCsvLine(const char* line, Waypoint& outPoint) {
   float latVal = 0.0f;
   float lngVal = 0.0f;
   float altVal = 0.0f;
-  float distanceDummy = 0.0f;
-  int parsed = sscanf(line, "%d,%f,%f,%f,%f", &id, &latVal, &lngVal, &altVal, &distanceDummy);
+  float distVal = 0.0f;
+  int parsed = sscanf(line, "%d,%f,%f,%f,%f", &id, &latVal, &lngVal, &altVal, &distVal);
   if (parsed < 4 || id <= 0) {
     return false;
   }
@@ -430,11 +465,13 @@ bool parseWaypointCsvLine(const char* line, Waypoint& outPoint) {
   outPoint.lat = latVal;
   outPoint.lng = lngVal;
   outPoint.alt = altVal;
+  outPoint.dist = (parsed >= 5) ? distVal : NAN;
   return true;
 }
 
 // ロケーション識別子に対応するウェイポイントCSVファイルをSDカードから読み込む関数
 bool loadWaypointFileForLoc(const String& loc) {
+  waypointRawLapMeters = 0.0f;
   if (!LOGGING) {
     waypointCount = 0;
     nearestWaypointIndex = -1;
@@ -500,6 +537,17 @@ bool loadWaypointFileForLoc(const String& loc) {
   waypointMinAlt = minAlt;
   waypointMaxAlt = maxAlt;
   loadedWaypointLoc = loc;
+
+  // 1周の距離 = 末尾までの距離 + 末尾から先頭へ戻る距離（走行支援の周内位置の算出に使う）
+  const Waypoint& first = waypoints[0];
+  const Waypoint& last = waypoints[waypointCount - 1];
+  bool hasDistance = waypointCount >= 2 && last.dist > 0.0f;
+  for (size_t i = 0; i < waypointCount && hasDistance; i++) {
+    hasDistance = isfinite(waypoints[i].dist);
+  }
+  if (hasDistance) {
+    waypointRawLapMeters = last.dist + static_cast<float>(approxDistanceMeters(last.lat, last.lng, first.lat, first.lng));
+  }
   Serial.printf("[Waypoint] loaded %u points from %s\n", static_cast<unsigned int>(waypointCount), path);
   return true;
 }
@@ -597,6 +645,464 @@ void drawAltitudeGraphMode() {
   lcd_s.printf("max %.1fm", waypointMaxAlt);
   lcd_s.setCursor(graphLeft, graphTop + graphHeight + 2);
   lcd_s.printf("min %.1fm", waypointMinAlt);
+}
+
+//==================== 走行支援 =====================
+
+// ロケーション識別子に対応する走行支援の設定ファイル(JSON)のパスを返す関数
+const char* getStrategyFilePathByLoc(const String& loc) {
+  if (loc == "su") {
+    return "/suzuka_strategy.json";
+  }
+  if (loc == "mo") {
+    return "/motegi_strategy.json";
+  }
+  return "/toyota_strategy.json";
+}
+
+// 加速パターン1つぶんをJSONから読み込む（指定された項目だけ上書きする）
+void readStrategyPatternJson(JsonVariantConst src, StrategyAssist::Pattern& pattern) {
+  if (src["v_off"].is<float>()) {
+    pattern.vOffKmh = src["v_off"].as<float>();
+  }
+  JsonArrayConst marks = src["marks_m"];
+  if (!marks.isNull()) {
+    pattern.markCount = 0;
+    for (JsonVariantConst mark : marks) {
+      if (pattern.markCount >= StrategyAssist::MAX_MARKS) {
+        break;
+      }
+      pattern.marksM[pattern.markCount++] = mark.as<float>();
+    }
+    // 目印を差し替えて最終周の指定が無い場合は、最終周も全目印を有効にする（加速が多い側＝完走側）
+    pattern.finalLapMarks = pattern.markCount;
+  }
+  if (src["final_lap_marks"].is<int>()) {
+    pattern.finalLapMarks = static_cast<uint8_t>(constrain(src["final_lap_marks"].as<int>(), 0, static_cast<int>(pattern.markCount)));
+  }
+}
+
+// 加速パターンの値が妥当かどうかを判定する関数
+bool isValidStrategyPattern(const StrategyAssist::Pattern& pattern, float lapM, float guardKmh) {
+  if (pattern.markCount == 0 || pattern.vOffKmh <= guardKmh || pattern.vOffKmh > 60.0f) {
+    return false;
+  }
+  for (uint8_t i = 0; i < pattern.markCount; i++) {
+    if (!isfinite(pattern.marksM[i]) || pattern.marksM[i] < 0.0f || pattern.marksM[i] >= lapM) {
+      return false;
+    }
+    if (i > 0 && pattern.marksM[i] <= pattern.marksM[i - 1]) {
+      return false;  // 昇順でない
+    }
+  }
+  return true;
+}
+
+// 走行支援の設定全体が妥当かどうかを判定する関数
+bool isValidStrategyConfig(const StrategyAssist::Config& cfg) {
+  if (cfg.lapM < 100.0f || cfg.guardKmh < 0.0f) {
+    return false;
+  }
+  if (!isValidStrategyPattern(cfg.primary, cfg.lapM, cfg.guardKmh)) {
+    return false;
+  }
+  if (cfg.fallback.markCount > 0 && !isValidStrategyPattern(cfg.fallback, cfg.lapM, cfg.guardKmh)) {
+    return false;
+  }
+  for (uint8_t i = 0; i < cfg.splitCount; i++) {
+    if (!isfinite(cfg.splitsS[i]) || cfg.splitsS[i] <= 0.0f || (i > 0 && cfg.splitsS[i] <= cfg.splitsS[i - 1])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 走行支援の設定(JSON文字列)を解釈し、指定された項目でcfgを上書きする関数
+bool parseStrategyConfigJson(const char* json, StrategyAssist::Config& cfg) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    Serial.printf("[Strategy] JSON parse failed: %s\n", err.c_str());
+    return false;
+  }
+
+  JsonVariantConst root = doc.as<JsonVariantConst>();
+  if (root["lap_m"].is<float>()) { cfg.lapM = root["lap_m"].as<float>(); }
+  if (root["guard_kmh"].is<float>()) { cfg.guardKmh = root["guard_kmh"].as<float>(); }
+  if (root["final_extra_if_split_over_s"].is<float>()) { cfg.finalExtraIfSplitOverS = root["final_extra_if_split_over_s"].as<float>(); }
+  if (root["fuel_warn_mpa"].is<float>()) { cfg.fuelWarnMpa = root["fuel_warn_mpa"].as<float>(); }
+  if (root["beep"].is<bool>()) { cfg.beep = root["beep"].as<bool>(); }
+  readStrategyPatternJson(root, cfg.primary);
+  if (!root["fallback"].isNull()) {
+    readStrategyPatternJson(root["fallback"], cfg.fallback);
+  }
+  JsonArrayConst splits = root["splits_s"];
+  if (!splits.isNull()) {
+    cfg.splitCount = 0;
+    for (JsonVariantConst split : splits) {
+      if (cfg.splitCount >= StrategyAssist::MAX_SPLITS) {
+        break;
+      }
+      cfg.splitsS[cfg.splitCount++] = split.as<float>();
+    }
+  }
+  return true;
+}
+
+// SDカードの設定ファイル(JSON)を読み込み、cfgを上書きする関数
+// ファイルが無い場合はfalseを返す。ファイルはあるが解釈できなかった場合はoutParsedがfalseになる
+bool readStrategyConfigFile(const char* path, StrategyAssist::Config& cfg, bool& outParsed) {
+  outParsed = false;
+  file_t strategyFile = sd.open(path, O_READ);
+  if (!strategyFile) {
+    return false;
+  }
+
+  static char buf[STRATEGY_FILE_BUFFER_SIZE];
+  int len = strategyFile.read(buf, sizeof(buf) - 1);
+  strategyFile.close();
+  if (len > 0) {
+    buf[len] = '\0';
+    outParsed = parseStrategyConfigJson(buf, cfg);
+  }
+  return true;
+}
+
+// ロケーション識別子に対応する走行支援の設定をSDカードから読み込む関数
+// 設定はファームに持たない。設定ファイルが無ければ走行支援は無効（SDから削除すれば無効にできる）
+void loadStrategyConfigForLoc(const String& loc) {
+  StrategyAssist::Config cfg;
+  cfg.totalLaps = totallaps;
+  strategySource = STRATEGY_SRC_NONE;
+
+  if (LOGGING) {
+    const char* path = getStrategyFilePathByLoc(loc);
+    bool parsed = false;
+    if (readStrategyConfigFile(path, cfg, parsed)) {
+      if (parsed && isValidStrategyConfig(cfg)) {
+        cfg.enabled = true;
+        strategySource = STRATEGY_SRC_SD;
+        Serial.printf("[Strategy] loaded %s\n", path);
+      } else {
+        // 設定ファイルが壊れている場合は走行支援を無効にし、モード0の画面に異常を出す
+        cfg = StrategyAssist::Config();
+        strategySource = STRATEGY_SRC_SD_ERROR;
+        Serial.printf("[Strategy] invalid config: %s\n", path);
+      }
+    }
+  }
+
+  strategy.configure(cfg);
+}
+
+// 現在のロケーションに対応する走行支援の設定がロードされていない場合にロードする関数
+void ensureStrategyLoadedForCurrentLoc() {
+  if (Loc.length() == 0 || loadedStrategyLoc == Loc) {
+    return;
+  }
+  loadStrategyConfigForLoc(Loc);
+  loadedStrategyLoc = Loc;
+}
+
+// 周内位置 [m] を返す関数（スタートラインからの距離。公式の1周の距離に合わせて伸縮する。求められない場合はNAN）
+// 最近傍ウェイポイントの前後の区間へ現在地を射影し、ウェイポイントの間隔（約8 m）より細かく求める
+float currentLapPositionMeters() {
+  const float lapM = strategy.config().lapM;
+  if (!positionFresh || nearestWaypointIndex < 0 || waypointCount < 2 || waypointRawLapMeters <= 0.0f || lapM <= 0.0f) {
+    return NAN;
+  }
+
+  const size_t nearest = static_cast<size_t>(nearestWaypointIndex);
+  const double metersPerDegLat = 111320.0;
+  const double metersPerDegLng = 111320.0 * cos(la * pi / 180.0);
+  double bestOffset = 1e9;
+  double bestRaw = 0.0;
+  for (uint8_t k = 0; k < 2; k++) {
+    // k=0: 手前の区間（nearest-1 → nearest）, k=1: 先の区間（nearest → nearest+1）
+    const size_t a = (k == 0) ? (nearest + waypointCount - 1) % waypointCount : nearest;
+    const size_t b = (a + 1) % waypointCount;
+    const double bx = (waypoints[b].lng - waypoints[a].lng) * metersPerDegLng;
+    const double by = (waypoints[b].lat - waypoints[a].lat) * metersPerDegLat;
+    const double px = (ln - waypoints[a].lng) * metersPerDegLng;
+    const double py = (la - waypoints[a].lat) * metersPerDegLat;
+    const double len2 = bx * bx + by * by;
+    const double t = (len2 > 0.0) ? constrain((px * bx + py * by) / len2, 0.0, 1.0) : 0.0;
+    const double offset = sqrt(pow(px - t * bx, 2) + pow(py - t * by, 2));
+    if (offset < bestOffset) {
+      bestOffset = offset;
+      const double segEnd = (b > a) ? waypoints[b].dist : waypointRawLapMeters;  // 末尾→先頭の区間は1周の距離まで
+      bestRaw = waypoints[a].dist + t * (segEnd - waypoints[a].dist);
+    }
+  }
+  if (bestOffset > STRATEGY_OFF_COURSE_M) {
+    return NAN;  // ピット・パドックなどコース外
+  }
+
+  // 測位からの経過時間ぶんを車速で進める（GNSSの更新間隔による合図の遅れを補う）
+  const float pos = static_cast<float>(bestRaw) * (lapM / waypointRawLapMeters) +
+                    speed / 3.6f * static_cast<float>(positionAgeMs) / 1000.0f;
+  return fmodf(pos, lapM);
+}
+
+// 発進（ECUの走行時間が0から動き出した）を検知して周回数を0に戻す関数
+// 発進前にラインをまたいで数えてしまった周回を、走行に持ち込まないようにする
+void resetLapCountOnLaunch() {
+  static float prevWorktime = 0.0f;
+  if (prevWorktime <= 0.0f && worktime > 0.0f) {
+    Lapcount = 0;
+    lapCountDistanceBase = 0;
+    lapCountDistanceBaseValid = true;
+  }
+  prevWorktime = worktime;
+}
+
+// 走行支援の判定を更新し、合図が変わったときにブザーを鳴らす関数
+void updateStrategyAssist() {
+  if (!strategy.config().enabled) {
+    return;
+  }
+
+  // Bボタン長押しで通常パターン ⇄ 予備パターンを切り替える
+  if (M5.BtnB.wasHold()) {
+    strategy.setFallback(!strategy.usingFallback());
+  }
+
+  StrategyAssist::Input in;
+  in.nowMs = millis();
+  in.lapPosM = currentLapPositionMeters();
+  in.speedKmh = speed;
+  in.engineOn = INJ_timems > 0.0f;  // ECUはエンジン停止中の噴射時間を0で送る
+  in.worktimeS = worktime;
+  in.lapsDone = Lapcount;
+  in.fuelMpa = FuelPre;
+
+  const StrategyAssist::Cue prevCue = strategy.output().cue;
+  const StrategyAssist::Output& out = strategy.update(in);
+
+#if STRATEGY_BEEP_AVAILABLE
+  static unsigned long lastBeepAt = 0;
+  const bool isActionCue = (out.cue == StrategyAssist::Cue::BurnNow || out.cue == StrategyAssist::Cue::CutNow);
+  if (strategy.config().beep && isActionCue &&
+      (out.cue != prevCue || millis() - lastBeepAt >= STRATEGY_BEEP_REPEAT_MS)) {
+    lastBeepAt = millis();
+    if (out.cue == StrategyAssist::Cue::BurnNow) {
+      M5.Speaker.tone(2600, 120, 0, true);   // 加速: 短く2回
+      M5.Speaker.tone(3200, 120, 0, false);
+    } else {
+      M5.Speaker.tone(1300, 500, 0, true);   // 停止: 長く1回
+    }
+  }
+#else
+  (void)prevCue;
+  (void)out;
+#endif
+}
+
+// 秒数を "mm:ss" に整形する
+void formatMinSec(char* out, size_t outSize, float seconds) {
+  const unsigned int total = static_cast<unsigned int>(seconds < 0.0f ? 0.0f : seconds);
+  snprintf(out, outSize, "%02u:%02u", total / 60U, total % 60U);
+}
+
+// 走行支援画面（支援が有効なときのモード0）の描画
+void drawStrategyMode() {
+  using StrategyAssist::Cue;
+  const StrategyAssist::Output& out = strategy.output();
+  const StrategyAssist::Config& cfg = strategy.config();
+  const StrategyAssist::Pattern& pattern = out.usingFallback ? cfg.fallback : cfg.primary;
+  char buf[48];
+
+  // 背景色で合図を伝える: 加速=緑, 停止=赤
+  int bg = TFT_BLACK;
+  int fg = TFT_WHITE;
+  if (out.cue == Cue::BurnNow) {
+    bg = TFT_GREEN;
+    fg = TFT_BLACK;
+  } else if (out.cue == Cue::CutNow) {
+    bg = TFT_RED;
+  }
+  const bool plainBg = (bg == TFT_BLACK);
+  lcd_s.fillScreen(bg);
+  lcd_s.setTextColor(fg);
+  lcd_s.setTextSize(1);
+
+  // 状態行: 場所・加速パターン / 接続状況
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextDatum(TL_DATUM);
+  snprintf(buf, sizeof(buf), "%s %u回%s%s",
+           Loc == "su" ? "鈴鹿" : (Loc == "mo" ? "茂木" : "豊田"),
+           static_cast<unsigned int>(pattern.markCount),
+           out.usingFallback ? "予備" : "",
+           STRATEGY_SIM ? " SIM" : "");
+  lcd_s.drawString(buf, 4, 0);
+  lcd_s.setTextDatum(TR_DATUM);
+  snprintf(buf, sizeof(buf), "SD:%c GNSS:%c MQ:%c", LOGGING ? 'O' : 'x', positionFresh ? 'O' : 'x', MQTTpush ? 'O' : 'x');
+  lcd_s.drawString(buf, 318, 0);
+
+  // 速度と、今の周の停止速度
+  lcd_s.setFont(&fonts::Font7);
+  lcd_s.setTextDatum(TR_DATUM);
+  snprintf(buf, sizeof(buf), "%.1f", speed);
+  lcd_s.drawString(buf, 150, 18);
+
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.drawString("停止", 166, 22);
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd_s.setTextSize(2);
+  lcd_s.setTextDatum(TR_DATUM);
+  if (plainBg && out.bumpKmh > 0.0f) {
+    lcd_s.setTextColor(TFT_MAGENTA);  // 遅れを取り戻すために上げている
+  } else if (plainBg && out.bumpKmh < 0.0f) {
+    lcd_s.setTextColor(TFT_CYAN);
+  }
+  snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+  lcd_s.drawString(buf, 316, 26);
+  lcd_s.setTextColor(fg);
+  lcd_s.setTextSize(1);
+
+  // 速度バー（0〜45 km/h）と、保険の速度・停止速度の目盛り
+  const int barX = 10;
+  const int barW = 300;
+  const float barMaxKmh = 45.0f;
+  lcd_s.drawRect(barX - 1, 70, barW + 2, 12, fg);
+  lcd_s.fillRect(barX, 71, static_cast<int>(constrain(speed, 0.0f, barMaxKmh) / barMaxKmh * barW), 10, fg);
+  const int guardX = barX + static_cast<int>(constrain(cfg.guardKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
+  const int vOffX = barX + static_cast<int>(constrain(out.vOffKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
+  if (cfg.guardKmh > 0.0f) {
+    lcd_s.fillRect(guardX - 1, 67, 3, 18, plainBg ? TFT_YELLOW : fg);
+  }
+  lcd_s.fillRect(vOffX - 1, 67, 3, 18, plainBg ? TFT_RED : fg);
+
+  // 合図
+  int cueColor = fg;
+  switch (out.cue) {
+    case Cue::Idle:
+      snprintf(buf, sizeof(buf), "スタート待ち");
+      break;
+    case Cue::Approach:
+      cueColor = TFT_YELLOW;
+      // fallthrough
+    case Cue::Coast:
+      snprintf(buf, sizeof(buf), "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      break;
+    case Cue::BurnNow:
+      snprintf(buf, sizeof(buf), out.guard ? "加速! 速度低下" : "加速!");
+      break;
+    case Cue::Burning:
+      snprintf(buf, sizeof(buf), "%.1fで停止", out.vOffKmh);
+      break;
+    case Cue::CutNow:
+      snprintf(buf, sizeof(buf), "停止!");
+      break;
+    case Cue::CoastHome:
+      snprintf(buf, sizeof(buf), "惰行でゴール");
+      break;
+    case Cue::NoPosition:
+      cueColor = TFT_YELLOW;
+      snprintf(buf, sizeof(buf), "位置なし");
+      break;
+    case Cue::Finished:
+      snprintf(buf, sizeof(buf), "FINISH");
+      break;
+    default:
+      buf[0] = '\0';
+      break;
+  }
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd_s.setTextSize(2);
+  lcd_s.setTextDatum(MC_DATUM);
+  lcd_s.setTextColor(cueColor);
+  lcd_s.drawString(buf, 160, 110);
+  lcd_s.setTextColor(fg);
+  lcd_s.setTextSize(1);
+
+  // 1周の位置バー（▼=加速開始位置、縦線=現在地）。燃圧低下時は警告に差し替える
+  if (out.fuelLow) {
+    lcd_s.fillRect(0, 136, 320, 24, TFT_ORANGE);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextDatum(MC_DATUM);
+    lcd_s.setTextColor(TFT_BLACK);
+    if (!out.usingFallback && strategy.hasFallback()) {
+      snprintf(buf, sizeof(buf), "燃圧低下 B長押しで%.0fkm/h・%u回",
+               cfg.fallback.vOffKmh, static_cast<unsigned int>(cfg.fallback.markCount));
+    } else {
+      snprintf(buf, sizeof(buf), "燃圧低下");
+    }
+    lcd_s.drawString(buf, 160, 148);
+    lcd_s.setTextColor(fg);
+  } else {
+    const int lapBarY = 148;
+    lcd_s.drawRect(barX - 1, lapBarY, barW + 2, 8, fg);
+    for (uint8_t i = 0; i < pattern.markCount; i++) {
+      const int x = barX + static_cast<int>(pattern.marksM[i] / cfg.lapM * barW);
+      if (i < out.activeMarks) {
+        lcd_s.fillTriangle(x, lapBarY - 1, x - 5, lapBarY - 10, x + 5, lapBarY - 10,
+                           (plainBg && i == out.nextMark) ? TFT_YELLOW : fg);
+      } else {
+        lcd_s.drawTriangle(x, lapBarY - 1, x - 5, lapBarY - 10, x + 5, lapBarY - 10, fg);  // 最終周で使わない目印
+      }
+    }
+    const float lapPos = currentLapPositionMeters();
+    if (isfinite(lapPos)) {
+      const int x = barX + static_cast<int>(constrain(lapPos / cfg.lapM, 0.0f, 1.0f) * barW);
+      lcd_s.fillRect(x - 2, lapBarY - 3, 5, 14, plainBg ? TFT_CYAN : fg);
+    }
+  }
+
+  // 残り周回
+  const int restlaps = max(0, static_cast<int>(totallaps) - static_cast<int>(Lapcount));
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.drawString(restlaps == 1 ? "最終周" : "残り", 8, 168);
+  lcd_s.drawString("走行時間", 84, 168);
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd_s.setTextSize(2);
+  snprintf(buf, sizeof(buf), "%d周", restlaps);
+  lcd_s.drawString(buf, 8, 190);
+
+  // 走行時間（直近の通過が遅れていればマゼンタ）
+  formatMinSec(buf, sizeof(buf), worktime);
+  if (plainBg && out.bumpKmh > 0.0f) {
+    lcd_s.setTextColor(TFT_MAGENTA);
+  }
+  lcd_s.drawString(buf, 84, 190);
+  lcd_s.setTextColor(fg);
+
+  // 直近の通過タイムと目標との差。まだ通過していなければ加速開始位置の一覧
+  lcd_s.setTextDatum(TR_DATUM);
+  if (out.hasSplit) {
+    if (isfinite(out.delayS)) {
+      snprintf(buf, sizeof(buf), "%+ds", static_cast<int>(constrain(lroundf(out.delayS), -99L, 99L)));
+    } else {
+      snprintf(buf, sizeof(buf), "--");
+    }
+    if (plainBg && out.bumpKmh > 0.0f) {
+      lcd_s.setTextColor(TFT_MAGENTA);
+    } else if (plainBg && out.bumpKmh < 0.0f) {
+      lcd_s.setTextColor(TFT_CYAN);
+    }
+    lcd_s.drawString(buf, 316, 190);
+    lcd_s.setTextColor(fg);
+    lcd_s.setTextSize(1);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    char splitStr[8];
+    formatMinSec(splitStr, sizeof(splitStr), out.splitS);
+    snprintf(buf, sizeof(buf), "%u周 %s", static_cast<unsigned int>(out.splitLap), splitStr);
+    lcd_s.drawString(buf, 316, 168);
+  } else {
+    lcd_s.setTextSize(1);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.drawString("加速位置(m)", 316, 168);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+    int len = 0;
+    buf[0] = '\0';
+    for (uint8_t i = 0; i < pattern.markCount && len < static_cast<int>(sizeof(buf)) - 8; i++) {
+      len += snprintf(buf + len, sizeof(buf) - len, i == 0 ? "%d" : "/%d", static_cast<int>(pattern.marksM[i]));
+    }
+    lcd_s.drawString(buf, 316, 200);
+  }
+  lcd_s.setTextSize(1);
 }
 
 //==================== 各種関数 =====================
@@ -1002,8 +1508,23 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
   }
 
   if (segmentsIntersect(prevLat, prevLng, la, ln, clLa1, clLn1, clLa2, clLn2)) {
+    // ECU受信中は、前回カウントからの走行距離が1周の半分に満たない交差を数えない
+    // （グリッドがラインの手前にある場合の発進直後の通過や、ライン付近での二重カウントを防ぐ）
+    if (distance < lapCountDistanceBase) {
+      lapCountDistanceBaseValid = false;  // ECUが再起動して走行距離が0に戻った。次のカウントまで距離では判定しない
+    }
+    const bool ecuAlive = (millis() - receiveECUtime <= 2000);
+    const float lapMeters = (Loc == "su" || Loc == "mo") ? static_cast<float>(goal) / static_cast<float>(totallaps) : 0.0f;
+    if (ecuAlive && lapCountDistanceBaseValid && lapMeters > 0.0f &&
+        !StrategyAssist::lapCrossingPlausible(static_cast<float>(distance - lapCountDistanceBase), lapMeters)) {
+      return;
+    }
+
     Lapcount++;
     lastLapCrossedAt = millis();
+    lapCountDistanceBase = distance;
+    lapCountDistanceBaseValid = true;
+    strategy.onLapCrossed(Lapcount, worktime);  // 通過タイムを保持し、次の周の停止速度を決める
   }
 }
 
@@ -1269,6 +1790,15 @@ void updateDisplay() {
     lcd.endWrite();
     return;
   }
+
+  // 走行支援が有効な場合、モード0は走行支援画面に差し替える
+  if (dispmode == 0 && strategy.config().enabled) {
+    drawStrategyMode();
+    lcd.startWrite();
+    lcd_s.pushSprite(0, 0);
+    lcd.endWrite();
+    return;
+  }
   
   // 接続状況表示
   if (dispmode == 0 || dispmode == 1) {
@@ -1276,6 +1806,12 @@ void updateDisplay() {
     lcd_s.setTextSize(1);
     lcd_s.setTextDatum(TL_DATUM);
     lcd_s.drawString(Loc == "su" ? "鈴鹿" : (Loc == "mo" ? "茂木" : "豊田"), 10, 0);
+    if (strategySource == STRATEGY_SRC_SD_ERROR) {
+      // 走行支援の設定ファイルはあるが内容に異常があり、支援が無効になっている
+      lcd_s.setTextColor(TFT_RED);
+      lcd_s.drawString("支援設定異常", 50, 0);
+      lcd_s.setTextColor(TFT_WHITE);
+    }
     lcd_s.setTextDatum(top_right);
     lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
     lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
@@ -1322,7 +1858,8 @@ void updateDisplay() {
   
   // 第２表示行（周回数・噴射時間など）
   if (dispmode == 0) {
-    uint8_t restlaps = totallaps - Lapcount;
+    // 周回数が規定を超えても負にならないようにする（符号なしだと255と表示される）
+    int restlaps = max(0, static_cast<int>(totallaps) - static_cast<int>(Lapcount));
     lcd_s.setCursor(140, 130);
     if (restlaps > 1)
       lcd_s.print(restlaps);
@@ -1700,12 +2237,101 @@ bool initializePressureSensorForGnssModule() {
   return false;
 }
 
+#if STRATEGY_SIM
+// 机上確認用の仮想走行
+// ウェイポイント上を走らせ、位置・速度・噴射・走行時間・燃圧を差し替えて走行支援画面を確認する。
+// 仮想ドライバーは画面の合図どおりに加速・停止する。走行抵抗を2割増しにして、通過タイムの遅れと補正も出るようにしてある。
+void updateSimulatedRun() {
+  static unsigned long lastMs = millis();
+  static float simS = -8.0f;   // スタートラインからの累積距離 [m]（グリッドはラインの8 m手前）
+  static float simV = 0.0f;    // 速度 [m/s]
+  static float simT = 0.0f;    // 走行時間 [s]
+  static float reactS = 0.0f;  // 合図に気づいてから操作するまでの時間 [s]
+  static bool launched = false;
+  static bool engine = false;
+
+  // もてぎとして扱う（ウェイポイントと走行支援の設定はloop()側で読み込まれる）
+  Loc = "mo";
+  totallaps = totallaps_mo;
+  goal = goal_mo;
+  limittime = limittime_mo;
+
+  const unsigned long nowMs = millis();
+  const float dt = static_cast<float>(nowMs - lastMs) / 1000.0f * static_cast<float>(STRATEGY_SIM);
+  lastMs = nowMs;
+  const float lapM = strategy.config().lapM;
+  if (waypointCount < 2 || waypointRawLapMeters <= 0.0f || lapM <= 0.0f) {
+    return;
+  }
+
+  // 仮想ドライバー
+  const StrategyAssist::Cue cue = strategy.output().cue;
+  if (!launched) {
+    if (nowMs > 8000UL) {  // 起動後しばらくは「スタート待ち」を表示する
+      launched = true;
+      engine = true;
+    }
+  } else if (cue == StrategyAssist::Cue::Finished) {
+    engine = false;
+  } else if (!engine && cue == StrategyAssist::Cue::BurnNow) {
+    reactS += dt;
+    if (reactS >= 0.5f) { engine = true; reactS = 0.0f; }
+  } else if (engine && cue == StrategyAssist::Cue::CutNow) {
+    reactS += dt;
+    if (reactS >= 0.3f) { engine = false; reactS = 0.0f; }
+  } else {
+    reactS = 0.0f;
+  }
+
+  // 運動（勾配は無視）
+  const float kmh = simV * 3.6f;
+  float accel = engine ? (1.6f - 0.03f * kmh) : 0.0f;
+  accel -= 1.2f * (9.8f * 0.00164f + 0.000391f * simV * simV);
+  simV = max(simV + accel * dt, 0.0f);
+  simS += simV * dt;
+  if (launched) {
+    simT += dt;
+  }
+
+  // 累積距離をウェイポイント間の補間で緯度経度に直す
+  const float rawPos = fmodf(simS + lapM, lapM) * (waypointRawLapMeters / lapM);
+  size_t i = 0;
+  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
+    i++;
+  }
+  const Waypoint& from = waypoints[i];
+  const Waypoint& to = waypoints[(i + 1) % waypointCount];
+  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;
+  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  const double prevLa = la;
+  const double prevLn = ln;
+  la = from.lat + (to.lat - from.lat) * ratio;
+  ln = from.lng + (to.lng - from.lng) * ratio;
+
+  // ECU・BLEの受信値を差し替える
+  receiveECUtime = nowMs;
+  speed = simV * 3.6f;
+  spd = speed;
+  tachoRpm = engine ? 3500 : 0;
+  INJ_timems = engine ? 3.0f : 0.0f;
+  worktime = simT;
+  distance = launched ? static_cast<uint16_t>(simS + 8.0f) : 0;
+  FuelPre = (engine && Lapcount == 2) ? 0.26f : 0.32f;  // 3周目の加速だけ燃圧低下を再現する
+
+  updateLapCountByControlLineCrossing(true, prevLa, prevLn);
+}
+#endif
+
 //==================== setup() =====================
 void setup() {
   // M5初期化
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.update();
+  M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える
+#if STRATEGY_BEEP_AVAILABLE
+  M5.Speaker.setVolume(255);
+#endif
   
   // デバッグ用Serial
   Serial.begin(115200);
@@ -1887,6 +2513,12 @@ void setup() {
     updateMQTT();
   }
 
+#if STRATEGY_SIM
+  // 仮想走行の値をクラウドへ送らない
+  MQTTpush = false;
+  ambientpush = false;
+#endif
+
   lcd.fillScreen(TFT_BLACK);
   showMessage(FPSTR(MSG_LOADING));
   Serial.println(F("lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, Pressure, Temp, Humidity, PRI, SEC, FUEL, datetime"));
@@ -1919,16 +2551,28 @@ void loop() {
     mqttclient.loop();
   }
 
+#if STRATEGY_SIM
+  updateSimulatedRun();
+  const bool hasPosition = true;
+  positionAgeMs = 0;
+#else
   updateBLE();
   updateECU();
   updateGNSS();
+  const bool hasPosition = gps.location.isValid();
+  positionAgeMs = gps.location.age();
+#endif
+  positionFresh = hasPosition && positionAgeMs < STRATEGY_POSITION_MAX_AGE_MS;
+  resetLapCountOnLaunch();
 
   ensureWaypointLoadedForCurrentLoc();
-  if (gps.location.isValid() && waypointCount > 0) {
+  ensureStrategyLoadedForCurrentLoc();
+  if (hasPosition && waypointCount > 0) {
     nearestWaypointIndex = findNearestWaypointIndex(la, ln);
   } else {
     nearestWaypointIndex = -1;
   }
+  updateStrategyAssist();
 
   if (millis() - t_display >= DISPLAY_INTERVAL) {
     updateDisplay();
@@ -1948,8 +2592,8 @@ void loop() {
     }
   }
   
-  // SDカードへのログ書き出し
-  if (LOGGING && (millis() - t_SD >= SD_LOG_INTERVAL)) {
+  // SDカードへのログ書き出し（仮想走行の値は記録しない）
+  if (LOGGING && !STRATEGY_SIM && (millis() - t_SD >= SD_LOG_INTERVAL)) {
     updateSDLog();
     t_SD += SD_LOG_INTERVAL;
     // 長時間ブロック後に連続実行（バースト）しないよう再同期する
