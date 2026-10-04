@@ -1074,6 +1074,18 @@ void drawStrategyMode() {
   lcd_s.drawRect(barX - 1, 226, barW + 2, 12, fg);
   lcd_s.fillRect(barX + elapsedPx, 227, barW - elapsedPx, 10, timeColor);
 
+  // 同じ帯に全周回の進み具合を重ねる: 周の区切りの目盛りと、走行距離の現在地
+  // 現在地が帯の左端より右にあれば、距離の進みが時間の進みを上回っている（平均25 km/hより速い）
+  for (uint8_t i = 1; i < totallaps; i++) {
+    const int x = barX + barW * i / totallaps;
+    lcd_s.drawFastVLine(x, 227, 10, (x >= barX + elapsedPx) ? bg : fg);  // 帯の上では背景色、帯の外では文字色で描く
+  }
+  if (goal > 0) {
+    const int x = barX + static_cast<int>(constrain(static_cast<float>(distance) / static_cast<float>(goal), 0.0f, 1.0f) * barW);
+    lcd_s.fillRect(x - 3, 224, 7, 16, bg);  // 帯と同じ色でも見えるよう背景色で縁取る
+    lcd_s.fillRect(x - 2, 225, 5, 14, plainBg ? TFT_CYAN : fg);
+  }
+
   // 直近の通過タイムと目標との差。まだ通過していなければ加速開始位置の一覧
   lcd_s.setTextDatum(TR_DATUM);
   if (out.hasSplit) {
