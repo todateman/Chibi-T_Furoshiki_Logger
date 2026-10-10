@@ -219,7 +219,7 @@ SDカードのルートに置く (`sd/motegi_strategy.json`)。場所ごとに `
 | `v_off` | 加速停止速度 [km/h] | **必須** | 32.5 |
 | `marks_m` | 加速開始位置 [m] (スタートラインから、昇順、最大 6) | **必須** | 400, 800, 1400 |
 | `final_lap_marks` | 最終周に有効な位置の数 (先頭から) | 全位置が有効 | 2 |
-| `final_extra_if_split_over_s` | 最終周に入る通過タイムがこれを超えたら全位置を有効にする [s] | この判定をしない | 1965 |
+| `final_extra_if_split_over_s` | 最終周に入る通過タイムがこれを超えたら全位置を有効にする [s] | この判定をしない | 1961 |
 | `guard_kmh` | 最低限界速度 [km/h] | 最低限界速度の合図を出さない | 16.0 |
 | `splits_s` | n 周通過時の目標走行時間 [s] (最大 12) | 加速停止速度を補正しない | 309, 630, 951, 1272, 1593, 1914 |
 | `fallback` | 予備パターン (`v_off` / `marks_m` / `final_lap_marks`) | 予備パターンなし (B長押しは無効) | 30.0 / 200, 600, 1000, 1400 / 3 |
@@ -227,6 +227,51 @@ SDカードのルートに置く (`sd/motegi_strategy.json`)。場所ごとに `
 | `beep` | ブザーを鳴らすか | 鳴らす | true |
 
 必須項目が無い、JSON として読めない、位置が昇順でない、位置が 1 周の距離を超えている、加速停止速度が最低限界速度以下、などの場合は設定全体を採用しない (`支援設定異常`)。
+
+### 設定ファイルの生成
+
+設定ファイルは、ECU リポジトリの戦略パラメータ (`tools/strategy/<コース>_<年>.json`。もてぎは `motegi_2026.json`) から `tools/make_strategy_json.py` で作る。PC上で実行する (Python 3.10 以上、追加ライブラリ不要)。  
+ECU リポジトリの `tools/strategy_sim.py` を読み込んで `optimize` と同じ計算をするので、ECU リポジトリが手元に要る (既定はこのリポジトリの隣の `../UNOR4_Chibi-T_EFI`。別の場所なら `--sim-dir` で `tools` ディレクトリを指定する)。
+
+```sh
+python3 tools/make_strategy_json.py motegi --dry-run        # 書き込まずに結果と変更点だけ表示
+python3 tools/make_strategy_json.py motegi                  # sd/motegi_strategy.json を書き換える
+python3 tools/make_strategy_json.py motegi --target 38:30   # 目標時間を変える (既定はパラメータの target_s)
+
+# 初めて作るコースは、パラメータから決まらない項目をオプションで与える
+python3 tools/make_strategy_json.py suzuka --fallback-v-off 30 --fallback-marks 200 600 1000 1400 --fuel-warn-mpa 0.30 --beep
+```
+
+- コースは `suzuka` / `motegi` / `toyota` で指定する (必須)。出力は `sd/<コース>_strategy.json`
+- 入力は `tools/strategy/<コース>_*.json` のうち名前順で最後のもの (年が新しいもの)。別のファイルを使うときは `--params` で指定する
+
+| 項目 | 決め方 |
+| ---- | ---- |
+| `lap_m` / `guard_kmh` | パラメータの `course` からそのまま (`total_m ÷ laps` / `guard_kmh`) |
+| `v_off` / `marks_m` | `optimize` の推奨パターン |
+| `splits_s` | 推奨パターンをずらさずに走ったときの各周の通過タイム |
+| `final_lap_marks` | 最終周に加速を始める回数。加速開始位置を ±30 m ずらした 3 通りの最大 |
+| `final_extra_if_split_over_s` | 規定時間 − 15 秒 − 最終周の所要時間 (同じ 3 通りの最長) |
+| `fallback` の `v_off` / `marks_m` | パラメータからは決まらない。**書き換える前のファイルの値を引き継ぐ** (`--fallback-v-off` / `--fallback-marks` で差し替え)。`final_lap_marks` は計算し直す |
+| `fuel_warn_mpa` / `beep` | パラメータからは決まらない。**書き換える前のファイルの値を引き継ぐ** (`--fuel-warn-mpa` / `--beep` / `--no-beep` で差し替え) |
+
+- 引き継ぐ項目は、出力先にファイルが無く、オプションでも与えなければ書き出されない (予備パターンなし・燃圧の警告なしになる)
+- 予備パターンが規定時間を超える場合は警告を表示する
+- 書き出す前に、上の「設定全体を採用しない」条件と同じ検査をする。当てはまればファイルを書き換えずに終了する
+
+#### ECU 側との照合
+
+次のどれかに当たると、ファイルを書き換えずにエラーで終了する (`--dry-run` でも同じ)。
+
+| 照合するもの | ECU 側 | このスクリプト側 |
+| ---- | ---- | ---- |
+| パラメータ JSON の形式 | JSON の `"format_version"` | `PARAMS_FORMAT_VERSION` |
+| シミュレータの仕様 (推奨パターンの選び方、関数の引数・戻り値) | `strategy_sim.py` の `INTERFACE_VERSION` | `SIM_INTERFACE_VERSION` |
+| 規定周回数 | JSON の `course.laps` | `src/main.cpp` の `totallaps_su` / `totallaps_mo` |
+
+- 版数が違う・書かれていない場合は、ECU 側で何が変わったかを確かめ、スクリプトを合わせてから対応版数を上げる。スクリプトは `optimize` の選定手順を写して持っているので、ECU 側で選び方を変えたら `INTERFACE_VERSION` を上げること
+- 新しいコースのパラメータ JSON にも `"format_version"` を書く
+- ECU 側のウェイポイント CSV が、このリポジトリの `sd/<コース>_waypoint.csv` と違う場合は警告を表示する (加速開始位置はこの距離を基準にするため)。書き出しは止めない
 
 ## 周回カウント仕様
 
