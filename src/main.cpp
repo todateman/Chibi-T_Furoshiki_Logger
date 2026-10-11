@@ -14,6 +14,7 @@
 #include <Wire.h>
 #include <string.h>
 #include <Adafruit_BME280.h>
+#include "CourseMap.h"
 #include "StrategyAssist.h"
 #include "secrets.h"
 
@@ -402,7 +403,7 @@ void updateSystemTimeFromGnss() {
 // ディスプレイ表示モード
 uint8_t dispmode = 0;
 
-// ウェイポイント（標高グラフ用）
+// ウェイポイント（コース図・周内位置の算出用）
 struct Waypoint {
   uint16_t id;
   float lat;
@@ -415,8 +416,10 @@ struct Waypoint {
 const size_t MAX_WAYPOINTS = 300;
 Waypoint waypoints[MAX_WAYPOINTS];
 size_t waypointCount = 0;
-float waypointMinAlt = 0.0f;
-float waypointMaxAlt = 0.0f;
+double waypointMinLat = 0.0;  // ウェイポイントの緯度経度の範囲（コース図の投影に使う）
+double waypointMaxLat = 0.0;
+double waypointMinLng = 0.0;
+double waypointMaxLng = 0.0;
 String loadedWaypointLoc = "";
 int nearestWaypointIndex = -1;
 float waypointRawLapMeters = 0.0f;  // ウェイポイントCSV上の1周の距離 [m]（距離列が無い場合は0）
@@ -491,8 +494,10 @@ bool loadWaypointFileForLoc(const String& loc) {
 
   char line[128];
   size_t loadedCount = 0;
-  float minAlt = 1000000.0f;
-  float maxAlt = -1000000.0f;
+  double minLat = 1000.0;
+  double maxLat = -1000.0;
+  double minLng = 1000.0;
+  double maxLng = -1000.0;
   while (waypointFile.available() && loadedCount < MAX_WAYPOINTS) {
     int len = waypointFile.readBytesUntil('\n', line, sizeof(line) - 1);
     if (len <= 0) {
@@ -513,12 +518,10 @@ bool loadWaypointFileForLoc(const String& loc) {
     }
 
     waypoints[loadedCount] = point;
-    if (point.alt < minAlt) {
-      minAlt = point.alt;
-    }
-    if (point.alt > maxAlt) {
-      maxAlt = point.alt;
-    }
+    minLat = min(minLat, static_cast<double>(point.lat));
+    maxLat = max(maxLat, static_cast<double>(point.lat));
+    minLng = min(minLng, static_cast<double>(point.lng));
+    maxLng = max(maxLng, static_cast<double>(point.lng));
     loadedCount++;
   }
   waypointFile.close();
@@ -530,12 +533,10 @@ bool loadWaypointFileForLoc(const String& loc) {
     return false;
   }
 
-  if (fabsf(maxAlt - minAlt) < 0.1f) {
-    minAlt -= 1.0f;
-    maxAlt += 1.0f;
-  }
-  waypointMinAlt = minAlt;
-  waypointMaxAlt = maxAlt;
+  waypointMinLat = minLat;
+  waypointMaxLat = maxLat;
+  waypointMinLng = minLng;
+  waypointMaxLng = maxLng;
   loadedWaypointLoc = loc;
 
   // 1周の距離 = 末尾までの距離 + 末尾から先頭へ戻る距離（走行支援の周内位置の算出に使う）
@@ -584,67 +585,26 @@ int findNearestWaypointIndex(double lat, double lng) {
   return nearest;
 }
 
-// 標高値をグラフのY座標に変換する関数
-int altitudeToGraphY(float value, float minAlt, float maxAlt, int top, int height) {
-  float normalized = (value - minAlt) / (maxAlt - minAlt);
-  normalized = constrain(normalized, 0.0f, 1.0f);
-  return top + height - 1 - static_cast<int>(normalized * static_cast<float>(height - 1));
-}
-
-// 標高グラフの描画
-void drawAltitudeGraphMode() {
-  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
-  lcd_s.setTextSize(1);
-  lcd_s.setTextDatum(TL_DATUM);
-  lcd_s.setTextColor(TFT_WHITE);
-
-  const int graphLeft = 10;
-  const int graphTop = 20;
-  const int graphWidth = 300;
-  const int graphHeight = 180;
-
-  lcd_s.drawRect(graphLeft, graphTop, graphWidth, graphHeight, TFT_WHITE);
-  if (waypointCount < 2) {
-    lcd_s.drawString("ウェイポイント未読込", 32, 108);
-    return;
+// 周内位置 [m]（スタートラインからの距離。公式の1周の距離基準）をコース上の緯度経度に直す関数
+// ウェイポイント間を補間する。求められない場合はfalseを返す
+bool lapPositionToLatLng(float lapPosM, double& outLat, double& outLng) {
+  const float lapM = strategy.config().lapM;
+  if (!isfinite(lapPosM) || waypointCount < 2 || waypointRawLapMeters <= 0.0f || lapM <= 0.0f) {
+    return false;
   }
 
-  for (size_t i = 0; i + 1 < waypointCount; i++) {
-    size_t next = i + 1;  // 右端と左端はつながない
-
-    int x1 = graphLeft + static_cast<int>((static_cast<float>(i) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
-    int y1 = altitudeToGraphY(waypoints[i].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-    int x2 = graphLeft + static_cast<int>((static_cast<float>(next) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
-    int y2 = altitudeToGraphY(waypoints[next].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-    lcd_s.drawLine(x1, y1, x2, y2, TFT_CYAN);
+  const float rawPos = fmodf(fmodf(lapPosM, lapM) + lapM, lapM) * (waypointRawLapMeters / lapM);
+  size_t i = 0;
+  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
+    i++;
   }
-
-  int plotIndex = nearestWaypointIndex;
-  if (plotIndex >= 0) {
-    int x = graphLeft + static_cast<int>((static_cast<float>(plotIndex) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
-    int yWaypoint = altitudeToGraphY(waypoints[plotIndex].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-    int yNow = altitudeToGraphY(static_cast<float>(alt), waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-
-    lcd_s.drawFastVLine(x, graphTop, graphHeight, TFT_DARKGREY);
-    lcd_s.fillCircle(x, yWaypoint, 3, TFT_YELLOW);
-    lcd_s.fillCircle(x, yNow, 4, TFT_RED);
-
-    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
-    lcd_s.setTextDatum(TL_DATUM);
-    lcd_s.setTextColor(TFT_WHITE);
-    lcd_s.setCursor(8, 225);
-    lcd_s.printf("WP:%d/%u route:%.1fm now:%.1fm", waypoints[plotIndex].id,
-                 static_cast<unsigned int>(waypointCount),
-                 waypoints[plotIndex].alt,
-                 static_cast<float>(alt));
-  }
-
-  lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
-  lcd_s.setTextDatum(TL_DATUM);
-  lcd_s.setCursor(graphLeft, graphTop - 14);
-  lcd_s.printf("max %.1fm", waypointMaxAlt);
-  lcd_s.setCursor(graphLeft, graphTop + graphHeight + 2);
-  lcd_s.printf("min %.1fm", waypointMinAlt);
+  const Waypoint& from = waypoints[i];
+  const Waypoint& to = waypoints[(i + 1) % waypointCount];
+  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;  // 末尾→先頭の区間は1周の距離まで
+  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  outLat = from.lat + (to.lat - from.lat) * ratio;
+  outLng = from.lng + (to.lng - from.lng) * ratio;
+  return true;
 }
 
 //==================== 走行支援 =====================
@@ -904,6 +864,46 @@ void formatMinSec(char* out, size_t outSize, float seconds) {
   snprintf(out, outSize, "%02u:%02u", total / 60U, total % 60U);
 }
 
+// 合図の文言を作る関数。黄色で目立たせる合図（加速開始位置の手前・位置なし）ならtrueを返す
+bool formatStrategyCue(const StrategyAssist::Output& out, char* buf, size_t bufSize) {
+  using StrategyAssist::Cue;
+  bool caution = false;
+  switch (out.cue) {
+    case Cue::Idle:
+      snprintf(buf, bufSize, "スタート待ち");
+      break;
+    case Cue::Approach:
+      caution = true;
+      // fallthrough
+    case Cue::Coast:
+      snprintf(buf, bufSize, "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      break;
+    case Cue::BurnNow:
+      snprintf(buf, bufSize, out.guard ? "加速! 速度低下" : "加速!");
+      break;
+    case Cue::Burning:
+      snprintf(buf, bufSize, "%.1fで停止", out.vOffKmh);
+      break;
+    case Cue::CutNow:
+      snprintf(buf, bufSize, "停止!");
+      break;
+    case Cue::CoastHome:
+      snprintf(buf, bufSize, "惰行でゴール");
+      break;
+    case Cue::NoPosition:
+      caution = true;
+      snprintf(buf, bufSize, "位置なし");
+      break;
+    case Cue::Finished:
+      snprintf(buf, bufSize, "FINISH");
+      break;
+    default:
+      buf[0] = '\0';
+      break;
+  }
+  return caution;
+}
+
 // 走行支援画面（支援が有効なときのモード0）の描画
 void drawStrategyMode() {
   using StrategyAssist::Cue;
@@ -975,40 +975,7 @@ void drawStrategyMode() {
   lcd_s.fillRect(vOffX - 1, 67, 3, 18, plainBg ? TFT_RED : fg);
 
   // 合図
-  int cueColor = fg;
-  switch (out.cue) {
-    case Cue::Idle:
-      snprintf(buf, sizeof(buf), "スタート待ち");
-      break;
-    case Cue::Approach:
-      cueColor = TFT_YELLOW;
-      // fallthrough
-    case Cue::Coast:
-      snprintf(buf, sizeof(buf), "加速まで %dm", static_cast<int>(out.nextMarkDistM));
-      break;
-    case Cue::BurnNow:
-      snprintf(buf, sizeof(buf), out.guard ? "加速! 速度低下" : "加速!");
-      break;
-    case Cue::Burning:
-      snprintf(buf, sizeof(buf), "%.1fで停止", out.vOffKmh);
-      break;
-    case Cue::CutNow:
-      snprintf(buf, sizeof(buf), "停止!");
-      break;
-    case Cue::CoastHome:
-      snprintf(buf, sizeof(buf), "惰行でゴール");
-      break;
-    case Cue::NoPosition:
-      cueColor = TFT_YELLOW;
-      snprintf(buf, sizeof(buf), "位置なし");
-      break;
-    case Cue::Finished:
-      snprintf(buf, sizeof(buf), "FINISH");
-      break;
-    default:
-      buf[0] = '\0';
-      break;
-  }
+  const int cueColor = formatStrategyCue(out, buf, sizeof(buf)) ? TFT_YELLOW : fg;
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd_s.setTextSize(2);
   lcd_s.setTextDatum(MC_DATUM);
@@ -1119,6 +1086,202 @@ void drawStrategyMode() {
     }
     lcd_s.drawString(buf, 316, 192);
   }
+  lcd_s.setTextSize(1);
+}
+
+bool getControlLineForLoc(const String& loc, double& outLa1, double& outLn1, double& outLa2, double& outLn2);
+
+// 現在地表示画面（モード2）の描画
+// コース図（北が上）に現在地・スタートライン・加速開始位置を重ね、四隅に速度・加速停止速度・残り周回・走行時間を出す
+// 合図は下端の帯だけで伝える（コース図の配色は変えない）。走行支援が無効な場所でもコース図と現在地は出す
+void drawCourseMapMode() {
+  using StrategyAssist::Cue;
+  const StrategyAssist::Output& out = strategy.output();
+  const StrategyAssist::Config& cfg = strategy.config();
+  const StrategyAssist::Pattern& pattern = out.usingFallback ? cfg.fallback : cfg.primary;
+  const int bandTop = 206;  // 合図の帯の上端
+  char buf[48];
+
+  lcd_s.setTextSize(1);
+  lcd_s.setTextColor(TFT_WHITE);
+
+  // コース図。どのコースも南北に長いので中央の矩形に収め、左右の余白に数値を置く
+  const CourseMap::Projection proj = CourseMap::fit(waypointMinLat, waypointMaxLat, waypointMinLng, waypointMaxLng, 96, 20, 128, 152);
+  if (waypointCount < 2 || !proj.valid) {
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextDatum(MC_DATUM);
+    lcd_s.drawString("ウェイポイント未読込", 160, 100);
+  } else {
+    // コース線（末尾から先頭へも結んで1周にする）。スプライトは8ビット色なので、そのまま出せる灰色を使う
+    const int trackColor = lcd_s.color565(146, 146, 170);
+    int prevX, prevY;
+    proj.toScreen(waypoints[waypointCount - 1].lat, waypoints[waypointCount - 1].lng, prevX, prevY);
+    for (size_t i = 0; i < waypointCount; i++) {
+      int x, y;
+      proj.toScreen(waypoints[i].lat, waypoints[i].lng, x, y);
+      lcd_s.drawLine(prevX, prevY, x, y, trackColor);
+      lcd_s.fillCircle(x, y, 2, trackColor);
+      prevX = x;
+      prevY = y;
+    }
+
+    // スタートライン
+    double clLa1, clLn1, clLa2, clLn2;
+    if (getControlLineForLoc(Loc, clLa1, clLn1, clLa2, clLn2)) {
+      int x1, y1, x2, y2;
+      proj.toScreen(clLa1, clLn1, x1, y1);
+      proj.toScreen(clLa2, clLn2, x2, y2);
+      lcd_s.drawLine(x1, y1, x2, y2, TFT_WHITE);
+      lcd_s.drawLine(x1, y1 + 1, x2, y2 + 1, TFT_WHITE);
+    }
+
+    // 加速開始位置（●=有効, 黄色=次の位置, ○=最終周で使わない位置）。番号は四隅の数値と重ならないようコース図の内側に置く
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextDatum(MC_DATUM);
+    for (uint8_t i = 0; i < pattern.markCount; i++) {
+      double markLat, markLng;
+      if (!lapPositionToLatLng(pattern.marksM[i], markLat, markLng)) {
+        continue;
+      }
+      int x, y;
+      proj.toScreen(markLat, markLng, x, y);
+      const int color = (i == out.nextMark) ? TFT_YELLOW : TFT_WHITE;
+      if (i < out.activeMarks) {
+        lcd_s.fillCircle(x, y, 5, color);
+      } else {
+        lcd_s.fillCircle(x, y, 5, TFT_BLACK);
+        lcd_s.drawCircle(x, y, 5, color);
+      }
+      const float inX = proj.cx - static_cast<float>(x);
+      const float inY = proj.cy - static_cast<float>(y);
+      const float inLen = sqrtf(inX * inX + inY * inY);
+      if (inLen > 0.0f) {
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned int>(i + 1));
+        lcd_s.setTextColor(color);
+        lcd_s.drawString(buf, x + static_cast<int>(lroundf(inX / inLen * 14.0f)), y + static_cast<int>(lroundf(inY / inLen * 14.0f)));
+      }
+    }
+    lcd_s.setTextColor(TFT_WHITE);
+
+    // 現在地（GNSSの測位位置そのまま）。向きはコースの進行方向
+    if (nearestWaypointIndex >= 0) {
+      int x, y;
+      proj.toScreen(la, ln, x, y);
+      if (x >= 0 && x < lcd_s.width() && y >= 0 && y < bandTop) {
+        const size_t nearest = static_cast<size_t>(nearestWaypointIndex);
+        const Waypoint& before = waypoints[(nearest + waypointCount - 1) % waypointCount];
+        const Waypoint& after = waypoints[(nearest + 1) % waypointCount];
+        float dirX = proj.eastMeters(after.lng) - proj.eastMeters(before.lng);
+        float dirY = proj.northMeters(before.lat) - proj.northMeters(after.lat);  // 画面は下が正
+        const float dirLen = sqrtf(dirX * dirX + dirY * dirY);
+        if (dirLen > 0.0f) {
+          dirX /= dirLen;
+          dirY /= dirLen;
+        } else {
+          dirX = 0.0f;
+          dirY = -1.0f;
+        }
+        // 進行方向へalong、右手へside [px] ずらした点
+        auto px = [&](float along, float side) { return x + static_cast<int>(lroundf(dirX * along - dirY * side)); };
+        auto py = [&](float along, float side) { return y + static_cast<int>(lroundf(dirY * along + dirX * side)); };
+        // 噴射中=緑, 惰行中=水色, 測位が古い=灰色
+        const int color = !positionFresh ? TFT_LIGHTGREY : (INJ_timems > 0.0f ? TFT_GREEN : TFT_CYAN);
+        lcd_s.fillTriangle(px(14, 0), py(14, 0), px(-9, 8), py(-9, 8), px(-9, -8), py(-9, -8), TFT_BLACK);  // コース線の上でも見えるよう黒で縁取る
+        lcd_s.fillTriangle(px(11, 0), py(11, 0), px(-7, 6), py(-7, 6), px(-7, -6), py(-7, -6), color);
+        lcd_s.fillTriangle(px(-3, 0), py(-3, 0), px(-8, 7), py(-8, 7), px(-8, -7), py(-8, -7), TFT_BLACK);  // 後ろを切り欠いて向きを分かりやすくする
+      }
+    }
+
+    // 方位（北が上）
+    lcd_s.fillTriangle(234, 2, 230, 9, 238, 9, TFT_WHITE);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+    lcd_s.setTextDatum(TC_DATUM);
+    lcd_s.drawString("N", 234, 10);
+  }
+
+  // 場所と加速パターン（コース図の下）
+  int len = snprintf(buf, sizeof(buf), "%s", Loc == "su" ? "鈴鹿" : (Loc == "mo" ? "茂木" : "豊田"));
+  if (cfg.enabled) {
+    len += snprintf(buf + len, sizeof(buf) - len, " %u回%s", static_cast<unsigned int>(pattern.markCount), out.usingFallback ? "予備" : "");
+  }
+  snprintf(buf + len, sizeof(buf) - len, "%s%s", STRATEGY_SIM ? " SIM" : "", positionFresh ? "" : " GNSS:x");
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+  lcd_s.setTextDatum(MC_DATUM);
+  lcd_s.setTextColor(positionFresh ? TFT_WHITE : TFT_YELLOW);
+  lcd_s.drawString(buf, 160, 197);
+  lcd_s.setTextColor(TFT_WHITE);
+
+  // 四隅の見出し
+  const int restlaps = max(0, static_cast<int>(totallaps) - static_cast<int>(Lapcount));
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.drawString("速度", 4, 2);
+  lcd_s.drawString(restlaps == 1 ? "最終周" : "残り", 4, 146);
+  lcd_s.setTextDatum(TR_DATUM);
+  lcd_s.drawString("走行時間", 316, 146);
+  if (cfg.enabled) {
+    lcd_s.drawString("停止", 316, 2);
+    if (out.fuelLow) {
+      lcd_s.setTextColor(TFT_ORANGE);
+      lcd_s.drawString("燃圧低下", 316, 64);
+      lcd_s.setTextColor(TFT_WHITE);
+    }
+  }
+
+  // 左上: 現在の速度, 左下: 残り周回
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd_s.setTextSize(2);
+  lcd_s.setTextDatum(TL_DATUM);
+  snprintf(buf, sizeof(buf), "%.1f", speed);
+  lcd_s.drawString(buf, 4, 20);
+  snprintf(buf, sizeof(buf), "%d周", restlaps);
+  lcd_s.drawString(buf, 4, 164);
+
+  // 右上: 今の周の加速停止速度（遅れを取り戻すために上げていればマゼンタ、下げていれば水色）
+  lcd_s.setTextDatum(TR_DATUM);
+  if (cfg.enabled) {
+    if (out.bumpKmh > 0.0f) {
+      lcd_s.setTextColor(TFT_MAGENTA);
+    } else if (out.bumpKmh < 0.0f) {
+      lcd_s.setTextColor(TFT_CYAN);
+    }
+    snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+    lcd_s.drawString(buf, 316, 20);
+    lcd_s.setTextColor(TFT_WHITE);
+  }
+
+  // 右下: 走行時間
+  lcd_s.setTextSize(1.5);
+  formatMinSec(buf, sizeof(buf), worktime);
+  lcd_s.drawString(buf, 316, 168);
+
+  // 合図の帯: 加速=緑, 停止=赤
+  int bandBg = TFT_BLACK;
+  int bandFg = TFT_WHITE;
+  if (cfg.enabled) {
+    const bool caution = formatStrategyCue(out, buf, sizeof(buf));
+    if (out.cue == Cue::BurnNow) {
+      bandBg = TFT_GREEN;
+      bandFg = TFT_BLACK;
+    } else if (out.cue == Cue::CutNow) {
+      bandBg = TFT_RED;
+    } else if (caution) {
+      bandFg = TFT_YELLOW;
+    }
+  } else if (strategySource == STRATEGY_SRC_SD_ERROR) {
+    snprintf(buf, sizeof(buf), "支援設定異常");
+    bandFg = TFT_RED;
+  } else {
+    snprintf(buf, sizeof(buf), "プラン未設定");
+  }
+  lcd_s.fillRect(0, bandTop, lcd_s.width(), lcd_s.height() - bandTop, bandBg);
+  if (bandBg == TFT_BLACK) {
+    lcd_s.drawFastHLine(0, bandTop, lcd_s.width(), TFT_DARKGREY);
+  }
+  lcd_s.setTextDatum(MC_DATUM);
+  lcd_s.setTextColor(bandFg);
+  lcd_s.drawString(buf, 160, bandTop + 18);
+  lcd_s.setTextColor(TFT_WHITE);
   lcd_s.setTextSize(1);
 }
 
@@ -1799,9 +1962,9 @@ void updateDisplay() {
   if (M5.BtnA.isPressed()) { dispmode = 1; }
   if (M5.BtnC.isPressed()) { dispmode = 2; }
 
-  // 標高グラフモードの場合は専用の描画関数を呼び出して終了する
+  // 現在地表示モードの場合は専用の描画関数を呼び出して終了する
   if (dispmode == 2) {
-    drawAltitudeGraphMode();      // 標高グラフモードの描画
+    drawCourseMapMode();          // コース図と現在地の描画
     lcd.startWrite();
     lcd_s.pushSprite(0, 0);
     lcd.endWrite();
@@ -2310,20 +2473,10 @@ void updateSimulatedRun() {
     simT += dt;
   }
 
-  // 累積距離をウェイポイント間の補間で緯度経度に直す
-  const float rawPos = fmodf(simS + lapM, lapM) * (waypointRawLapMeters / lapM);
-  size_t i = 0;
-  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
-    i++;
-  }
-  const Waypoint& from = waypoints[i];
-  const Waypoint& to = waypoints[(i + 1) % waypointCount];
-  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;
-  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  // 累積距離をコース上の緯度経度に直す
   const double prevLa = la;
   const double prevLn = ln;
-  la = from.lat + (to.lat - from.lat) * ratio;
-  ln = from.lng + (to.lng - from.lng) * ratio;
+  lapPositionToLatLng(simS, la, ln);
 
   // ECU・BLEの受信値を差し替える
   receiveECUtime = nowMs;
