@@ -259,14 +259,39 @@ python3 tools/make_strategy_json.py suzuka --fallback-v-off 30 --fallback-marks 
 - 予備パターンが規定時間を超える場合は警告を表示する
 - 書き出す前に、上の「設定全体を採用しない」条件と同じ検査をする。当てはまればファイルを書き換えずに終了する
 
+#### 周ごとにパターンを替えるプラン (練習走行用)
+
+パラメータ JSON に `phases` (何周目からどのパターンで走るか) があるときは、`optimize` の計算をせず、書かれたとおりに設定ファイルを作る。もてぎの練習走行用は ECU リポジトリの `tools/strategy/practice_motegi_2026.json`。
+
+```sh
+# 本番用の sd/motegi_strategy.json を上書きしないよう、出力先を分ける
+python3 tools/make_strategy_json.py motegi \
+    --params ../UNOR4_Chibi-T_EFI/tools/strategy/practice_motegi_2026.json \
+    --fuel-warn-mpa 0.30 --beep -o sd/motegi_strategy_practice.json
+```
+
+| 項目 | 決め方 |
+| ---- | ---- |
+| `v_off` / `marks_m` | 1 つ目の段階。**通常パターン**になる (起動直後に有効) |
+| `fallback` の `v_off` / `marks_m` | 2 つ目の段階。**予備パターン**になり、その周に入るところで B 長押しで切り替える |
+| `splits_s` | 途中でパターンを切り替えて走ったときの各周の通過タイム |
+| `final_lap_marks` / `final_extra_if_split_over_s` | 最終周を走る側 (予備パターン) について計算する。通常パターンの `final_lap_marks` は全位置 |
+
+- 段階は 2 つまで (ファームが持てるパターンは通常と予備の 2 つ)。3 つ以上はエラーで終了する
+- `--target` と、段階が 2 つあるときの `--fallback-v-off` / `--fallback-marks` は使えない (エラーで終了する)
+- 入力の既定 (`tools/strategy/<コース>_*.json` のうち名前順で最後) に練習用が選ばれないよう、練習用のファイル名は `<コース>_` で始めない。`--params` で指定する
+- 出力先を分けた場合は `fuel_warn_mpa` / `beep` を引き継ぐファイルが無いので、オプションで与える
+- microSD には `motegi_strategy.json` の名前で入れる。**練習走行のあとは本番用に入れ替える**
+- 走行中にロガーが再起動すると通常パターン (1 つ目の段階) に戻る。切り替えたあとなら B 長押しをやり直す
+
 #### ECU 側との照合
 
 次のどれかに当たると、ファイルを書き換えずにエラーで終了する (`--dry-run` でも同じ)。
 
 | 照合するもの | ECU 側 | このスクリプト側 |
 | ---- | ---- | ---- |
-| パラメータ JSON の形式 | JSON の `"format_version"` | `PARAMS_FORMAT_VERSION` |
-| シミュレータの仕様 (推奨パターンの選び方、関数の引数・戻り値) | `strategy_sim.py` の `INTERFACE_VERSION` | `SIM_INTERFACE_VERSION` |
+| パラメータ JSON の形式 (現在 2。`phases` を足した) | JSON の `"format_version"` | `PARAMS_FORMAT_VERSION` |
+| シミュレータの仕様 (推奨パターンの選び方、関数の引数・戻り値。現在 2) | `strategy_sim.py` の `INTERFACE_VERSION` | `SIM_INTERFACE_VERSION` |
 | 規定周回数 | JSON の `course.laps` | `src/main.cpp` の `totallaps_su` / `totallaps_mo` |
 
 - 版数が違う・書かれていない場合は、ECU 側で何が変わったかを確かめ、スクリプトを合わせてから対応版数を上げる。スクリプトは `optimize` の選定手順を写して持っているので、ECU 側で選び方を変えたら `INTERFACE_VERSION` を上げること

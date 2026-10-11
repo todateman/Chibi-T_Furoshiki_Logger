@@ -15,6 +15,12 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
 
 最終周の 2 項目は、加速開始位置を ±30 m ずらした 3 通りのうち完走側（回数は最大、所要時間は最長）を採る。
 
+パラメータに "phases"（周ごとのパターン。練習走行用）があるときは探索をせず、書かれたとおりに作る:
+  - 1 つ目の段階 → 通常パターン（起動直後に有効）、2 つ目の段階 → 予備パターン（B 長押しで切り替える）
+  - splits_s は途中でパターンを切り替えて走ったときの通過タイム
+  - 最終周の 2 項目は最終周を走る側（予備パターン）について計算する
+  - 段階は 2 つまで（ファームが持てるパターンが 2 つのため）
+
 パラメータからは決まらない項目は、出力先に既にあるファイルの値を引き継ぐ。初めて作るコースでは
 オプションで与える:
   - fallback の v_off / marks_m（--fallback-v-off / --fallback-marks。final_lap_marks は計算し直す）
@@ -30,6 +36,10 @@ ECU 側の形式が変わったことに気づけるよう、次の 2 つの版�
   python3 tools/make_strategy_json.py motegi              # → sd/motegi_strategy.json
   python3 tools/make_strategy_json.py suzuka --target 38:30
   python3 tools/make_strategy_json.py suzuka --params ../UNOR4_Chibi-T_EFI/tools/strategy/suzuka_2027.json
+
+  # 練習走行用（本番用の sd/motegi_strategy.json を上書きしないよう出力先を分ける）
+  python3 tools/make_strategy_json.py motegi --params ../UNOR4_Chibi-T_EFI/tools/strategy/practice_motegi_2026.json \
+      --fuel-warn-mpa 0.30 --beep -o sd/motegi_strategy_practice.json
 """
 
 import argparse
@@ -47,10 +57,11 @@ FIRMWARE = REPO / "src" / "main.cpp"
 COURSES = {"suzuka": "su", "motegi": "mo", "toyota": "to"}
 
 # 対応している ECU 側の版数
-PARAMS_FORMAT_VERSION = 1  # パラメータ JSON の format_version
-SIM_INTERFACE_VERSION = 1  # strategy_sim.py の INTERFACE_VERSION
+PARAMS_FORMAT_VERSION = 2  # パラメータ JSON の format_version
+SIM_INTERFACE_VERSION = 2  # strategy_sim.py の INTERFACE_VERSION
 
 # ファーム側の上限（include/StrategyAssist.h, src/main.cpp）
+MAX_PATTERNS = 2  # 通常パターンと予備パターン
 MAX_MARKS = 6
 MAX_SPLITS = 12
 MAX_FILE_BYTES = 1535  # STRATEGY_FILE_BUFFER_SIZE - 1
@@ -140,15 +151,30 @@ def recommend(sim, p: dict, course, target_s: float, n_min: int, n_max: int, fue
     return rec
 
 
-def final_lap(sim, p: dict, course, v_off: float, marks: list[float], guard: float) -> tuple[int, float]:
+def plan(sim, p: dict, course, args) -> dict | None:
+    """パラメータの phases に書かれたプランの評価結果を返す。phases が無ければ None。"""
+    pol = sim.plan_from_params(p)
+    if pol is None:
+        return None
+    if 1 + len(pol["switches"]) > MAX_PATTERNS:
+        raise ValueError(f"phases は {MAX_PATTERNS} つまでです（ロガーが持てるのは通常パターンと予備パターンだけ）")
+    if args.target:
+        raise ValueError("phases のあるパラメータでは探索をしないので、--target は使えません")
+    if pol["switches"] and (args.fallback_v_off is not None or args.fallback_marks is not None):
+        raise ValueError("phases の 2 つ目の段階が予備パターンになるので、--fallback-v-off / --fallback-marks は使えません")
+    return sim.evaluate(p, course, pol)
+
+
+def final_lap(sim, p: dict, course, pol: dict) -> tuple[int, float]:
     """(最終周に加速を始める回数の最大, 最終周の所要時間の最長 s) を返す。"""
     laps = p["course"]["laps"]
     counts, times = [], []
-    for dm, dv in sim.JITTER:
-        r = sim.simulate(p, course, v_off, marks=[m + dm for m in marks], v_on=guard + dv)
+    for v_off, jitter in sim.jittered(pol):
+        r = sim.simulate(p, course, v_off, **jitter)
         counts.append(sum(1 for lap, _, _ in r["starts"] if lap == laps))
         times.append(r["time_s"] - r["crossings"][laps - 2][0])
-    return min(max(counts), len(marks)), max(times)
+    last_marks = pol["switches"][-1][2] if pol.get("switches") else pol["marks"]
+    return min(max(counts), len(last_marks)), max(times)
 
 
 def number(value: float):
@@ -163,26 +189,34 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
     guard = c.get("guard_kmh", 16.0)
     notes = []
 
-    v_off, marks = rec["pol"]["v_off"], rec["pol"]["marks"]
-    count, longest = final_lap(sim, p, course, v_off, marks, guard)
+    pol = rec["pol"]
+    v_off, marks, switches = pol["v_off"], pol["marks"], pol.get("switches", [])
+    # 途中で予備パターンへ切り替えるプランでは、最終周を走るのは予備パターンの側
+    count, longest = final_lap(sim, p, course, pol)
+    final_marks = switches[-1][2] if switches else marks
     cfg = {
         "lap_m": round(c["total_m"] / laps, 2),
         "v_off": v_off,
         "marks_m": [number(m) for m in marks],
-        "final_lap_marks": count,
+        "final_lap_marks": len(marks) if switches else count,
     }
-    if count < len(marks):
+    if count < len(final_marks):
         cfg["final_extra_if_split_over_s"] = math.floor(limit - sim.HOME_MARGIN_S - longest)
     cfg["guard_kmh"] = guard
-    nominal = sim.simulate(p, course, v_off, marks=marks, v_on=guard)
+    nominal = sim.simulate(p, course, v_off, marks=marks, v_on=guard, switches=switches)
     cfg["splits_s"] = [round(t) for t, _, _ in nominal["crossings"][:laps - 1]]
 
     kept = existing.get("fallback") or {}
     fb_v_off = args.fallback_v_off if args.fallback_v_off is not None else kept.get("v_off")
     fb_marks = args.fallback_marks if args.fallback_marks is not None else kept.get("marks_m")
-    if fb_v_off is not None and fb_marks:
+    if switches:
+        from_lap, sw_v_off, sw_marks = switches[0]
+        cfg["fallback"] = {"v_off": sw_v_off, "marks_m": [number(m) for m in sw_marks], "final_lap_marks": count}
+        notes.append(f"1〜{from_lap - 1} 周目は通常パターン、{from_lap} 周目から予備パターン"
+                     f"（{from_lap - 1} 周通過後に B 長押しで切り替える）")
+    elif fb_v_off is not None and fb_marks:
         fb_marks = sorted(float(m) for m in fb_marks)
-        fb_count, _ = final_lap(sim, p, course, float(fb_v_off), fb_marks, guard)
+        fb_count, _ = final_lap(sim, p, course, {"v_off": float(fb_v_off), "marks": fb_marks, "v_on": guard})
         cfg["fallback"] = {"v_off": fb_v_off, "marks_m": [number(m) for m in fb_marks], "final_lap_marks": fb_count}
         r = sim.evaluate(p, course, {"v_off": float(fb_v_off), "marks": fb_marks, "v_on": guard})
         notes.append(f"予備パターン: {sim.mmss(r['time_min_s'])}〜{sim.mmss(r['time_s'])}  加速 {r['burns']} 回")
@@ -289,10 +323,20 @@ def main() -> int:
         if output.exists():
             existing = json.loads(output.read_text(encoding="utf-8"), parse_float=Literal)
 
-        target = sim.parse_mmss(args.target) if args.target else p["target_s"]
-        rec = recommend(sim, p, course, target, args.n_min, args.n_max, args.fuel_slack)
-        if rec is None:
-            raise ValueError(f"目標 {sim.mmss(target)} に収まるパターンがありません")
+        limit = p["course"]["limit_s"]
+        rec = plan(sim, p, course, args)
+        if rec is not None:
+            summary = [f"phases のプラン（探索なし） / 規定 {sim.mmss(limit)} / {p['course']['laps']} 周",
+                       f"プランの通し: {sim.mmss(rec['time_min_s'])}〜{sim.mmss(rec['time_s'])}  加速 {rec['burns']} 回"]
+            if rec["time_s"] > limit:
+                summary.append(f"警告: プランは規定時間 {sim.mmss(limit)} を超えます")
+        else:
+            target = sim.parse_mmss(args.target) if args.target else p["target_s"]
+            rec = recommend(sim, p, course, target, args.n_min, args.n_max, args.fuel_slack)
+            if rec is None:
+                raise ValueError(f"目標 {sim.mmss(target)} に収まるパターンがありません")
+            summary = [f"目標 {sim.mmss(target)} / 規定 {sim.mmss(limit)} / {p['course']['laps']} 周",
+                       f"通常パターン: {sim.mmss(rec['time_min_s'])}〜{sim.mmss(rec['time_s'])}  加速 {rec['burns']} 回"]
         cfg, build_notes = build(sim, p, course, rec, existing, args)
     except (OSError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
@@ -303,9 +347,7 @@ def main() -> int:
 
     text = dump(cfg) + "\n"
     print(f"入力 {params}")
-    print(f"目標 {sim.mmss(target)} / 規定 {sim.mmss(p['course']['limit_s'])} / {p['course']['laps']} 周")
-    print(f"通常パターン: {sim.mmss(rec['time_min_s'])}〜{sim.mmss(rec['time_s'])}  加速 {rec['burns']} 回")
-    for note in build_notes + notes:
+    for note in summary + build_notes + notes:
         print(note)
     print()
     print(text, end="")
