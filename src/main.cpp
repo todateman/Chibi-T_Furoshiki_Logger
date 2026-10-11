@@ -1952,15 +1952,19 @@ void tryFetchAltitudeOffsetFromGsi() {
   Serial.printf("[GSI] altitude offset fixed: %.2fm (gsi=%.2fm raw=%.2fm)\n", altitudeOffsetMeters, gsiElevationMeters, rawAltitudeMeters);
 }
 
+// ボタン操作により表示モードを切り替える関数
+// Bボタンは長押し（走行支援の加速パターン切替）では画面を替えず、短く押して離したときだけモード0へ切り替える
+// 離した瞬間の判定は M5.update() の1回ぶんしか残らないので、loop() のたびに呼ぶ
+void updateDisplayMode() {
+  if (M5.BtnB.wasClicked()) { dispmode = 0; }
+  if (M5.BtnA.isPressed()) { dispmode = 1; }
+  if (M5.BtnC.isPressed()) { dispmode = 2; }
+}
+
 // ディスプレイ更新（表示モードごとに分岐）
 void updateDisplay() {
   lcd_s.fillScreen(TFT_BLACK);
   lcd_s.setTextColor(TFT_WHITE);
-  
-  // ボタン状態により表示モードを切り替え
-  if (M5.BtnB.isPressed()) { dispmode = 0; }
-  if (M5.BtnA.isPressed()) { dispmode = 1; }
-  if (M5.BtnC.isPressed()) { dispmode = 2; }
 
   // 現在地表示モードの場合は専用の描画関数を呼び出して終了する
   if (dispmode == 2) {
@@ -2498,7 +2502,7 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.update();
-  M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える
+  M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える（1秒未満で離すとモード0へ切替）
 #if STRATEGY_BEEP_AVAILABLE
   M5.Speaker.setVolume(255);
 #endif
@@ -2743,6 +2747,7 @@ void loop() {
     nearestWaypointIndex = -1;
   }
   updateStrategyAssist();
+  updateDisplayMode();
 
   if (millis() - t_display >= DISPLAY_INTERVAL) {
     updateDisplay();
