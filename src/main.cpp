@@ -191,7 +191,7 @@ float FuelPre = 0.0;    // 燃圧 [MPa]（AutoAirAdjust経由）
 
 // GPS用
 TinyGPSPlus gps;
-int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, M5Stack GNSS Module:38400）
+int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, ATGM336H:115200（tools/setup_atgm336h.pyで設定済みのもの）, M5Stack GNSS Module:38400）
 double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
