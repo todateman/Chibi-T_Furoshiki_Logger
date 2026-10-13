@@ -1075,6 +1075,12 @@ void drawStrategyMode() {
     const int x = barX + barW * i / totallaps;
     lcd_s.drawFastVLine(x, 227, 10, (x >= barX + elapsedPx) ? bg : fg);  // 帯の上では背景色、帯の外では文字色で描く
   }
+  // 戦略どおりなら今いるはずの位置を、帯の上辺の切り欠き（▼）で示す。現在地が切り欠きより左なら計画より遅れている
+  const float planned = StrategyAssist::plannedProgress(cfg, worktime);
+  if (isfinite(planned)) {
+    const int x = barX + static_cast<int>(constrain(planned, 0.0f, 1.0f) * barW);
+    lcd_s.fillTriangle(x - 4, 227, x + 4, 227, x, 232, (x >= barX + elapsedPx) ? bg : fg);
+  }
   if (goal > 0) {
     const int x = barX + static_cast<int>(constrain(static_cast<float>(distance) / static_cast<float>(goal), 0.0f, 1.0f) * barW);
     lcd_s.fillRect(x - 3, 224, 7, 16, bg);  // 帯と同じ色でも見えるよう背景色で縁取る

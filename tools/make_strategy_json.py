@@ -8,7 +8,7 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
 計算で決まる項目:
   - lap_m, guard_kmh                 パラメータの course からそのまま
   - v_off, marks_m                   optimize の推奨パターン
-  - splits_s                         推奨パターンをずらさずに走ったときの各周の通過タイム
+  - splits_s                         推奨パターンをずらさずに走ったときの各周の通過タイム（最後はゴール）
   - final_lap_marks                  最終周に加速を始める回数
   - final_extra_if_split_over_s      規定時間 - 余裕 - 最終周の所要時間。これより遅く最終周に入ると
                                      惰行で終えたときの余裕が足りない
@@ -204,7 +204,7 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
         cfg["final_extra_if_split_over_s"] = math.floor(limit - sim.HOME_MARGIN_S - longest)
     cfg["guard_kmh"] = guard
     nominal = sim.simulate(p, course, v_off, marks=marks, v_on=guard, switches=switches)
-    cfg["splits_s"] = [round(t) for t, _, _ in nominal["crossings"][:laps - 1]]
+    cfg["splits_s"] = [round(t) for t, _, _ in nominal["crossings"][:laps]]  # 最後はゴールの目標時間
 
     kept = existing.get("fallback") or {}
     fb_v_off = args.fallback_v_off if args.fallback_v_off is not None else kept.get("v_off")

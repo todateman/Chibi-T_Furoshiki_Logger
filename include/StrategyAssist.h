@@ -53,6 +53,23 @@ inline float paceBumpKmh(float delayS) {
   return 0.0f;
 }
 
+// 戦略どおりに走った場合の、走行時間 worktimeS での全周回の進み具合（0〜1）
+// 目標通過タイムのあいだを直線で補間する。最後の目標を過ぎた場合や目標が無い場合はNAN
+inline float plannedProgress(const Config& cfg, float worktimeS) {
+  if (cfg.totalLaps == 0 || worktimeS <= 0.0f) {
+    return NAN;
+  }
+  float prevS = 0.0f;
+  for (uint8_t i = 0; i < cfg.splitCount && i < cfg.totalLaps; i++) {
+    const float splitS = cfg.splitsS[i];
+    if (worktimeS <= splitS) {
+      return (static_cast<float>(i) + (worktimeS - prevS) / (splitS - prevS)) / static_cast<float>(cfg.totalLaps);
+    }
+    prevS = splitS;
+  }
+  return NAN;
+}
+
 // コントロールライン交差を1周として数えてよいか（前回カウントからの走行距離で判定）
 // 発進直後の通過と、ライン付近での二重カウントを除外する
 inline bool lapCrossingPlausible(float distSinceLastCountM, float lapM) {
