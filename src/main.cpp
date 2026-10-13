@@ -2649,8 +2649,9 @@ void setup() {
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
     showMessage(String(FPSTR(MSG_WIFI_CONFIG)) + portalSSID);
-    char ConfigSSID[40];
-    sprintf(ConfigSSID, "WIFI:S:%s;T:nopass;R:1;;", portalSSID);
+    // Wi-Fi接続用QRコード（パスワードなしのAP）。SSIDは最大32文字
+    char ConfigSSID[64];
+    snprintf(ConfigSSID, sizeof(ConfigSSID), "WIFI:S:%s;T:nopass;;", portalSSID.c_str());
     lcd.qrcode(ConfigSSID, 105, 92, 135, 5);
   });
   
