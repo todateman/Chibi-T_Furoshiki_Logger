@@ -79,6 +79,9 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define LAP_CROSS_DEBOUNCE_MS 10000UL       // ラップカウントの多重カウント防止用クールダウン時間
 #define LAP_CROSS_TELEPORT_GUARD_M 100.0    // GPSロスト後の誤検出防止用の最大移動距離しきい値[m]
+// 周回開始（ECUの走行時間が動き出す）前のコントロールライン通過も周回として数えるか
+// ポータブル仕様はECUを繋がず走行時間が0のままなので、常に数える
+#define LAP_COUNT_BEFORE_START GNSS_MODULE_M5
 
 // GNSS受信バッファサイズ（1ループあたりの最大パース量。10Hzロギングでの取りこぼし防止のため広めに確保）
 #define GNSS_PARSE_BUDGET_BYTES 512
@@ -830,7 +833,7 @@ float currentLapPositionMeters() {
 }
 
 // 発進（ECUの走行時間が0から動き出した）を検知して周回数を0に戻す関数
-// 発進前にラインをまたいで数えてしまった周回を、走行に持ち込まないようにする
+// 前の走行の周回数や、発進前にラインをまたいで数えた周回（ポータブル仕様）を、走行に持ち込まないようにする
 void resetLapCountOnLaunch() {
   static float prevWorktime = 0.0f;
   if (prevWorktime <= 0.0f && worktime > 0.0f) {
@@ -1690,6 +1693,11 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
 
   if (!hasPriorFix) {
     hasPriorFix = true;  // 初回の有効な測位では前回位置が無いため判定をスキップする
+    return;
+  }
+
+  // 周回開始前（ECUの走行時間が0のまま）の通過は数えない（走行開始前の移動中にラインをまたぐことがある）
+  if (!LAP_COUNT_BEFORE_START && worktime <= 0.0f) {
     return;
   }
 
