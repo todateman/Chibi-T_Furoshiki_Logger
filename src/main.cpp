@@ -13,7 +13,15 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <string.h>
+// GNSSと気圧の取得元（0:車載用の外付けGNSS + BME280, 1:M5Stack GNSS ModuleのNEO-M9N + BMP280）
+#ifndef GNSS_MODULE_M5
+#define GNSS_MODULE_M5 0
+#endif
+#if GNSS_MODULE_M5
+#include <Adafruit_BMP280.h>
+#else
 #include <Adafruit_BME280.h>
+#endif
 #include "CourseMap.h"
 #include "StrategyAssist.h"
 #include "secrets.h"
@@ -55,7 +63,11 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 
 // 各タスクの更新間隔（ミリ秒）
 #define SERIAL_OUT_INTERVAL 100
+#if GNSS_MODULE_M5
+#define SD_LOG_INTERVAL     1000   // ポータブル仕様はGNSSの測位(1Hz)に合わせる
+#else
 #define SD_LOG_INTERVAL     100
+#endif
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define MQTT_RECONNECT_BASE_INTERVAL 5000UL
@@ -191,7 +203,12 @@ float FuelPre = 0.0;    // 燃圧 [MPa]（AutoAirAdjust経由）
 
 // GPS用
 TinyGPSPlus gps;
-int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, M5Stack GNSS Module:38400）
+// GNSSモジュールのボーレート（NEO-6M:115200, M5Stack GNSS Module:38400）
+#if GNSS_MODULE_M5
+int gnss_bps = 38400;
+#else
+int gnss_bps = 115200;
+#endif
 double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
@@ -199,9 +216,17 @@ double alt = 0.0;   // GPS高度
 double spd = 0.0;   // GPS速度
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
-// BME280による高度推定用
-Adafruit_BME280 bme280;
-bool isBmx280Ready = false;     // BME280が正常に初期化されているかどうか
+// 気圧センサー（BME280 / GNSS Module内蔵のBMP280）による高度推定用
+#if GNSS_MODULE_M5
+Adafruit_BMP280 envSensor(&Wire);
+constexpr uint8_t ENV_SENSOR_CHIP_ID = 0x58;
+constexpr char ENV_SENSOR_NAME[] = "BMP280";
+#else
+Adafruit_BME280 envSensor;
+constexpr uint8_t ENV_SENSOR_CHIP_ID = 0x60;
+constexpr char ENV_SENSOR_NAME[] = "BME280";
+#endif
+bool isBmx280Ready = false;     // 気圧センサーが正常に初期化されているかどうか
 float envPressureKPa = NAN;                       // BME280から取得した環境気圧 [kPa]（利用できない場合はNAN）
 float envTemperatureC = NAN;                      // BME280から取得した環境温度 [°C]（利用できない場合はNAN）
 float envHumidityPct = NAN;                       // BME280から取得した環境湿度 [%]（利用できない場合はNAN）
@@ -1763,7 +1788,7 @@ bool readPressurePa(float& outPressurePa) {
   if (!isBmx280Ready) {
     return false;
   }
-  outPressurePa = bme280.readPressure();
+  outPressurePa = envSensor.readPressure();
   return true;
 }
 
@@ -1777,8 +1802,12 @@ void updateEnvironmentSensors() {
   }
 
   if (isBmx280Ready) {
-    float temperatureC = bme280.readTemperature();
-    float humidityPct = bme280.readHumidity();
+    float temperatureC = envSensor.readTemperature();
+#if GNSS_MODULE_M5
+    float humidityPct = NAN;  // BMP280は湿度を測れない
+#else
+    float humidityPct = envSensor.readHumidity();
+#endif
     envTemperatureC = (isfinite(temperatureC) && temperatureC > -40.0f && temperatureC < 100.0f) ? temperatureC : NAN;
     envHumidityPct = (isfinite(humidityPct) && humidityPct >= 0.0f && humidityPct <= 100.0f) ? humidityPct : NAN;
     return;
@@ -2392,10 +2421,8 @@ bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   return true;
 }
 
-// BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+// 気圧センサー（BME280 / GNSS Module内蔵のBMP280）向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
 bool initializePressureSensorForGnssModule() {
-  const uint8_t bme280ChipId = 0x60;
-
   Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());
 
   const uint8_t addresses[] = {0x76, 0x77};
@@ -2405,12 +2432,17 @@ bool initializePressureSensorForGnssModule() {
       continue;
     }
 
-    if (chipId == bme280ChipId) {
-      if (bme280.begin(addresses[i], &Wire)) {
-        Serial.printf("BME280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+    if (chipId == ENV_SENSOR_CHIP_ID) {
+#if GNSS_MODULE_M5
+      const bool began = envSensor.begin(addresses[i], ENV_SENSOR_CHIP_ID);
+#else
+      const bool began = envSensor.begin(addresses[i], &Wire);
+#endif
+      if (began) {
+        Serial.printf("%s initialized (addr=0x%02X, id=0x%02X)\n", ENV_SENSOR_NAME, addresses[i], chipId);
         return true;
       }
-      Serial.printf("BME280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      Serial.printf("%s begin failed (addr=0x%02X, id=0x%02X)\n", ENV_SENSOR_NAME, addresses[i], chipId);
       continue;
     }
 
@@ -2510,14 +2542,22 @@ void setup() {
   // デバッグ用Serial
   Serial.begin(115200);
 
-  // 気圧センサー初期化（BME280）
+  // 気圧センサー初期化（BME280 / GNSS Module内蔵のBMP280）
   if (initializePressureSensorForGnssModule()) {
-    bme280.setSampling(Adafruit_BME280::MODE_NORMAL,
-                       Adafruit_BME280::SAMPLING_X2,
-                       Adafruit_BME280::SAMPLING_X16,
-                       Adafruit_BME280::SAMPLING_X1,
-                       Adafruit_BME280::FILTER_X16,
-                       Adafruit_BME280::STANDBY_MS_500);
+#if GNSS_MODULE_M5
+    envSensor.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                          Adafruit_BMP280::SAMPLING_X2,
+                          Adafruit_BMP280::SAMPLING_X16,
+                          Adafruit_BMP280::FILTER_X16,
+                          Adafruit_BMP280::STANDBY_MS_500);
+#else
+    envSensor.setSampling(Adafruit_BME280::MODE_NORMAL,
+                          Adafruit_BME280::SAMPLING_X2,
+                          Adafruit_BME280::SAMPLING_X16,
+                          Adafruit_BME280::SAMPLING_X1,
+                          Adafruit_BME280::FILTER_X16,
+                          Adafruit_BME280::STANDBY_MS_500);
+#endif
     isBmx280Ready = true;
   }
   updateEnvironmentSensors();

@@ -33,16 +33,22 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - 基板: M5Stack Basic (Gray) / M5Stack Core2 (ESP32, PSRAM 使用)
 - SD: SPI (GPIO4 / SHARED_SPI 設定)
 - ECU: Serial1 115200 bps、RXピンはボード依存  
-  (M5Stack Core2: RX=2, TX=0 / M5Stack Basic: RX=15, TX=0)  
+  (M5Stack Basic: RX=15, TX=0 / M5Stack Core2: RX=2, TX=0)  
   ※M5Stack Basicの起動不良対策としてGPIO12を使用しないため分岐 (コード参照)
   - 受信フォーマット (10Hz): `rpm,inj(ms),ign_ca,inj_end_ca,speed,distance,fuel(ml),km/L,worktime*XX` (`worktime` は0.1秒単位の小数秒。例 `267.3`。整数秒でも受理)  
     `XX` は先頭から `*` 直前までのXOR (16進2桁)。不一致・項目不足の行は破棄する。EFI側と同時に更新すること (旧形式とは非互換)  
     RXバッファは1024Bに拡大 (MQTT/HTTP中の取りこぼし対策)
-- GNSS(GY-NEO-6MV2): Serial2 115200 bps (RX=13, TX=14)
+- GNSS(GY-NEO-6MV2): Serial2 115200 bps
+  (M5Stack Basic: RX=16, TX=17 / M5Stack Core2: RX=13, TX=14)
 - BME280(気圧/気温/湿度センサ): I2C 0x76、SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
+- ポータブル仕様 (`m5stack-basic-portable`、M5Stack Basic のみ): 上の GNSS と BME280 の代わりに [M5Stack GNSS Module](https://docs.m5stack.com/ja/module/Module_GNSS) を重ねて使う
+  - GNSS(NEO-M9N): Serial2 38400 bps (RX=16, TX=17)、測位は出荷時の 1Hz のまま。モジュールの DIP スイッチで NEO_TXD を G16 に繋ぐ (ロガーからモジュールへは何も送らない)  
+    PPS は使わない。割り当てる場合は ECU 用の G15 / G0 と SD の G4 を避ける
+  - BMP280(気圧/気温センサ): I2C 0x76 (SDA=21, SCL=22)。湿度は測れないので SD ログでは空欄、MQTT では `null` になる。気温はモジュール内の温度なので外気より高めに出る
+  - ECU・BLE 中継機の処理は車載と同じまま動く (繋がないので速度・回転数などは 0)
 - BLE 中継機 [nRF52840_BLE_Central](https://github.com/todateman/nRF52840_BLE_Central) (XIAO nRF52840): Port A 経由の I2C で接続（XIAO nRF52840側がI2Cスレーブ, addr=`0x08`）
-  - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。BME280用バスとはピンが異なるため)
   - M5Stack Basic: SDA=21, SCL=22 (BME280用`Wire`バスと共用。Port Aのピンが同一のため)
+  - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。BME280用バスとはピンが異なるため)
   - 200ms間隔で以下4コマンドを順に送信し、それぞれ32byte固定フレーム（`[0]`=データ長, `[1..]`=文字列データ）でデータを取得。いずれも2秒以上有効データを取得できない場合は該当値を`0.0`にリセットする
 
     | コマンド | データ | 単位 | 有効範囲(範囲外は破棄) |
@@ -84,6 +90,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 | ---- | ---- | ---- |
 | `native` | 走行支援の判定ロジック (`include/StrategyAssist.h`) のテストをPC上で実行 | `pio test -e native` |
 | `m5stack-basic-sim` | 走行支援画面・現在地表示画面の机上確認。もてぎのウェイポイント上を8倍速で仮想走行する (`STRATEGY_SIM=8`)。SDに `motegi_waypoint.csv` と `motegi_strategy.json` が必要。SDログ・MQTT・Ambientは止まる。**本番には書き込まない** (状態行に `SIM` と出る) | `pio run -e m5stack-basic-sim -t upload` |
+| `m5stack-basic-portable` | 車体に載せずコースウォークなどで使うポータブル仕様 (M5Stack Basic + M5Stack GNSS Module)。GNSS は NEO-M9N (38400 bps)、気圧は BMP280 から取り、SD への記録は 1Hz になる (`GNSS_MODULE_M5=1`)。車載用のハードでは GNSS も気圧も取れないので**車載には書き込まない** | `pio run -e m5stack-basic-portable -t upload` |
 
 ### デバッグ
 
