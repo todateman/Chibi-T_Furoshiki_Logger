@@ -5,10 +5,10 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 - [ECU](https://github.com/todateman/UNOR4_Chibi-T_EFI) からの走行データ取得 (Serial1)
 - GNSS 位置・時刻取得 (Serial2, TinyGPS++)
-- 高度推定 (BME280を用いた気圧→高度換算)
+- 高度推定 (Unit ENV-III または BME280 を用いた気圧→高度換算)
 - インターネット接続時の国土地理院標高API利用 (HTTP優先、失敗時はHTTPS/GNSS高度へフォールバック)
 - BLE 経由の[エンジン温度](https://github.com/todateman/Chibi-T_Furoshiki_Heater)・[1次側/2次側空気圧・燃圧](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust)受信 ([nF52840 BLE中継機](https://github.com/todateman/nRF52840_BLE_Central)とPort A経由のI2C通信)
-- BME280を使用した気温・湿度測定
+- [Unit ENV-III](https://docs.m5stack.com/en/unit/Unit_ENV-III) (見つからなければ BME280) を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
 - Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
 - LCD (M5Unified + LovyanGFX) への複数モード表示
@@ -22,8 +22,8 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 | 走行支援 | 加速開始位置・加速停止速度・通過タイムの遅れを画面の色と文字で合図する (SDに設定ファイル `motegi_strategy.json` があるときだけ有効。削除すれば無効)。詳細は「走行支援」を参照 |
 | 現在地表示 (コース図) | `sd`ディレクトリのウェイポイントCSV (`suzuka_waypoint.csv` / `motegi_waypoint.csv` / `toyota_waypoint.csv`) を読み込み、北を上にしたコース図を描く。GNSSの現在地と、走行支援の加速開始位置・加速停止速度を重ねて表示。詳細は「モード2(現在地表示)」を参照 |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
-| 高度推定 | BME280 気圧から高度推定 (標準大気式) |
-| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、BME280高度との差分でオフセット補正 |
+| 高度推定 | Unit ENV-III (見つからなければ BME280) の気圧から高度推定 (標準大気式) |
+| 標高オフセット補正 | 国土地理院APIから標高を1回取得し、気圧センサー高度との差分でオフセット補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
 | Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値・未固定除外<BR>周回カウントの多重検出防止 (デバウンス) / GPSロスト再測位時の誤検出防止 (テレポートガード)<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
@@ -40,16 +40,19 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
     RXバッファは1024Bに拡大 (MQTT/HTTP中の取りこぼし対策)
 - GNSS(GY-NEO-6MV2): Serial2 115200 bps
   (M5Stack Basic: RX=16, TX=17 / M5Stack Core2: RX=13, TX=14)
-- BME280(気圧/気温/湿度センサ): I2C 0x76、SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
+- 環境センサ (気圧/気温/湿度): 起動時に下の順で探し、先に見つかった方を使う。SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
+  1. [Unit ENV-III](https://docs.m5stack.com/en/unit/Unit_ENV-III): I2C 0x44 (SHT30: 気温/湿度) + 0x70 (QMP6988: 気圧)。BME280 より精度が高い (気温 ±0.2℃、湿度 ±2%RH)。BME280 と同じ I2C バス (Port A) に繋ぐ (M5Stack Basic で BLE 中継機と同時に使うときは Grove ハブで分岐する)
+  2. BME280: I2C 0x76 / 0x77 (Unit ENV-III が見つからないときだけ使う)
+  - どちらを使っているかは起動時のシリアル出力 (`Unit ENV-III initialized` / `Unit ENV-III not found`) で分かる
 - ポータブル仕様 (`m5stack-basic-portable`、M5Stack Basic のみ): 上の GNSS と BME280 の代わりに [M5Stack GNSS Module](https://docs.m5stack.com/ja/module/Module_GNSS) を重ねて使う
   - GNSS(NEO-M9N): Serial2 38400 bps (RX=16, TX=17)、測位は出荷時の 1Hz のまま。モジュールの DIP スイッチで NEO_TXD を G16 に繋ぐ (ロガーからモジュールへは何も送らない)  
     PPS は使わない。割り当てる場合は ECU 用の G15 / G0 と SD の G4 を避ける
-  - BMP280(気圧/気温センサ): I2C 0x76 (SDA=21, SCL=22)。湿度は測れないので SD ログでは空欄、MQTT では `null` になる。気温はモジュール内の温度なので外気より高めに出る
+  - BMP280(気圧/気温センサ): I2C 0x76 (SDA=21, SCL=22)。湿度は測れないので SD ログでは空欄、MQTT では `null` になる。気温はモジュール内の温度なので外気より高めに出る。Port A に Unit ENV-III を繋ぐと、BMP280 の代わりに Unit ENV-III から気圧/気温/湿度を取る
   - ECU・BLE 中継機の処理は車載と同じまま動く (繋がないので速度・回転数などは 0)
   - 周回数は走行開始を待たずに、コントロールラインを通過するたびに数える (車載では ECU の走行時間が動き出してから数える)
 - BLE 中継機 [nRF52840_BLE_Central](https://github.com/todateman/nRF52840_BLE_Central) (XIAO nRF52840): Port A 経由の I2C で接続（XIAO nRF52840側がI2Cスレーブ, addr=`0x08`）
-  - M5Stack Basic: SDA=21, SCL=22 (BME280用`Wire`バスと共用。Port Aのピンが同一のため)
-  - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。BME280用バスとはピンが異なるため)
+  - M5Stack Basic: SDA=21, SCL=22 (環境センサ用`Wire`バスと共用。Port Aのピンが同一のため)
+  - M5Stack Core2: SDA=32, SCL=33 (専用I2Cバス`Wire1`を使用。環境センサ用バスとはピンが異なるため)
   - 200ms間隔で以下4コマンドを順に送信し、それぞれ32byte固定フレーム（`[0]`=データ長, `[1..]`=文字列データ）でデータを取得。いずれも2秒以上有効データを取得できない場合は該当値を`0.0`にリセットする
 
     | コマンド | データ | 単位 | 有効範囲(範囲外は破棄) |
@@ -100,11 +103,11 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 
 ## 高度推定 / 国土地理院API補正
 
-- 高度は GNSS ではなく BME280 の気圧から算出
+- 高度は GNSS ではなく気圧センサー (Unit ENV-III、見つからなければ BME280) の気圧から算出
 - 海面気圧は初期値 `101.325kPa` を使用
 - Wi-Fi接続済みかつGNSS座標が有効なときのみ、国土地理院API (`getelevation.php`) で標高取得を低頻度で試行
-- 標高取得成功時、その時点のBME280生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
-- 以後の表示/ログ高度は `BME280生高度 + オフセット` で算出
+- 標高取得成功時、その時点の気圧センサー生高度との差分をオフセットとして1回だけ固定し、以後は再取得しない
+- 以後の表示/ログ高度は `気圧センサー生高度 + オフセット` で算出
 - API取得は HTTP を優先し、失敗時は HTTPS フォールバック
 
 ## 起動時の Wi-Fi 操作
@@ -345,7 +348,7 @@ python3 tools/make_strategy_json.py motegi \
 ヘッダ: `記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)` (22列)
 
 - 記録日時: GNSS/NTP同期時刻を基準にmillis()で連続算出 + JST補正 (`YYYY/M/D hh:mm:ss.cc`)。SDログ行は10Hzでも重複しない (厳密単調増加)
-- `alt`: BME280高度 + 国土地理院APIで確定したオフセット
+- `alt`: 気圧センサー高度 + 国土地理院APIで確定したオフセット
 - `loc`: サーキット判定結果 (`su` / `mo` / `to`)
 - 走行時間: ECU送信の積算秒 (0.1秒単位、小数1桁。例 `267.3`)。LCD表示・MQTT/Ambient送信は整数秒
 - 燃料噴射時間(ms) / 点火進角角度(CA) / 燃料噴射終了角度(CA): ECU送信値。ECU無信号時は0 (燃料噴射時間は小数1桁)
@@ -384,8 +387,9 @@ python3 tools/remove_stopped_rows.py LOG0651.CSV -o out.csv   # 出力先を指�
 
 - 実装ファイル: `src/main.cpp`
 - センサー構成:
-  - 気圧: BME280
-  - 気温/湿度: BME280
+  - 気圧: Unit ENV-III の QMP6988 (見つからなければ BME280)
+  - 気温/湿度: Unit ENV-III の SHT30 (見つからなければ BME280)
+  - Unit ENV-III のドライバは `include/UnitEnvIII.h`。loop() を止めないよう、SHT30 は前回始めた測定の結果を読んで次の測定を始める (値は1秒前のもの)
 - 計算式: 標準大気式 `44330 * (1 - (P / P0)^0.1903)`
   - `P`: 実測気圧(kPa)
   - `P0`: 海面気圧初期値 `101.325kPa`
