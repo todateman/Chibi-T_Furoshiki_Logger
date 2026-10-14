@@ -2574,7 +2574,11 @@ void setup() {
   M5.update();
   M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える（1秒未満で離すとモード0へ切替）
 #if STRATEGY_BEEP_AVAILABLE
+#if STRATEGY_SIM
+  M5.Speaker.setVolume(100);  // 机上確認用環境では音量を落とす
+#else
   M5.Speaker.setVolume(255);
+#endif
 #endif
   
   // デバッグ用Serial
@@ -2682,6 +2686,11 @@ void setup() {
     }
   }
   
+#if STRATEGY_SIM
+  // 机上確認用環境ではインターネット接続が不要なので、Wi-Fi設定・接続をスキップする
+  MQTTpush = false;
+  ambientpush = false;
+#else
   // WiFi設定（WiFiManagerを利用）
   wifiManager.setAPCallback([](WiFiManager* mgr){
     Serial.println("Entered config mode");
@@ -2722,6 +2731,7 @@ void setup() {
       lcd.drawString("Wi-Fi無効", lcd.width()/2, lcd.height()/2);
     }
   }
+#endif
 
   if (isWifiConfigSucceeded) {
     // ESP32の省電力動作でTLS受信が不安定になることがあるため無効化する
