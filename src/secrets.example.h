@@ -11,9 +11,6 @@ extern const int   mqtt_port;        // 通常 8883 (TLS)
 extern const char* mqtt_topic;       // 例: "Furoshiki/M5Logger"
 extern const char* mqtt_deviceID;    // Thing Name / Client ID
 
-// Ambient
-extern const char* userKey;          // Ambient user key (channelId / writeKey は動的取得 or 追加定義可)
-
 // Amazon Root CA 1
 extern const char AWS_CERT_CA[] PROGMEM;    
 // Device Certificate
@@ -28,7 +25,6 @@ const char* mqtt_server = "xxxxxxxxxx-ats.iot.ap-northeast-*.amazonaws.com";
 const int   mqtt_port   = 8883;
 const char* mqtt_topic  = "Furoshiki/M5Logger";
 const char* mqtt_deviceID = "M5Core2_Furoshiki";
-const char* userKey = "your_ambient_user_key";
 
 static const char AWS_CERT_CA[] PROGMEM = R"EOF(-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n)EOF";
 static const char AWS_CERT_CRT[] PROGMEM = R"KEY(-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n)KEY";

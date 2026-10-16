@@ -3,7 +3,6 @@
 #include "SdFat.h"
 #include "sdios.h"
 #include <M5Unified.h>
-#include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
 #include <WiFiClientSecure.h>
@@ -73,7 +72,6 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define MQTT_RECONNECT_BASE_INTERVAL 5000UL
 #define MQTT_RECONNECT_MAX_INTERVAL  60000UL
-#define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
 #define ENV_SENSOR_INTERVAL 1000
 #define DISPLAY_INTERVAL    100
@@ -148,24 +146,17 @@ int fileNum = 0;    // ログファイル番号（例: LOG0000.CSVの0000部分�
 bool logFileInitialized = false;  // ログファイルが初期化されているか（ヘッダ書き込み済みか）
 const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイル番号を保存するファイル
 
-// WiFi, MQTT, Ambient
+// WiFi, MQTT
 WiFiManager wifiManager;
-WiFiClient ambientClient;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttclient(mqttTlsClient);
-Ambient ambient;
 bool isWifiConfigSucceeded = false;
-bool ambientpush = false;   // Ambient送信有効（必要に応じてfalseに設定）
 bool MQTTpush = true;       // MQTT送信有効
-char devKey[20];
-unsigned int channelId;
-char writeKey[20];
 
 // タイマー用
 unsigned long t_Serial = 0;
 unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
-unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
 unsigned long t_env    = 0;
 unsigned long t_display = 0;
@@ -2058,12 +2049,7 @@ void updateDisplay() {
     lcd_s.setTextDatum(top_right);
     lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
     lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
-    if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
-    if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
-    if (!ambientpush && !MQTTpush) {
-      lcd_s.drawString("MQTT: x", 320, 30);
-      // lcd_s.drawString("Amb: x", 320, 45);
-    }
+    lcd_s.drawString(MQTTpush ? "MQTT: O" : "MQTT: x", 320, 30);
   }
   
   // タイトル表示（表示モードごと）
@@ -2408,34 +2394,6 @@ void updateMQTT() {
   lastPublishAt = millis();
 }
 
-// Ambient送信
-void updateAmbient() {
-  if (WiFi.status() == WL_CONNECTED) {
-    char buf[16];
-    ambient.set(1, speed);
-    ambient.set(2, EngTemp);
-    ambient.set(3, Lapcount);
-    ambient.set(4, static_cast<int>(worktime));
-    ambient.set(5, tachoRpm);
-    ambient.set(6, distance);
-    ambient.set(7, gasml);
-    ambient.set(8, dispergas);
-    dtostrf(la, 12, 8, buf);
-    ambient.set(9, buf);
-    dtostrf(ln, 12, 8, buf);
-    ambient.set(10, buf);
-    // ambient.set(11, alt); // 高度追加 (フィールド11は使用上無いのでコメントアウト、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
-    if (ambient.send(1000)) {
-      Serial.println("Ambient: Success!");
-    } else {
-      Serial.println("Ambient: failure...");
-    }
-  } else {
-    Serial.println("WiFi disconnected for Ambient");
-    WiFi.reconnect();
-  }
-}
-
 // I2CデバイスからチップIDレジスタ(0xD0)を読み取る
 bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   Wire.beginTransmission(i2cAddress);
@@ -2689,7 +2647,6 @@ void setup() {
 #if STRATEGY_SIM
   // 机上確認用環境ではインターネット接続が不要なので、Wi-Fi設定・接続をスキップする
   MQTTpush = false;
-  ambientpush = false;
 #else
   // WiFi設定（WiFiManagerを利用）
   wifiManager.setAPCallback([](WiFiManager* mgr){
@@ -2711,7 +2668,7 @@ void setup() {
   while (millis() - btnStart < 5000) {
     M5.update();
     if (M5.BtnA.isPressed()) { doManualConfig = true; break; }
-    if (M5.BtnC.isPressed()) { ambientpush = false; MQTTpush = false; break; }
+    if (M5.BtnC.isPressed()) { MQTTpush = false; break; }
     delay(10);
   }
   if (doManualConfig) {
@@ -2721,11 +2678,11 @@ void setup() {
       isWifiConfigSucceeded = false;
     }
   } else {
-    if (ambientpush || MQTTpush) {
+    if (MQTTpush) {
       lcd.fillScreen(TFT_BLACK);
       showMessage(FPSTR(MSG_WIFI_CONNECTING));
       if (wifiManager.autoConnect()) { isWifiConfigSucceeded = true; }
-      else { isWifiConfigSucceeded = false; ambientpush = false; MQTTpush = false; }
+      else { isWifiConfigSucceeded = false; MQTTpush = false; }
     } else {
       lcd.fillScreen(TFT_BLACK);
       lcd.drawString("Wi-Fi無効", lcd.width()/2, lcd.height()/2);
@@ -2737,21 +2694,6 @@ void setup() {
     // ESP32の省電力動作でTLS受信が不安定になることがあるため無効化する
     WiFi.setSleep(false);
     Serial.println("WiFi modem sleep disabled");
-  }
-  
-  // Ambient設定
-  if (ambientpush && isWifiConfigSucceeded) {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    sprintf(devKey, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
-      Serial.printf("Cannot get channelId for device %s\n", devKey);
-      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
-        M5.update();
-        delay(500);
-      }
-    }
-    ambient.begin(channelId, writeKey, &ambientClient);
   }
   
   // MQTT設定
@@ -2781,7 +2723,6 @@ void setup() {
 #if STRATEGY_SIM
   // 仮想走行の値をクラウドへ送らない
   MQTTpush = false;
-  ambientpush = false;
 #endif
 
   lcd.fillScreen(TFT_BLACK);
@@ -2791,7 +2732,6 @@ void setup() {
   t_Serial = millis();
   t_SD = millis();
   t_MQTT = millis();
-  t_amb = millis();
   t_alt = millis();
   t_env = millis();
   t_display = millis();
@@ -2890,12 +2830,6 @@ void loop() {
         }
       }
     }
-  }
-  
-  // AmbientはWi-Fi接続が必要なため、接続成功している場合のみ更新する
-  if (ambientpush && (millis() - t_amb >= AMBIENT_INTERVAL)) {
-    updateAmbient();
-    t_amb += AMBIENT_INTERVAL;
   }
   
   // 高度更新は気圧センサーが正常に初期化されている場合のみ実行する

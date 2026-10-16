@@ -10,7 +10,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 - BLE 経由の[エンジン温度](https://github.com/todateman/Chibi-T_Furoshiki_Heater)・[1次側/2次側空気圧・燃圧](https://github.com/todateman/Chibi-T_Furoshiki_AutoAirAdjust)受信 ([nF52840 BLE中継機](https://github.com/todateman/nRF52840_BLE_Central)とPort A経由のI2C通信)
 - [Unit ENV-III](https://docs.m5stack.com/en/unit/Unit_ENV-III) (見つからなければ BME280) を使用した気温・湿度測定
 - SD カードへの CSV ロギング (SdFat)
-- Wi-Fi (任意) + MQTT (AWS IoT Core) / Ambient 送信
+- Wi-Fi (任意) + MQTT (AWS IoT Core) 送信
 - LCD (M5Unified + LovyanGFX) への複数モード表示
 
 ## 主な機能概要
@@ -25,7 +25,6 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 | 高度推定 | Unit ENV-III (見つからなければ BME280) の気圧から高度推定 (標準大気式) |
 | 標高オフセット補正 | 国土地理院APIから標高を1回取得し、気圧センサー高度との差分でオフセット補正 |
 | MQTT 送信 | JSON ペイロードを `mqtt_topic` へ (証明書による TLS) |
-| Ambient 送信 | 10 フィールド + 位置情報文字列 |
 | セーフ処理 | GNSS 異常値・未固定除外<BR>周回カウントの多重検出防止 (デバウンス) / GPSロスト再測位時の誤検出防止 (テレポートガード)<BR>BLEタイムアウト時温度リセット<BR>ECU無信号時フェールセーフ |
 
 ## ハードウェア / 接続
@@ -67,7 +66,6 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 ## ソフトウェア依存ライブラリ (platformio.ini より)
 
 - [TinyGPSPlus](https://github.com/mikalhart/TinyGPSPlus)
-- [Ambient ESP32 ESP8266 lib](https://github.com/AmbientDataInc/Ambient_ESP8266_lib)
 - [M5Unified](https://github.com/m5stack/M5Unified)
 - [TimeLib](https://github.com/derickr/timelib)
 - [PubSubClient](https://github.com/knolleary/pubsubclient)
@@ -93,7 +91,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 | 環境 | 用途 | コマンド |
 | ---- | ---- | ---- |
 | `native` | 走行支援の判定ロジック (`include/StrategyAssist.h`) のテストをPC上で実行 | `pio test -e native` |
-| `m5stack-basic-sim` | 走行支援画面・現在地表示画面の机上確認。もてぎのウェイポイント上を8倍速で仮想走行する (`STRATEGY_SIM=8`)。SDに `motegi_waypoint.csv` と `motegi_strategy.json` が必要。SDログ・MQTT・Ambientは止まる。**本番には書き込まない** (状態行に `SIM` と出る) | `pio run -e m5stack-basic-sim -t upload` |
+| `m5stack-basic-sim` | 走行支援画面・現在地表示画面の机上確認。もてぎのウェイポイント上を8倍速で仮想走行する (`STRATEGY_SIM=8`)。SDに `motegi_waypoint.csv` と `motegi_strategy.json` が必要。SDログ・MQTTは止まる。**本番には書き込まない** (状態行に `SIM` と出る) | `pio run -e m5stack-basic-sim -t upload` |
 | `m5stack-basic-portable` | 車体に載せずコースウォークなどで使うポータブル仕様 (M5Stack Basic + M5Stack GNSS Module)。GNSS は NEO-M9N (38400 bps)、気圧は BMP280 から取り、SD への記録は 1Hz になる (`GNSS_MODULE_M5=1`)。車載用のハードでは GNSS も気圧も取れないので**車載には書き込まない** | `pio run -e m5stack-basic-portable -t upload` |
 
 ### デバッグ
@@ -115,7 +113,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 | 操作 | 説明 |
 | ---- | ---- |
 | A ボタン | Wi-Fi 設定ポータル (AP モード, QR コードで簡易接続) |
-| C ボタン | Wi-Fi 無効 (Ambient / MQTT も無効) |
+| C ボタン | Wi-Fi 無効 (MQTT も無効) |
 | 無操作 (5秒) | 自動接続 (保存済 SSID) / 失敗時は接続先SSIDを設定するWebUIへのQRコードを表示 |
 
 ## 表示モード詳細
@@ -350,7 +348,7 @@ python3 tools/make_strategy_json.py motegi \
 - 記録日時: GNSS/NTP同期時刻を基準にmillis()で連続算出 + JST補正 (`YYYY/M/D hh:mm:ss.cc`)。SDログ行は10Hzでも重複しない (厳密単調増加)
 - `alt`: 気圧センサー高度 + 国土地理院APIで確定したオフセット
 - `loc`: サーキット判定結果 (`su` / `mo` / `to`)
-- 走行時間: ECU送信の積算秒 (0.1秒単位、小数1桁。例 `267.3`)。LCD表示・MQTT/Ambient送信は整数秒
+- 走行時間: ECU送信の積算秒 (0.1秒単位、小数1桁。例 `267.3`)。LCD表示・MQTT送信は整数秒
 - 燃料噴射時間(ms) / 点火進角角度(CA) / 燃料噴射終了角度(CA): ECU送信値。ECU無信号時は0 (燃料噴射時間は小数1桁)
 - 燃費: コード中 `dispergas` (km/L 指定の閾値 2000 スケールバー)
 - タイムスタンプは `logFile.timestamp()` によりファイル更新時にも設定
@@ -437,14 +435,6 @@ python3 tools/remove_stopped_rows.py LOG0651.CSV -o out.csv   # 出力先を指�
 - バッファサイズ: `MQTT_BUFFER_SIZE` (既定 512) → 変更時は `PubSubClient` の制約に注意
 - 送信間隔: 走行前 `10s`, 走行中 `1s`
 
-## Ambient 送信仕様
-
-フィールド番号: 1=速度, 2=温度, 3=ラップ, 4=走行時間, 5=回転数, 6=距離, 7=積算燃料, 8=燃費, 9=lat文字列, 10=lon文字列
-
-- `userKey` と `devKey` (MAC アドレスから生成) を利用して `channelId` / `writeKey` を動的に取得  
-  (secrets.h に記載しての固定はしない)
-- 送信タイムアウト 1000 ms
-
 ## secrets.h 管理
 
 **認証情報は Git に含めないでください。**  
@@ -456,7 +446,6 @@ const char* mqtt_server;      // AWS IoT Core エンドポイント (xxxxxxxxx-a
 const int   mqtt_port;        // 8883 推奨 (TLS)
 const char* mqtt_topic;       // 例: "Furoshiki/M5Logger"
 const char* mqtt_deviceID;    // Thing Name / クライアントID
-const char* userKey;          // Ambient ユーザーキー
 static const char AWS_CERT_CA[] PROGMEM;       // Amazon Root CA 1
 static const char AWS_CERT_CRT[] PROGMEM;      // デバイス証明書 (-----BEGIN CERTIFICATE-----)
 static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BEGIN RSA PRIVATE KEY-----)
@@ -488,7 +477,6 @@ static const char AWS_CERT_PRIVATE[] PROGMEM;  // デバイス秘密鍵 (-----BE
 | CSVログの先頭が文字化け/バイナリになる | 旧実装で `preAllocate()` されたログの可能性。CSV本体が予約領域後に残っている場合は、該当オフセット以降を切り出して復旧する |
 | MQTT connect失敗 | 証明書有効性/時刻同期 (GNSSで JST 変換) <BR> ポリシー権限確認 |
 | MQTT reconnect failed, state: -2 かつ `X509 - Allocation of memory failed` | TLS証明書検証時のヒープ不足。表示・バッファ確保量を下げて空きメモリを増やす (例: `MAX_WAYPOINTS` 削減, `lcd_s.setColorDepth(4)` など) <BR> 切り分け時は `MQTT_DIAGNOSTIC_LOG` を `1` にして `heap/minHeap/maxAlloc` を確認し、接続直前の `maxAlloc` を十分確保する |
-| Ambient failure | Wi-Fi RSSI / userKey / devKey/channelId 取得失敗再試行 |
 | 温度/PRI/SEC/FUEL が 0.0 固定 | BLE中継機(XIAO nRF52840)とのI2C通信失敗、またはBLE中継機が対応するBLEペリフェラル(Heater/AutoAirAdjust)からNotifyを受信できていない <BR> (該当値ごとに有効データ未取得が2秒以上継続でリセット。BLE中継機は切断時や3秒以上更新のないデータを長さ0で返すため、ペリフェラル側が止まった場合もここに該当する) |
 | 温度だけが同じ値のまま変化しない (例: LOG0645 の 79.50 固定) | BLE中継機の旧ファームウェアの不具合。AutoAirAdjust 接続中に Heater だけ切断されると再接続されず、切断前の値を返し続けていた <BR> [nRF52840_BLE_Central](https://github.com/todateman/nRF52840_BLE_Central) を最新版(2026-10-03 以降)へ更新する |
 | `[GSI] HTTPS GET failed: -1` が出る | 現在は `HTTP優先` 運用のため、HTTP成功時は実害なし。`[GSI] elevation=...` が継続していれば正常 |
