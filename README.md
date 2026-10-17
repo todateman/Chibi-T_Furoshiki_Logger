@@ -39,6 +39,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
     RXバッファは1024Bに拡大 (MQTT/HTTP中の取りこぼし対策)
 - GNSS(GY-NEO-6MV2): Serial2 115200 bps
   (M5Stack Basic: RX=16, TX=17 / M5Stack Core2: RX=13, TX=14)
+  - ATGM336H も使える。出荷状態は 9600 bps でそのままでは読めないので、先に `tools/setup_atgm336h.py` で設定を書き込んでおく (「ATGM336H を使う場合の設定」を参照)
 - 環境センサ (気圧/気温/湿度): 起動時に下の順で探し、先に見つかった方を使う。SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
   1. [Unit ENV-III](https://docs.m5stack.com/en/unit/Unit_ENV-III): I2C 0x44 (SHT30: 気温/湿度) + 0x70 (QMP6988: 気圧)。BME280 より精度が高い (気温 ±0.2℃、湿度 ±2%RH)。BME280 と同じ I2C バス (Port A) に繋ぐ (M5Stack Basic で BLE 中継機と同時に使うときは Grove ハブで分岐する)
   2. BME280: I2C 0x76 / 0x77 (Unit ENV-III が見つからないときだけ使う)
@@ -62,6 +63,34 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
     | `CMD_FUEL_PRE` (`0x04`) | 燃圧 (同上) | MPa | -0.02 〜 1.05 |
 
 - ボタン: A/B/C でモード選択 + 起動時設定。B長押し(1秒)で走行支援の加速パターンを切替 (長押しでは画面は替わらない。モード 0 へは B を短く押して離す)
+
+### ATGM336H を使う場合の設定
+
+GNSS モジュールは GY-NEO-6MV2 を標準とするが、ATGM336H も代わりに使える。  
+ロガーは Serial2 を 115200 bps で開いて NMEA を読むだけで、モジュールへ設定は送らない。  
+出荷状態の ATGM336H は 9600 bps・1 Hz なので、ロガーにつなぐ前に `tools/setup_atgm336h.py` で設定を書き込み、モジュールに保存しておく。  
+PC上で実行する (Python 3.10 以上、`pyserial` が必要)。  
+モジュールは USB シリアル変換でPCにつなぐ。
+
+```sh
+python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX                       # 設定して保存し、実際の出力を確認
+python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --verify-only         # 書き込まず、現在の出力を確認するだけ
+python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --rate-hz 5           # 更新レートを変える (1 / 2 / 4 / 5 / 10)
+python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す (衛星数・HDOP・GNSS高度)
+```
+
+| 項目 | 出荷状態 | 設定後 (既定) | 送るコマンド |
+| --- | --- | --- | --- |
+| 出力センテンス | GGA / GLL / GSA / GSV / RMC / VTG / ZDA / TXT | RMC のみ | `$PCAS03,0,0,0,0,1,0,0,0,0,0,,,0,0*03` |
+| ボーレート | 9600 bps | 115200 bps | `$PCAS01,5*19` |
+| 更新レート | 1 Hz | 10 Hz | `$PCAS02,100*1E` |
+| 保存 | - | モジュール内に保存 (電源を切っても残る) | `$PCAS00*01` |
+
+- 現在のボーレートは受信して自動で判定するので、設定済みのモジュールにかけ直してもよい
+- 書き込んだあと 5 秒間受信し、ボーレート・出力センテンス・更新レート・壊れた行の有無を `OK` / `NG` で表示する。`NG` があれば終了コードが 1 になる
+- 設定後に一度電源を入れ直し、`--verify-only` で設定が残っていることを確かめる
+- ロガーが使うのは時刻・日付・緯度経度・速度で、すべて RMC に入っている。RMC のみにすると衛星数・HDOP・GNSS高度は出ないが、ファームでは使っていない
+- ファーム側の変更は不要 (`src/main.cpp` の `gnss_bps` は 115200 のまま)。配線は GY-NEO-6MV2 と同じで、つないだあと屋外で画面右上の GNSS の表示が `O` になることを確認する
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
 

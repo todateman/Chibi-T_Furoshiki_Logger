@@ -198,7 +198,7 @@ float FuelPre = 0.0;    // 燃圧 [MPa]（AutoAirAdjust経由）
 
 // GPS用
 TinyGPSPlus gps;
-// GNSSモジュールのボーレート（NEO-6M:115200, M5Stack GNSS Module:38400）
+// GNSSモジュールのボーレート（NEO-6M:115200, ATGM336H:115200（tools/setup_atgm336h.pyで設定済みのもの）, M5Stack GNSS Module:38400）
 #if GNSS_MODULE_M5
 int gnss_bps = 38400;
 #else
