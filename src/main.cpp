@@ -3,7 +3,6 @@
 #include "SdFat.h"
 #include "sdios.h"
 #include <M5Unified.h>
-#include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
 #include <WiFiClientSecure.h>
@@ -13,8 +12,18 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <string.h>
+// GNSSと気圧の取得元（0:車載用の外付けGNSS + BME280, 1:M5Stack GNSS ModuleのNEO-M9N + BMP280）
+#ifndef GNSS_MODULE_M5
+#define GNSS_MODULE_M5 0
+#endif
+#if GNSS_MODULE_M5
+#include <Adafruit_BMP280.h>
+#else
 #include <Adafruit_BME280.h>
+#endif
+#include "CourseMap.h"
 #include "StrategyAssist.h"
+#include "UnitEnvIII.h"
 #include "secrets.h"
 
 //==================== 定数・マクロ ====================
@@ -54,18 +63,24 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 
 // 各タスクの更新間隔（ミリ秒）
 #define SERIAL_OUT_INTERVAL 100
+#if GNSS_MODULE_M5
+#define SD_LOG_INTERVAL     1000   // ポータブル仕様はGNSSの測位(1Hz)に合わせる
+#else
 #define SD_LOG_INTERVAL     100
+#endif
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define MQTT_RECONNECT_BASE_INTERVAL 5000UL
 #define MQTT_RECONNECT_MAX_INTERVAL  60000UL
-#define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
 #define ENV_SENSOR_INTERVAL 1000
 #define DISPLAY_INTERVAL    100
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define LAP_CROSS_DEBOUNCE_MS 10000UL       // ラップカウントの多重カウント防止用クールダウン時間
 #define LAP_CROSS_TELEPORT_GUARD_M 100.0    // GPSロスト後の誤検出防止用の最大移動距離しきい値[m]
+// 周回開始（ECUの走行時間が動き出す）前のコントロールライン通過も周回として数えるか
+// ポータブル仕様はECUを繋がず走行時間が0のままなので、常に数える
+#define LAP_COUNT_BEFORE_START GNSS_MODULE_M5
 
 // GNSS受信バッファサイズ（1ループあたりの最大パース量。10Hzロギングでの取りこぼし防止のため広めに確保）
 #define GNSS_PARSE_BUDGET_BYTES 512
@@ -131,24 +146,17 @@ int fileNum = 0;    // ログファイル番号（例: LOG0000.CSVの0000部分�
 bool logFileInitialized = false;  // ログファイルが初期化されているか（ヘッダ書き込み済みか）
 const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイル番号を保存するファイル
 
-// WiFi, MQTT, Ambient
+// WiFi, MQTT
 WiFiManager wifiManager;
-WiFiClient ambientClient;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttclient(mqttTlsClient);
-Ambient ambient;
 bool isWifiConfigSucceeded = false;
-bool ambientpush = false;   // Ambient送信有効（必要に応じてfalseに設定）
 bool MQTTpush = true;       // MQTT送信有効
-char devKey[20];
-unsigned int channelId;
-char writeKey[20];
 
 // タイマー用
 unsigned long t_Serial = 0;
 unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
-unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
 unsigned long t_env    = 0;
 unsigned long t_display = 0;
@@ -190,7 +198,12 @@ float FuelPre = 0.0;    // 燃圧 [MPa]（AutoAirAdjust経由）
 
 // GPS用
 TinyGPSPlus gps;
-int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, M5Stack GNSS Module:38400）
+// GNSSモジュールのボーレート（NEO-6M:115200, ATGM336H:115200（tools/setup_atgm336h.pyで設定済みのもの）, M5Stack GNSS Module:38400）
+#if GNSS_MODULE_M5
+int gnss_bps = 38400;
+#else
+int gnss_bps = 115200;
+#endif
 double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
@@ -198,14 +211,25 @@ double alt = 0.0;   // GPS高度
 double spd = 0.0;   // GPS速度
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
-// BME280による高度推定用
-Adafruit_BME280 bme280;
-bool isBmx280Ready = false;     // BME280が正常に初期化されているかどうか
-float envPressureKPa = NAN;                       // BME280から取得した環境気圧 [kPa]（利用できない場合はNAN）
-float envTemperatureC = NAN;                      // BME280から取得した環境温度 [°C]（利用できない場合はNAN）
-float envHumidityPct = NAN;                       // BME280から取得した環境湿度 [%]（利用できない場合はNAN）
+// 環境センサー（気圧・気温・湿度）。高度推定にも使う
+// Unit ENV-IIIを優先し、見つからない場合はBME280 / GNSS Module内蔵のBMP280を使う
+UnitEnvIII envIII;
+bool isEnvIIIReady = false;     // Unit ENV-IIIが正常に初期化されているかどうか
+#if GNSS_MODULE_M5
+Adafruit_BMP280 envSensor(&Wire);
+constexpr uint8_t ENV_SENSOR_CHIP_ID = 0x58;
+constexpr char ENV_SENSOR_NAME[] = "BMP280";
+#else
+Adafruit_BME280 envSensor;
+constexpr uint8_t ENV_SENSOR_CHIP_ID = 0x60;
+constexpr char ENV_SENSOR_NAME[] = "BME280";
+#endif
+bool isBmx280Ready = false;                       // BME280 / BMP280が正常に初期化されているかどうか
+float envPressureKPa = NAN;                       // 環境センサーから取得した環境気圧 [kPa]（利用できない場合はNAN）
+float envTemperatureC = NAN;                      // 環境センサーから取得した環境温度 [°C]（利用できない場合はNAN）
+float envHumidityPct = NAN;                       // 環境センサーから取得した環境湿度 [%]（利用できない場合はNAN）
 float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
-float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBME280生高度の差分（m）
+float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高と気圧センサー生高度の差分（m）
 bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
 unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
 
@@ -402,7 +426,7 @@ void updateSystemTimeFromGnss() {
 // ディスプレイ表示モード
 uint8_t dispmode = 0;
 
-// ウェイポイント（標高グラフ用）
+// ウェイポイント（コース図・周内位置の算出用）
 struct Waypoint {
   uint16_t id;
   float lat;
@@ -415,8 +439,10 @@ struct Waypoint {
 const size_t MAX_WAYPOINTS = 300;
 Waypoint waypoints[MAX_WAYPOINTS];
 size_t waypointCount = 0;
-float waypointMinAlt = 0.0f;
-float waypointMaxAlt = 0.0f;
+double waypointMinLat = 0.0;  // ウェイポイントの緯度経度の範囲（コース図の投影に使う）
+double waypointMaxLat = 0.0;
+double waypointMinLng = 0.0;
+double waypointMaxLng = 0.0;
 String loadedWaypointLoc = "";
 int nearestWaypointIndex = -1;
 float waypointRawLapMeters = 0.0f;  // ウェイポイントCSV上の1周の距離 [m]（距離列が無い場合は0）
@@ -491,8 +517,10 @@ bool loadWaypointFileForLoc(const String& loc) {
 
   char line[128];
   size_t loadedCount = 0;
-  float minAlt = 1000000.0f;
-  float maxAlt = -1000000.0f;
+  double minLat = 1000.0;
+  double maxLat = -1000.0;
+  double minLng = 1000.0;
+  double maxLng = -1000.0;
   while (waypointFile.available() && loadedCount < MAX_WAYPOINTS) {
     int len = waypointFile.readBytesUntil('\n', line, sizeof(line) - 1);
     if (len <= 0) {
@@ -513,12 +541,10 @@ bool loadWaypointFileForLoc(const String& loc) {
     }
 
     waypoints[loadedCount] = point;
-    if (point.alt < minAlt) {
-      minAlt = point.alt;
-    }
-    if (point.alt > maxAlt) {
-      maxAlt = point.alt;
-    }
+    minLat = min(minLat, static_cast<double>(point.lat));
+    maxLat = max(maxLat, static_cast<double>(point.lat));
+    minLng = min(minLng, static_cast<double>(point.lng));
+    maxLng = max(maxLng, static_cast<double>(point.lng));
     loadedCount++;
   }
   waypointFile.close();
@@ -530,12 +556,10 @@ bool loadWaypointFileForLoc(const String& loc) {
     return false;
   }
 
-  if (fabsf(maxAlt - minAlt) < 0.1f) {
-    minAlt -= 1.0f;
-    maxAlt += 1.0f;
-  }
-  waypointMinAlt = minAlt;
-  waypointMaxAlt = maxAlt;
+  waypointMinLat = minLat;
+  waypointMaxLat = maxLat;
+  waypointMinLng = minLng;
+  waypointMaxLng = maxLng;
   loadedWaypointLoc = loc;
 
   // 1周の距離 = 末尾までの距離 + 末尾から先頭へ戻る距離（走行支援の周内位置の算出に使う）
@@ -584,67 +608,26 @@ int findNearestWaypointIndex(double lat, double lng) {
   return nearest;
 }
 
-// 標高値をグラフのY座標に変換する関数
-int altitudeToGraphY(float value, float minAlt, float maxAlt, int top, int height) {
-  float normalized = (value - minAlt) / (maxAlt - minAlt);
-  normalized = constrain(normalized, 0.0f, 1.0f);
-  return top + height - 1 - static_cast<int>(normalized * static_cast<float>(height - 1));
-}
-
-// 標高グラフの描画
-void drawAltitudeGraphMode() {
-  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
-  lcd_s.setTextSize(1);
-  lcd_s.setTextDatum(TL_DATUM);
-  lcd_s.setTextColor(TFT_WHITE);
-
-  const int graphLeft = 10;
-  const int graphTop = 20;
-  const int graphWidth = 300;
-  const int graphHeight = 180;
-
-  lcd_s.drawRect(graphLeft, graphTop, graphWidth, graphHeight, TFT_WHITE);
-  if (waypointCount < 2) {
-    lcd_s.drawString("ウェイポイント未読込", 32, 108);
-    return;
+// 周内位置 [m]（スタートラインからの距離。公式の1周の距離基準）をコース上の緯度経度に直す関数
+// ウェイポイント間を補間する。求められない場合はfalseを返す
+bool lapPositionToLatLng(float lapPosM, double& outLat, double& outLng) {
+  const float lapM = strategy.config().lapM;
+  if (!isfinite(lapPosM) || waypointCount < 2 || waypointRawLapMeters <= 0.0f || lapM <= 0.0f) {
+    return false;
   }
 
-  for (size_t i = 0; i + 1 < waypointCount; i++) {
-    size_t next = i + 1;  // 右端と左端はつながない
-
-    int x1 = graphLeft + static_cast<int>((static_cast<float>(i) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
-    int y1 = altitudeToGraphY(waypoints[i].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-    int x2 = graphLeft + static_cast<int>((static_cast<float>(next) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
-    int y2 = altitudeToGraphY(waypoints[next].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-    lcd_s.drawLine(x1, y1, x2, y2, TFT_CYAN);
+  const float rawPos = fmodf(fmodf(lapPosM, lapM) + lapM, lapM) * (waypointRawLapMeters / lapM);
+  size_t i = 0;
+  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
+    i++;
   }
-
-  int plotIndex = nearestWaypointIndex;
-  if (plotIndex >= 0) {
-    int x = graphLeft + static_cast<int>((static_cast<float>(plotIndex) / static_cast<float>(waypointCount - 1)) * static_cast<float>(graphWidth - 1));
-    int yWaypoint = altitudeToGraphY(waypoints[plotIndex].alt, waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-    int yNow = altitudeToGraphY(static_cast<float>(alt), waypointMinAlt, waypointMaxAlt, graphTop, graphHeight);
-
-    lcd_s.drawFastVLine(x, graphTop, graphHeight, TFT_DARKGREY);
-    lcd_s.fillCircle(x, yWaypoint, 3, TFT_YELLOW);
-    lcd_s.fillCircle(x, yNow, 4, TFT_RED);
-
-    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
-    lcd_s.setTextDatum(TL_DATUM);
-    lcd_s.setTextColor(TFT_WHITE);
-    lcd_s.setCursor(8, 225);
-    lcd_s.printf("WP:%d/%u route:%.1fm now:%.1fm", waypoints[plotIndex].id,
-                 static_cast<unsigned int>(waypointCount),
-                 waypoints[plotIndex].alt,
-                 static_cast<float>(alt));
-  }
-
-  lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
-  lcd_s.setTextDatum(TL_DATUM);
-  lcd_s.setCursor(graphLeft, graphTop - 14);
-  lcd_s.printf("max %.1fm", waypointMaxAlt);
-  lcd_s.setCursor(graphLeft, graphTop + graphHeight + 2);
-  lcd_s.printf("min %.1fm", waypointMinAlt);
+  const Waypoint& from = waypoints[i];
+  const Waypoint& to = waypoints[(i + 1) % waypointCount];
+  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;  // 末尾→先頭の区間は1周の距離まで
+  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  outLat = from.lat + (to.lat - from.lat) * ratio;
+  outLng = from.lng + (to.lng - from.lng) * ratio;
+  return true;
 }
 
 //==================== 走行支援 =====================
@@ -845,7 +828,7 @@ float currentLapPositionMeters() {
 }
 
 // 発進（ECUの走行時間が0から動き出した）を検知して周回数を0に戻す関数
-// 発進前にラインをまたいで数えてしまった周回を、走行に持ち込まないようにする
+// 前の走行の周回数や、発進前にラインをまたいで数えた周回（ポータブル仕様）を、走行に持ち込まないようにする
 void resetLapCountOnLaunch() {
   static float prevWorktime = 0.0f;
   if (prevWorktime <= 0.0f && worktime > 0.0f) {
@@ -902,6 +885,46 @@ void updateStrategyAssist() {
 void formatMinSec(char* out, size_t outSize, float seconds) {
   const unsigned int total = static_cast<unsigned int>(seconds < 0.0f ? 0.0f : seconds);
   snprintf(out, outSize, "%02u:%02u", total / 60U, total % 60U);
+}
+
+// 合図の文言を作る関数。黄色で目立たせる合図（加速開始位置の手前・位置なし）ならtrueを返す
+bool formatStrategyCue(const StrategyAssist::Output& out, char* buf, size_t bufSize) {
+  using StrategyAssist::Cue;
+  bool caution = false;
+  switch (out.cue) {
+    case Cue::Idle:
+      snprintf(buf, bufSize, "スタート待ち");
+      break;
+    case Cue::Approach:
+      caution = true;
+      // fallthrough
+    case Cue::Coast:
+      snprintf(buf, bufSize, "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      break;
+    case Cue::BurnNow:
+      snprintf(buf, bufSize, out.guard ? "加速! 速度低下" : "加速!");
+      break;
+    case Cue::Burning:
+      snprintf(buf, bufSize, "%.1fで停止", out.vOffKmh);
+      break;
+    case Cue::CutNow:
+      snprintf(buf, bufSize, "停止!");
+      break;
+    case Cue::CoastHome:
+      snprintf(buf, bufSize, "惰行でゴール");
+      break;
+    case Cue::NoPosition:
+      caution = true;
+      snprintf(buf, bufSize, "位置なし");
+      break;
+    case Cue::Finished:
+      snprintf(buf, bufSize, "FINISH");
+      break;
+    default:
+      buf[0] = '\0';
+      break;
+  }
+  return caution;
 }
 
 // 走行支援画面（支援が有効なときのモード0）の描画
@@ -975,40 +998,7 @@ void drawStrategyMode() {
   lcd_s.fillRect(vOffX - 1, 67, 3, 18, plainBg ? TFT_RED : fg);
 
   // 合図
-  int cueColor = fg;
-  switch (out.cue) {
-    case Cue::Idle:
-      snprintf(buf, sizeof(buf), "スタート待ち");
-      break;
-    case Cue::Approach:
-      cueColor = TFT_YELLOW;
-      // fallthrough
-    case Cue::Coast:
-      snprintf(buf, sizeof(buf), "加速まで %dm", static_cast<int>(out.nextMarkDistM));
-      break;
-    case Cue::BurnNow:
-      snprintf(buf, sizeof(buf), out.guard ? "加速! 速度低下" : "加速!");
-      break;
-    case Cue::Burning:
-      snprintf(buf, sizeof(buf), "%.1fで停止", out.vOffKmh);
-      break;
-    case Cue::CutNow:
-      snprintf(buf, sizeof(buf), "停止!");
-      break;
-    case Cue::CoastHome:
-      snprintf(buf, sizeof(buf), "惰行でゴール");
-      break;
-    case Cue::NoPosition:
-      cueColor = TFT_YELLOW;
-      snprintf(buf, sizeof(buf), "位置なし");
-      break;
-    case Cue::Finished:
-      snprintf(buf, sizeof(buf), "FINISH");
-      break;
-    default:
-      buf[0] = '\0';
-      break;
-  }
+  const int cueColor = formatStrategyCue(out, buf, sizeof(buf)) ? TFT_YELLOW : fg;
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd_s.setTextSize(2);
   lcd_s.setTextDatum(MC_DATUM);
@@ -1080,6 +1070,12 @@ void drawStrategyMode() {
     const int x = barX + barW * i / totallaps;
     lcd_s.drawFastVLine(x, 227, 10, (x >= barX + elapsedPx) ? bg : fg);  // 帯の上では背景色、帯の外では文字色で描く
   }
+  // 戦略どおりなら今いるはずの位置を、帯の上辺の切り欠き（▼）で示す。現在地が切り欠きより左なら計画より遅れている
+  const float planned = StrategyAssist::plannedProgress(cfg, worktime);
+  if (isfinite(planned)) {
+    const int x = barX + static_cast<int>(constrain(planned, 0.0f, 1.0f) * barW);
+    lcd_s.fillTriangle(x - 4, 227, x + 4, 227, x, 232, (x >= barX + elapsedPx) ? bg : fg);
+  }
   if (goal > 0) {
     const int x = barX + static_cast<int>(constrain(static_cast<float>(distance) / static_cast<float>(goal), 0.0f, 1.0f) * barW);
     lcd_s.fillRect(x - 3, 224, 7, 16, bg);  // 帯と同じ色でも見えるよう背景色で縁取る
@@ -1119,6 +1115,202 @@ void drawStrategyMode() {
     }
     lcd_s.drawString(buf, 316, 192);
   }
+  lcd_s.setTextSize(1);
+}
+
+bool getControlLineForLoc(const String& loc, double& outLa1, double& outLn1, double& outLa2, double& outLn2);
+
+// 現在地表示画面（モード2）の描画
+// コース図（北が上）に現在地・スタートライン・加速開始位置を重ね、四隅に速度・加速停止速度・残り周回・走行時間を出す
+// 合図は下端の帯だけで伝える（コース図の配色は変えない）。走行支援が無効な場所でもコース図と現在地は出す
+void drawCourseMapMode() {
+  using StrategyAssist::Cue;
+  const StrategyAssist::Output& out = strategy.output();
+  const StrategyAssist::Config& cfg = strategy.config();
+  const StrategyAssist::Pattern& pattern = out.usingFallback ? cfg.fallback : cfg.primary;
+  const int bandTop = 206;  // 合図の帯の上端
+  char buf[48];
+
+  lcd_s.setTextSize(1);
+  lcd_s.setTextColor(TFT_WHITE);
+
+  // コース図。どのコースも南北に長いので中央の矩形に収め、左右の余白に数値を置く
+  const CourseMap::Projection proj = CourseMap::fit(waypointMinLat, waypointMaxLat, waypointMinLng, waypointMaxLng, 96, 20, 128, 152);
+  if (waypointCount < 2 || !proj.valid) {
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextDatum(MC_DATUM);
+    lcd_s.drawString("ウェイポイント未読込", 160, 100);
+  } else {
+    // コース線（末尾から先頭へも結んで1周にする）。スプライトは8ビット色なので、そのまま出せる灰色を使う
+    const int trackColor = lcd_s.color565(146, 146, 170);
+    int prevX, prevY;
+    proj.toScreen(waypoints[waypointCount - 1].lat, waypoints[waypointCount - 1].lng, prevX, prevY);
+    for (size_t i = 0; i < waypointCount; i++) {
+      int x, y;
+      proj.toScreen(waypoints[i].lat, waypoints[i].lng, x, y);
+      lcd_s.drawLine(prevX, prevY, x, y, trackColor);
+      lcd_s.fillCircle(x, y, 2, trackColor);
+      prevX = x;
+      prevY = y;
+    }
+
+    // スタートライン
+    double clLa1, clLn1, clLa2, clLn2;
+    if (getControlLineForLoc(Loc, clLa1, clLn1, clLa2, clLn2)) {
+      int x1, y1, x2, y2;
+      proj.toScreen(clLa1, clLn1, x1, y1);
+      proj.toScreen(clLa2, clLn2, x2, y2);
+      lcd_s.drawLine(x1, y1, x2, y2, TFT_WHITE);
+      lcd_s.drawLine(x1, y1 + 1, x2, y2 + 1, TFT_WHITE);
+    }
+
+    // 加速開始位置（●=有効, 黄色=次の位置, ○=最終周で使わない位置）。番号は四隅の数値と重ならないようコース図の内側に置く
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextDatum(MC_DATUM);
+    for (uint8_t i = 0; i < pattern.markCount; i++) {
+      double markLat, markLng;
+      if (!lapPositionToLatLng(pattern.marksM[i], markLat, markLng)) {
+        continue;
+      }
+      int x, y;
+      proj.toScreen(markLat, markLng, x, y);
+      const int color = (i == out.nextMark) ? TFT_YELLOW : TFT_WHITE;
+      if (i < out.activeMarks) {
+        lcd_s.fillCircle(x, y, 5, color);
+      } else {
+        lcd_s.fillCircle(x, y, 5, TFT_BLACK);
+        lcd_s.drawCircle(x, y, 5, color);
+      }
+      const float inX = proj.cx - static_cast<float>(x);
+      const float inY = proj.cy - static_cast<float>(y);
+      const float inLen = sqrtf(inX * inX + inY * inY);
+      if (inLen > 0.0f) {
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned int>(i + 1));
+        lcd_s.setTextColor(color);
+        lcd_s.drawString(buf, x + static_cast<int>(lroundf(inX / inLen * 14.0f)), y + static_cast<int>(lroundf(inY / inLen * 14.0f)));
+      }
+    }
+    lcd_s.setTextColor(TFT_WHITE);
+
+    // 現在地（GNSSの測位位置そのまま）。向きはコースの進行方向
+    if (nearestWaypointIndex >= 0) {
+      int x, y;
+      proj.toScreen(la, ln, x, y);
+      if (x >= 0 && x < lcd_s.width() && y >= 0 && y < bandTop) {
+        const size_t nearest = static_cast<size_t>(nearestWaypointIndex);
+        const Waypoint& before = waypoints[(nearest + waypointCount - 1) % waypointCount];
+        const Waypoint& after = waypoints[(nearest + 1) % waypointCount];
+        float dirX = proj.eastMeters(after.lng) - proj.eastMeters(before.lng);
+        float dirY = proj.northMeters(before.lat) - proj.northMeters(after.lat);  // 画面は下が正
+        const float dirLen = sqrtf(dirX * dirX + dirY * dirY);
+        if (dirLen > 0.0f) {
+          dirX /= dirLen;
+          dirY /= dirLen;
+        } else {
+          dirX = 0.0f;
+          dirY = -1.0f;
+        }
+        // 進行方向へalong、右手へside [px] ずらした点
+        auto px = [&](float along, float side) { return x + static_cast<int>(lroundf(dirX * along - dirY * side)); };
+        auto py = [&](float along, float side) { return y + static_cast<int>(lroundf(dirY * along + dirX * side)); };
+        // 噴射中=緑, 惰行中=水色, 測位が古い=灰色
+        const int color = !positionFresh ? TFT_LIGHTGREY : (INJ_timems > 0.0f ? TFT_GREEN : TFT_CYAN);
+        lcd_s.fillTriangle(px(14, 0), py(14, 0), px(-9, 8), py(-9, 8), px(-9, -8), py(-9, -8), TFT_BLACK);  // コース線の上でも見えるよう黒で縁取る
+        lcd_s.fillTriangle(px(11, 0), py(11, 0), px(-7, 6), py(-7, 6), px(-7, -6), py(-7, -6), color);
+        lcd_s.fillTriangle(px(-3, 0), py(-3, 0), px(-8, 7), py(-8, 7), px(-8, -7), py(-8, -7), TFT_BLACK);  // 後ろを切り欠いて向きを分かりやすくする
+      }
+    }
+
+    // 方位（北が上）
+    lcd_s.fillTriangle(234, 2, 230, 9, 238, 9, TFT_WHITE);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+    lcd_s.setTextDatum(TC_DATUM);
+    lcd_s.drawString("N", 234, 10);
+  }
+
+  // 場所と加速パターン（コース図の下）
+  int len = snprintf(buf, sizeof(buf), "%s", Loc == "su" ? "鈴鹿" : (Loc == "mo" ? "茂木" : "豊田"));
+  if (cfg.enabled) {
+    len += snprintf(buf + len, sizeof(buf) - len, " %u回%s", static_cast<unsigned int>(pattern.markCount), out.usingFallback ? "予備" : "");
+  }
+  snprintf(buf + len, sizeof(buf) - len, "%s%s", STRATEGY_SIM ? " SIM" : "", positionFresh ? "" : " GNSS:x");
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_12);
+  lcd_s.setTextDatum(MC_DATUM);
+  lcd_s.setTextColor(positionFresh ? TFT_WHITE : TFT_YELLOW);
+  lcd_s.drawString(buf, 160, 197);
+  lcd_s.setTextColor(TFT_WHITE);
+
+  // 四隅の見出し
+  const int restlaps = max(0, static_cast<int>(totallaps) - static_cast<int>(Lapcount));
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+  lcd_s.setTextDatum(TL_DATUM);
+  lcd_s.drawString("速度", 4, 2);
+  lcd_s.drawString(restlaps == 1 ? "最終周" : "残り", 4, 146);
+  lcd_s.setTextDatum(TR_DATUM);
+  lcd_s.drawString("走行時間", 316, 146);
+  if (cfg.enabled) {
+    lcd_s.drawString("停止", 316, 2);
+    if (out.fuelLow) {
+      lcd_s.setTextColor(TFT_ORANGE);
+      lcd_s.drawString("燃圧低下", 316, 64);
+      lcd_s.setTextColor(TFT_WHITE);
+    }
+  }
+
+  // 左上: 現在の速度, 左下: 残り周回
+  lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+  lcd_s.setTextSize(2);
+  lcd_s.setTextDatum(TL_DATUM);
+  snprintf(buf, sizeof(buf), "%.1f", speed);
+  lcd_s.drawString(buf, 4, 20);
+  snprintf(buf, sizeof(buf), "%d周", restlaps);
+  lcd_s.drawString(buf, 4, 164);
+
+  // 右上: 今の周の加速停止速度（遅れを取り戻すために上げていればマゼンタ、下げていれば水色）
+  lcd_s.setTextDatum(TR_DATUM);
+  if (cfg.enabled) {
+    if (out.bumpKmh > 0.0f) {
+      lcd_s.setTextColor(TFT_MAGENTA);
+    } else if (out.bumpKmh < 0.0f) {
+      lcd_s.setTextColor(TFT_CYAN);
+    }
+    snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+    lcd_s.drawString(buf, 316, 20);
+    lcd_s.setTextColor(TFT_WHITE);
+  }
+
+  // 右下: 走行時間
+  lcd_s.setTextSize(1.5);
+  formatMinSec(buf, sizeof(buf), worktime);
+  lcd_s.drawString(buf, 316, 168);
+
+  // 合図の帯: 加速=緑, 停止=赤
+  int bandBg = TFT_BLACK;
+  int bandFg = TFT_WHITE;
+  if (cfg.enabled) {
+    const bool caution = formatStrategyCue(out, buf, sizeof(buf));
+    if (out.cue == Cue::BurnNow) {
+      bandBg = TFT_GREEN;
+      bandFg = TFT_BLACK;
+    } else if (out.cue == Cue::CutNow) {
+      bandBg = TFT_RED;
+    } else if (caution) {
+      bandFg = TFT_YELLOW;
+    }
+  } else if (strategySource == STRATEGY_SRC_SD_ERROR) {
+    snprintf(buf, sizeof(buf), "支援設定異常");
+    bandFg = TFT_RED;
+  } else {
+    snprintf(buf, sizeof(buf), "プラン未設定");
+  }
+  lcd_s.fillRect(0, bandTop, lcd_s.width(), lcd_s.height() - bandTop, bandBg);
+  if (bandBg == TFT_BLACK) {
+    lcd_s.drawFastHLine(0, bandTop, lcd_s.width(), TFT_DARKGREY);
+  }
+  lcd_s.setTextDatum(MC_DATUM);
+  lcd_s.setTextColor(bandFg);
+  lcd_s.drawString(buf, 160, bandTop + 18);
+  lcd_s.setTextColor(TFT_WHITE);
   lcd_s.setTextSize(1);
 }
 
@@ -1505,6 +1697,11 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
     return;
   }
 
+  // 周回開始前（ECUの走行時間が0のまま）の通過は数えない（走行開始前の移動中にラインをまたぐことがある）
+  if (!LAP_COUNT_BEFORE_START && worktime <= 0.0f) {
+    return;
+  }
+
   double clLa1, clLn1, clLa2, clLn2;
   if (!getControlLineForLoc(Loc, clLa1, clLn1, clLa2, clLn2)) {
     return;  // コントロールライン座標が未定義のロケーションでは判定しない
@@ -1595,12 +1792,20 @@ bool hasValidLocationForGsiApi() {
   return isfinite(la) && isfinite(ln) && gps.location.isValid() && la >= -90.0 && la <= 90.0 && ln >= -180.0 && ln <= 180.0;
 }
 
+// 気圧を測れるセンサーが使えるかどうか
+bool isPressureSensorReady() {
+  return isEnvIIIReady || isBmx280Ready;
+}
+
 // 検出したセンサーから現在の気圧(Pa)を読み出す
 bool readPressurePa(float& outPressurePa) {
+  if (isEnvIIIReady) {
+    return envIII.readPressurePa(outPressurePa);
+  }
   if (!isBmx280Ready) {
     return false;
   }
-  outPressurePa = bme280.readPressure();
+  outPressurePa = envSensor.readPressure();
   return true;
 }
 
@@ -1613,9 +1818,17 @@ void updateEnvironmentSensors() {
     envPressureKPa = NAN;
   }
 
-  if (isBmx280Ready) {
-    float temperatureC = bme280.readTemperature();
-    float humidityPct = bme280.readHumidity();
+  if (isPressureSensorReady()) {
+    float temperatureC = NAN;
+    float humidityPct = NAN;
+    if (isEnvIIIReady) {
+      envIII.readTemperatureHumidity(temperatureC, humidityPct);
+    } else {
+      temperatureC = envSensor.readTemperature();
+#if !GNSS_MODULE_M5
+      humidityPct = envSensor.readHumidity();  // BMP280は湿度を測れない
+#endif
+    }
     envTemperatureC = (isfinite(temperatureC) && temperatureC > -40.0f && temperatureC < 100.0f) ? temperatureC : NAN;
     envHumidityPct = (isfinite(humidityPct) && humidityPct >= 0.0f && humidityPct <= 100.0f) ? humidityPct : NAN;
     return;
@@ -1625,13 +1838,13 @@ void updateEnvironmentSensors() {
   envHumidityPct = NAN;
 }
 
-// BME280から気圧を読み取って高度を更新する
-void updateAltitudeFromBmx280() {
-  if (!isBmx280Ready) {
+// 気圧センサーから気圧を読み取って高度を更新する
+void updateAltitudeFromPressureSensor() {
+  if (!isPressureSensorReady()) {
     return;
   }
 
-  // BME280から気圧を読み取る
+  // 気圧センサーから気圧を読み取る
   float pressurePa = NAN;
   if (!readPressurePa(pressurePa)) {
     return;
@@ -1724,7 +1937,7 @@ bool fetchGsiElevationMeters(float& outElevationMeters) {
   return false;
 }
 
-// 国土地理院API標高とBME280生高度との差分を取得し、高度オフセットを固定する
+// 国土地理院API標高と気圧センサー生高度との差分を取得し、高度オフセットを固定する
 void tryFetchAltitudeOffsetFromGsi() {
   // すでに正常に取得している場合は何もしない
   if (altitudeOffsetFixed) {
@@ -1736,7 +1949,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   }
 
   // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
-  if (!isBmx280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
+  if (!isPressureSensorReady() || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
     return;
   }
 
@@ -1763,7 +1976,7 @@ void tryFetchAltitudeOffsetFromGsi() {
     return;
   }
   if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
-    Serial.println("[GSI] BME280 pressure invalid while fixing offset");
+    Serial.println("[GSI] pressure invalid while fixing offset");
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -1771,7 +1984,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   float pressureKPa = pressurePa / 1000.0f;
   float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
   if (!isfinite(rawAltitudeMeters) || rawAltitudeMeters < -1000.0f || rawAltitudeMeters > 12000.0f) {
-    Serial.printf("[GSI] BME280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
+    Serial.printf("[GSI] raw altitude out of range: %.2f\n", rawAltitudeMeters);
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -1789,19 +2002,23 @@ void tryFetchAltitudeOffsetFromGsi() {
   Serial.printf("[GSI] altitude offset fixed: %.2fm (gsi=%.2fm raw=%.2fm)\n", altitudeOffsetMeters, gsiElevationMeters, rawAltitudeMeters);
 }
 
+// ボタン操作により表示モードを切り替える関数
+// Bボタンは長押し（走行支援の加速パターン切替）では画面を替えず、短く押して離したときだけモード0へ切り替える
+// 離した瞬間の判定は M5.update() の1回ぶんしか残らないので、loop() のたびに呼ぶ
+void updateDisplayMode() {
+  if (M5.BtnB.wasClicked()) { dispmode = 0; }
+  if (M5.BtnA.isPressed()) { dispmode = 1; }
+  if (M5.BtnC.isPressed()) { dispmode = 2; }
+}
+
 // ディスプレイ更新（表示モードごとに分岐）
 void updateDisplay() {
   lcd_s.fillScreen(TFT_BLACK);
   lcd_s.setTextColor(TFT_WHITE);
-  
-  // ボタン状態により表示モードを切り替え
-  if (M5.BtnB.isPressed()) { dispmode = 0; }
-  if (M5.BtnA.isPressed()) { dispmode = 1; }
-  if (M5.BtnC.isPressed()) { dispmode = 2; }
 
-  // 標高グラフモードの場合は専用の描画関数を呼び出して終了する
+  // 現在地表示モードの場合は専用の描画関数を呼び出して終了する
   if (dispmode == 2) {
-    drawAltitudeGraphMode();      // 標高グラフモードの描画
+    drawCourseMapMode();          // コース図と現在地の描画
     lcd.startWrite();
     lcd_s.pushSprite(0, 0);
     lcd.endWrite();
@@ -1832,12 +2049,7 @@ void updateDisplay() {
     lcd_s.setTextDatum(top_right);
     lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
     lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
-    if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
-    if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
-    if (!ambientpush && !MQTTpush) {
-      lcd_s.drawString("MQTT: x", 320, 30);
-      // lcd_s.drawString("Amb: x", 320, 45);
-    }
+    lcd_s.drawString(MQTTpush ? "MQTT: O" : "MQTT: x", 320, 30);
   }
   
   // タイトル表示（表示モードごと）
@@ -2182,34 +2394,6 @@ void updateMQTT() {
   lastPublishAt = millis();
 }
 
-// Ambient送信
-void updateAmbient() {
-  if (WiFi.status() == WL_CONNECTED) {
-    char buf[16];
-    ambient.set(1, speed);
-    ambient.set(2, EngTemp);
-    ambient.set(3, Lapcount);
-    ambient.set(4, static_cast<int>(worktime));
-    ambient.set(5, tachoRpm);
-    ambient.set(6, distance);
-    ambient.set(7, gasml);
-    ambient.set(8, dispergas);
-    dtostrf(la, 12, 8, buf);
-    ambient.set(9, buf);
-    dtostrf(ln, 12, 8, buf);
-    ambient.set(10, buf);
-    // ambient.set(11, alt); // 高度追加 (フィールド11は使用上無いのでコメントアウト、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
-    if (ambient.send(1000)) {
-      Serial.println("Ambient: Success!");
-    } else {
-      Serial.println("Ambient: failure...");
-    }
-  } else {
-    Serial.println("WiFi disconnected for Ambient");
-    WiFi.reconnect();
-  }
-}
-
 // I2CデバイスからチップIDレジスタ(0xD0)を読み取る
 bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   Wire.beginTransmission(i2cAddress);
@@ -2225,12 +2409,18 @@ bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   return true;
 }
 
-// BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+// Unit ENV-III（SHT30: 0x44 / QMP6988: 0x70）を探索する
+bool initializeUnitEnvIII() {
+  if (envIII.begin(Wire)) {
+    Serial.printf("Unit ENV-III initialized (SHT30=0x%02X, QMP6988=0x%02X)\n", UnitEnvIII::SHT30_ADDR, UnitEnvIII::QMP6988_ADDR);
+    return true;
+  }
+  Serial.println("Unit ENV-III not found");
+  return false;
+}
+
+// 気圧センサー（BME280 / GNSS Module内蔵のBMP280）を0x76/0x77で探索する
 bool initializePressureSensorForGnssModule() {
-  const uint8_t bme280ChipId = 0x60;
-
-  Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());
-
   const uint8_t addresses[] = {0x76, 0x77};
   for (uint8_t i = 0; i < sizeof(addresses); i++) {
     uint8_t chipId = 0;
@@ -2238,12 +2428,17 @@ bool initializePressureSensorForGnssModule() {
       continue;
     }
 
-    if (chipId == bme280ChipId) {
-      if (bme280.begin(addresses[i], &Wire)) {
-        Serial.printf("BME280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+    if (chipId == ENV_SENSOR_CHIP_ID) {
+#if GNSS_MODULE_M5
+      const bool began = envSensor.begin(addresses[i], ENV_SENSOR_CHIP_ID);
+#else
+      const bool began = envSensor.begin(addresses[i], &Wire);
+#endif
+      if (began) {
+        Serial.printf("%s initialized (addr=0x%02X, id=0x%02X)\n", ENV_SENSOR_NAME, addresses[i], chipId);
         return true;
       }
-      Serial.printf("BME280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      Serial.printf("%s begin failed (addr=0x%02X, id=0x%02X)\n", ENV_SENSOR_NAME, addresses[i], chipId);
       continue;
     }
 
@@ -2310,20 +2505,10 @@ void updateSimulatedRun() {
     simT += dt;
   }
 
-  // 累積距離をウェイポイント間の補間で緯度経度に直す
-  const float rawPos = fmodf(simS + lapM, lapM) * (waypointRawLapMeters / lapM);
-  size_t i = 0;
-  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
-    i++;
-  }
-  const Waypoint& from = waypoints[i];
-  const Waypoint& to = waypoints[(i + 1) % waypointCount];
-  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;
-  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  // 累積距離をコース上の緯度経度に直す
   const double prevLa = la;
   const double prevLn = ln;
-  la = from.lat + (to.lat - from.lat) * ratio;
-  ln = from.lng + (to.lng - from.lng) * ratio;
+  lapPositionToLatLng(simS, la, ln);
 
   // ECU・BLEの受信値を差し替える
   receiveECUtime = nowMs;
@@ -2345,22 +2530,36 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.update();
-  M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える
+  M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える（1秒未満で離すとモード0へ切替）
 #if STRATEGY_BEEP_AVAILABLE
+#if STRATEGY_SIM
+  M5.Speaker.setVolume(100);  // 机上確認用環境では音量を落とす
+#else
   M5.Speaker.setVolume(255);
+#endif
 #endif
   
   // デバッグ用Serial
   Serial.begin(115200);
 
-  // 気圧センサー初期化（BME280）
-  if (initializePressureSensorForGnssModule()) {
-    bme280.setSampling(Adafruit_BME280::MODE_NORMAL,
-                       Adafruit_BME280::SAMPLING_X2,
-                       Adafruit_BME280::SAMPLING_X16,
-                       Adafruit_BME280::SAMPLING_X1,
-                       Adafruit_BME280::FILTER_X16,
-                       Adafruit_BME280::STANDBY_MS_500);
+  // 環境センサー初期化（Unit ENV-IIIを優先し、見つからなければBME280 / GNSS Module内蔵のBMP280）
+  Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());
+  isEnvIIIReady = initializeUnitEnvIII();
+  if (!isEnvIIIReady && initializePressureSensorForGnssModule()) {
+#if GNSS_MODULE_M5
+    envSensor.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                          Adafruit_BMP280::SAMPLING_X2,
+                          Adafruit_BMP280::SAMPLING_X16,
+                          Adafruit_BMP280::FILTER_X16,
+                          Adafruit_BMP280::STANDBY_MS_500);
+#else
+    envSensor.setSampling(Adafruit_BME280::MODE_NORMAL,
+                          Adafruit_BME280::SAMPLING_X2,
+                          Adafruit_BME280::SAMPLING_X16,
+                          Adafruit_BME280::SAMPLING_X1,
+                          Adafruit_BME280::FILTER_X16,
+                          Adafruit_BME280::STANDBY_MS_500);
+#endif
     isBmx280Ready = true;
   }
   updateEnvironmentSensors();
@@ -2385,7 +2584,7 @@ void setup() {
   // M5Unified側の初期化で400kHz(Fast Mode)になっている可能性が高い。Groveケーブル経由の
   // 配線ではFast Modeはノイズ・リンギングの影響を受けやすく、NanoC6側で本来存在しない
   // コマンドバイトを誤検出する一因になっていると考えられるため、Standard Mode(100kHz)に
-  // 明示的に固定してノイズ耐性のマージンを広げる（共有バスのBME280も100kHzで問題なく動作する）
+  // 明示的に固定してノイズ耐性のマージンを広げる（共有バスのUnit ENV-III / BME280も100kHzで問題なく動作する）
   BleI2C.setClock(100000);
 
   // LCD初期化
@@ -2445,6 +2644,10 @@ void setup() {
     }
   }
   
+#if STRATEGY_SIM
+  // 机上確認用環境ではインターネット接続が不要なので、Wi-Fi設定・接続をスキップする
+  MQTTpush = false;
+#else
   // WiFi設定（WiFiManagerを利用）
   wifiManager.setAPCallback([](WiFiManager* mgr){
     Serial.println("Entered config mode");
@@ -2452,8 +2655,9 @@ void setup() {
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
     showMessage(String(FPSTR(MSG_WIFI_CONFIG)) + portalSSID);
-    char ConfigSSID[40];
-    sprintf(ConfigSSID, "WIFI:S:%s;T:nopass;R:1;;", portalSSID);
+    // Wi-Fi接続用QRコード（パスワードなしのAP）。SSIDは最大32文字
+    char ConfigSSID[64];
+    snprintf(ConfigSSID, sizeof(ConfigSSID), "WIFI:S:%s;T:nopass;;", portalSSID.c_str());
     lcd.qrcode(ConfigSSID, 105, 92, 135, 5);
   });
   
@@ -2464,7 +2668,7 @@ void setup() {
   while (millis() - btnStart < 5000) {
     M5.update();
     if (M5.BtnA.isPressed()) { doManualConfig = true; break; }
-    if (M5.BtnC.isPressed()) { ambientpush = false; MQTTpush = false; break; }
+    if (M5.BtnC.isPressed()) { MQTTpush = false; break; }
     delay(10);
   }
   if (doManualConfig) {
@@ -2474,36 +2678,22 @@ void setup() {
       isWifiConfigSucceeded = false;
     }
   } else {
-    if (ambientpush || MQTTpush) {
+    if (MQTTpush) {
       lcd.fillScreen(TFT_BLACK);
       showMessage(FPSTR(MSG_WIFI_CONNECTING));
       if (wifiManager.autoConnect()) { isWifiConfigSucceeded = true; }
-      else { isWifiConfigSucceeded = false; ambientpush = false; MQTTpush = false; }
+      else { isWifiConfigSucceeded = false; MQTTpush = false; }
     } else {
       lcd.fillScreen(TFT_BLACK);
       lcd.drawString("Wi-Fi無効", lcd.width()/2, lcd.height()/2);
     }
   }
+#endif
 
   if (isWifiConfigSucceeded) {
     // ESP32の省電力動作でTLS受信が不安定になることがあるため無効化する
     WiFi.setSleep(false);
     Serial.println("WiFi modem sleep disabled");
-  }
-  
-  // Ambient設定
-  if (ambientpush && isWifiConfigSucceeded) {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    sprintf(devKey, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
-      Serial.printf("Cannot get channelId for device %s\n", devKey);
-      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
-        M5.update();
-        delay(500);
-      }
-    }
-    ambient.begin(channelId, writeKey, &ambientClient);
   }
   
   // MQTT設定
@@ -2533,7 +2723,6 @@ void setup() {
 #if STRATEGY_SIM
   // 仮想走行の値をクラウドへ送らない
   MQTTpush = false;
-  ambientpush = false;
 #endif
 
   lcd.fillScreen(TFT_BLACK);
@@ -2543,7 +2732,6 @@ void setup() {
   t_Serial = millis();
   t_SD = millis();
   t_MQTT = millis();
-  t_amb = millis();
   t_alt = millis();
   t_env = millis();
   t_display = millis();
@@ -2590,6 +2778,7 @@ void loop() {
     nearestWaypointIndex = -1;
   }
   updateStrategyAssist();
+  updateDisplayMode();
 
   if (millis() - t_display >= DISPLAY_INTERVAL) {
     updateDisplay();
@@ -2643,18 +2832,12 @@ void loop() {
     }
   }
   
-  // AmbientはWi-Fi接続が必要なため、接続成功している場合のみ更新する
-  if (ambientpush && (millis() - t_amb >= AMBIENT_INTERVAL)) {
-    updateAmbient();
-    t_amb += AMBIENT_INTERVAL;
-  }
-  
-  // 高度更新はBME280が正常に初期化されている場合のみ実行する
+  // 高度更新は気圧センサーが正常に初期化されている場合のみ実行する
   if (millis() - t_alt >= ALTITUDE_INTERVAL) {
-    updateAltitudeFromBmx280();
+    updateAltitudeFromPressureSensor();
     t_alt += ALTITUDE_INTERVAL;
   }
-  // 環境センサー更新はBME280が正常に初期化されている場合のみ実行する
+  // 環境センサー更新は環境センサーが正常に初期化されている場合のみ実行する
   if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
     updateEnvironmentSensors();
     t_env += ENV_SENSOR_INTERVAL;
@@ -2663,8 +2846,8 @@ void loop() {
     }
   }
 
-  // 国土地理院API呼び出しはBME280接続時のみ低頻度で実行し、成功したら以後実行しない
-  if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
+  // 国土地理院API呼び出しは気圧センサー接続時のみ低頻度で実行し、成功したら以後実行しない
+  if (isPressureSensorReady()) tryFetchAltitudeOffsetFromGsi();
 
   delay(1);
 }

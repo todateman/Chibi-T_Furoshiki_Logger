@@ -92,6 +92,32 @@ void test_pace_bump_thresholds() {
   TEST_ASSERT_EQUAL_FLOAT(-0.5f, StrategyAssist::paceBumpKmh(-31.0f));
 }
 
+void test_planned_progress() {
+  using StrategyAssist::plannedProgress;
+  Config c = motegiConfig();
+
+  // 発進前と、目標が無い設定では求められない
+  TEST_ASSERT_TRUE(isnan(plannedProgress(c, 0.0f)));
+  Config noSplits = c;
+  noSplits.splitCount = 0;
+  TEST_ASSERT_TRUE(isnan(plannedProgress(noSplits, 100.0f)));
+
+  // 通過タイムちょうどで n/7、あいだは直線補間
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.5f / 7.0f, plannedProgress(c, 154.5f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 1.0f / 7.0f, plannedProgress(c, 309.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 1.5f / 7.0f, plannedProgress(c, 469.5f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 6.0f / 7.0f, plannedProgress(c, 1914.0f));
+
+  // ゴールの目標時間が無い設定では、最終周は求められない
+  TEST_ASSERT_TRUE(isnan(plannedProgress(c, 1915.0f)));
+
+  // ゴールの目標時間（7個目）があれば最終周も求められる。ゴールを過ぎたら求められない
+  c.splitsS[c.splitCount++] = 2290.0f;
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 6.5f / 7.0f, plannedProgress(c, 2102.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-4f, 1.0f, plannedProgress(c, 2290.0f));
+  TEST_ASSERT_TRUE(isnan(plannedProgress(c, 2291.0f)));
+}
+
 void test_lap_crossing_plausible() {
   TEST_ASSERT_FALSE(StrategyAssist::lapCrossingPlausible(5.0f, 2341.38f));     // 発進直後の通過
   TEST_ASSERT_FALSE(StrategyAssist::lapCrossingPlausible(1100.0f, 2341.38f));
@@ -439,6 +465,7 @@ void tearDown() {}
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_pace_bump_thresholds);
+  RUN_TEST(test_planned_progress);
   RUN_TEST(test_lap_crossing_plausible);
   RUN_TEST(test_off_and_idle);
   RUN_TEST(test_mark_sequence);

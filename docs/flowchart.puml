@@ -40,11 +40,6 @@ partition "初期化フェーズ (setup)" {
         if (接続成功?) then (yes)
             :isWifiConfigSucceeded = true;
             
-            if (Ambient有効?) then (yes)
-                :チャネル情報取得
-                Ambient初期化;
-            endif
-            
             if (MQTT有効?) then (yes)
                 :証明書設定
                 MQTTサーバー設定;
@@ -53,12 +48,11 @@ partition "初期化フェーズ (setup)" {
             :WiFi機能無効化;
         endif
     else (no)
-        :ambientpush = false
-        MQTTpush = false;
+        :MQTTpush = false;
     endif
     
     :タイマー初期化
-    t_Serial, t_SD, t_MQTT, t_amb;
+    t_Serial, t_SD, t_MQTT;
 }
 
 partition "メインループ (loop)" {
@@ -100,11 +94,6 @@ partition "メインループ (loop)" {
                     JSON送信;
                 endif
             endif
-        endif
-        
-        if (ambientpush && t_amb間隔経過?) then (yes)
-            :updateAmbient()
-            データ送信;
         endif
         
         :delay(10);
@@ -223,8 +212,7 @@ partition "WiFi設定" {
         endif
         
         if (BtnC.isPressed?) then (yes)
-            :ambientpush = false
-            MQTTpush = false;
+            :MQTTpush = false;
             break;
         endif
         
@@ -242,7 +230,7 @@ partition "WiFi設定" {
         endif
         
     else (no)
-        if (ambientpush || MQTTpush?) then (yes)
+        if (MQTTpush?) then (yes)
             :画面表示
             "Wi-Fi接続中...";
             
@@ -252,32 +240,12 @@ partition "WiFi設定" {
                 :isWifiConfigSucceeded = true;
             else (no)
                 :isWifiConfigSucceeded = false
-                ambientpush = false
                 MQTTpush = false;
             endif
         else (no)
             :画面表示
             "Wi-Fi無効";
         endif
-    endif
-}
-
-partition "Ambient設定" {
-    if (ambientpush && isWifiConfigSucceeded?) then (yes)
-        :MACアドレス取得
-        devKey生成;
-        
-        :ambient.getchannel()
-        チャネルID・writeKey取得;
-        
-        repeat
-            :M5.update();
-            :delay(500);
-        repeat while (チャネル取得失敗?) is (yes)
-        ->no;
-        
-        :ambient.begin()
-        初期化完了;
     endif
 }
 
@@ -329,7 +297,6 @@ partition "最終準備" {
     t_Serial = millis()
     t_SD = millis()
     t_MQTT = millis()
-    t_amb = millis()
     t_alt = millis();
 }
 
@@ -442,15 +409,6 @@ partition "定期出力処理 (タイミング制御)" {
     else (no)
     endif
     
-    if (ambientpush?) then (yes)
-        if (millis() - t_amb >= 10000ms?) then (yes)
-            :updateAmbient()
-            データ送信;
-            :t_amb = millis();
-        else (no)
-        endif
-    else (no)
-    endif
 }
 
 :delay(10)
@@ -713,7 +671,6 @@ partition "定期送信タイミング制御" {
         - t_Serial: シリアル出力
         - t_SD: SDログ
         - t_MQTT: MQTT送信
-        - t_amb: Ambient送信
     end note
     
     fork
@@ -763,19 +720,6 @@ partition "定期送信タイミング制御" {
                         タイマーリセット;
                     else (no)
                     endif
-                endif
-            else (no)
-            endif
-        }
-    fork again
-        partition "Ambient送信 (10秒間隔)" {
-            if (ambientpush?) then (yes)
-                if (millis() - t_amb >= 10000?) then (yes)
-                    :updateAmbient()
-                    10フィールド送信;
-                    :t_amb = millis()
-                    タイマーリセット;
-                else (no)
                 endif
             else (no)
             endif
@@ -930,68 +874,6 @@ stop
 
 @enduml
 
-@startuml Ambient送信詳細
-title updateAmbient() - Ambient送信処理詳細
-
-start
-
-partition "updateAmbient() - Ambient送信" {
-    if (WiFi接続中?) then (yes: WL_CONNECTED)
-        :char buf[16] を準備;
-        
-        :ambient.set(1, spd)
-        フィールド1: GPS速度;
-        
-        :ambient.set(2, EngTemp)
-        フィールド2: エンジン温度;
-        
-        :ambient.set(3, Lapcount)
-        フィールド3: 周回数;
-        
-        :ambient.set(4, worktime)
-        フィールド4: 走行時間;
-        
-        :ambient.set(5, tachoRpm)
-        フィールド5: 回転数;
-        
-        :ambient.set(6, distance)
-        フィールド6: 走行距離;
-        
-        :ambient.set(7, gasml)
-        フィールド7: 積算燃料;
-        
-        :ambient.set(8, dispergas)
-        フィールド8: 燃費;
-        
-        :dtostrf(la, 12, 8, buf)
-        ambient.set(9, buf)
-        フィールド9: 緯度(文字列);
-        
-        :dtostrf(ln, 12, 8, buf)
-        ambient.set(10, buf)
-        フィールド10: 経度(文字列);
-        
-        if (ambient.send(1000)?) then (yes: 送信成功)
-            :Serial.println("Ambient: Success!")
-            成功ログ;
-        else (no: 送信失敗)
-            :Serial.println("Ambient: failure...")
-            失敗ログ;
-        endif
-        
-    else (no: WiFi切断)
-        :Serial.println("WiFi disconnected")
-        エラーログ出力;
-        
-        :WiFi.reconnect()
-        再接続試行;
-    endif
-}
-
-stop
-
-@enduml
-
 @startuml 表示モード詳細
 title updateDisplay() - 表示モード切替と画面描画
 
@@ -1031,12 +913,10 @@ partition "接続状況表示 (右上)" {
         :lcd_s.drawString("SD: x", 320, 0);
     endif
     
-    if (ambientpush?) then (yes)
-        :lcd_s.drawString("Amb: O", 320, 15);
-    elseif (MQTTpush?) then (yes)
+    if (MQTTpush?) then (yes)
         :lcd_s.drawString("MQTT: O", 320, 15);
-    else (両方無効)
-        :lcd_s.drawString("Amb･MQTT: x", 320, 15);
+    else (no)
+        :lcd_s.drawString("MQTT: x", 320, 15);
     endif
 }
 
