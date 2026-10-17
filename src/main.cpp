@@ -3,7 +3,6 @@
 #include "SdFat.h"
 #include "sdios.h"
 #include <M5Unified.h>
-#include "Ambient.h"
 #include <WiFiManager.h>
 #include <TimeLib.h>
 #include <WiFiClientSecure.h>
@@ -13,9 +12,18 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <string.h>
+// GNSSと気圧の取得元（0:車載用の外付けGNSS + BME280, 1:M5Stack GNSS ModuleのNEO-M9N + BMP280）
+#ifndef GNSS_MODULE_M5
+#define GNSS_MODULE_M5 0
+#endif
+#if GNSS_MODULE_M5
+#include <Adafruit_BMP280.h>
+#else
 #include <Adafruit_BME280.h>
+#endif
 #include "CourseMap.h"
 #include "StrategyAssist.h"
+#include "UnitEnvIII.h"
 #include "secrets.h"
 
 //==================== 定数・マクロ ====================
@@ -55,18 +63,24 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 
 // 各タスクの更新間隔（ミリ秒）
 #define SERIAL_OUT_INTERVAL 100
+#if GNSS_MODULE_M5
+#define SD_LOG_INTERVAL     1000   // ポータブル仕様はGNSSの測位(1Hz)に合わせる
+#else
 #define SD_LOG_INTERVAL     100
+#endif
 #define MQTT_INTERVAL_PRE   10000  // 走行前
 #define MQTT_INTERVAL_RUN   1000   // 走行中
 #define MQTT_RECONNECT_BASE_INTERVAL 5000UL
 #define MQTT_RECONNECT_MAX_INTERVAL  60000UL
-#define AMBIENT_INTERVAL    10000
 #define ALTITUDE_INTERVAL   500
 #define ENV_SENSOR_INTERVAL 1000
 #define DISPLAY_INTERVAL    100
 #define ELEVATION_OFFSET_FETCH_RETRY_INTERVAL 15000UL
 #define LAP_CROSS_DEBOUNCE_MS 10000UL       // ラップカウントの多重カウント防止用クールダウン時間
 #define LAP_CROSS_TELEPORT_GUARD_M 100.0    // GPSロスト後の誤検出防止用の最大移動距離しきい値[m]
+// 周回開始（ECUの走行時間が動き出す）前のコントロールライン通過も周回として数えるか
+// ポータブル仕様はECUを繋がず走行時間が0のままなので、常に数える
+#define LAP_COUNT_BEFORE_START GNSS_MODULE_M5
 
 // GNSS受信バッファサイズ（1ループあたりの最大パース量。10Hzロギングでの取りこぼし防止のため広めに確保）
 #define GNSS_PARSE_BUDGET_BYTES 512
@@ -132,24 +146,17 @@ int fileNum = 0;    // ログファイル番号（例: LOG0000.CSVの0000部分�
 bool logFileInitialized = false;  // ログファイルが初期化されているか（ヘッダ書き込み済みか）
 const char NEXT_LOG_INDEX_FILE[] = "/LOG/NEXTID.TXT";  // 次回ログファイル番号を保存するファイル
 
-// WiFi, MQTT, Ambient
+// WiFi, MQTT
 WiFiManager wifiManager;
-WiFiClient ambientClient;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttclient(mqttTlsClient);
-Ambient ambient;
 bool isWifiConfigSucceeded = false;
-bool ambientpush = false;   // Ambient送信有効（必要に応じてfalseに設定）
 bool MQTTpush = true;       // MQTT送信有効
-char devKey[20];
-unsigned int channelId;
-char writeKey[20];
 
 // タイマー用
 unsigned long t_Serial = 0;
 unsigned long t_SD     = 0;
 unsigned long t_MQTT   = 0;
-unsigned long t_amb    = 0;
 unsigned long t_alt    = 0;
 unsigned long t_env    = 0;
 unsigned long t_display = 0;
@@ -191,7 +198,12 @@ float FuelPre = 0.0;    // 燃圧 [MPa]（AutoAirAdjust経由）
 
 // GPS用
 TinyGPSPlus gps;
-int gnss_bps = 115200;  // GNSSモジュールのボーレート（モジュールに応じて切り替える NEO-6M:115200, ATGM336H:115200（tools/setup_atgm336h.pyで設定済みのもの）, M5Stack GNSS Module:38400）
+// GNSSモジュールのボーレート（NEO-6M:115200, ATGM336H:115200（tools/setup_atgm336h.pyで設定済みのもの）, M5Stack GNSS Module:38400）
+#if GNSS_MODULE_M5
+int gnss_bps = 38400;
+#else
+int gnss_bps = 115200;
+#endif
 double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double la = 34.990768;    // KMMF2026の緯度経度初期値
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
@@ -199,14 +211,25 @@ double alt = 0.0;   // GPS高度
 double spd = 0.0;   // GPS速度
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
-// BME280による高度推定用
-Adafruit_BME280 bme280;
-bool isBmx280Ready = false;     // BME280が正常に初期化されているかどうか
-float envPressureKPa = NAN;                       // BME280から取得した環境気圧 [kPa]（利用できない場合はNAN）
-float envTemperatureC = NAN;                      // BME280から取得した環境温度 [°C]（利用できない場合はNAN）
-float envHumidityPct = NAN;                       // BME280から取得した環境湿度 [%]（利用できない場合はNAN）
+// 環境センサー（気圧・気温・湿度）。高度推定にも使う
+// Unit ENV-IIIを優先し、見つからない場合はBME280 / GNSS Module内蔵のBMP280を使う
+UnitEnvIII envIII;
+bool isEnvIIIReady = false;     // Unit ENV-IIIが正常に初期化されているかどうか
+#if GNSS_MODULE_M5
+Adafruit_BMP280 envSensor(&Wire);
+constexpr uint8_t ENV_SENSOR_CHIP_ID = 0x58;
+constexpr char ENV_SENSOR_NAME[] = "BMP280";
+#else
+Adafruit_BME280 envSensor;
+constexpr uint8_t ENV_SENSOR_CHIP_ID = 0x60;
+constexpr char ENV_SENSOR_NAME[] = "BME280";
+#endif
+bool isBmx280Ready = false;                       // BME280 / BMP280が正常に初期化されているかどうか
+float envPressureKPa = NAN;                       // 環境センサーから取得した環境気圧 [kPa]（利用できない場合はNAN）
+float envTemperatureC = NAN;                      // 環境センサーから取得した環境温度 [°C]（利用できない場合はNAN）
+float envHumidityPct = NAN;                       // 環境センサーから取得した環境湿度 [%]（利用できない場合はNAN）
 float seaLevelPressureKPa = 101.325f;             // 海面上気圧の初期値（kPa単位）
-float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高とBME280生高度の差分（m）
+float altitudeOffsetMeters = 0.0f;                // 国土地理院API標高と気圧センサー生高度の差分（m）
 bool altitudeOffsetFixed = false;                 // 標高オフセットが確定しているかどうか
 unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセット取得を試みる時刻（ミリ秒）
 
@@ -805,7 +828,7 @@ float currentLapPositionMeters() {
 }
 
 // 発進（ECUの走行時間が0から動き出した）を検知して周回数を0に戻す関数
-// 発進前にラインをまたいで数えてしまった周回を、走行に持ち込まないようにする
+// 前の走行の周回数や、発進前にラインをまたいで数えた周回（ポータブル仕様）を、走行に持ち込まないようにする
 void resetLapCountOnLaunch() {
   static float prevWorktime = 0.0f;
   if (prevWorktime <= 0.0f && worktime > 0.0f) {
@@ -1046,6 +1069,12 @@ void drawStrategyMode() {
   for (uint8_t i = 1; i < totallaps; i++) {
     const int x = barX + barW * i / totallaps;
     lcd_s.drawFastVLine(x, 227, 10, (x >= barX + elapsedPx) ? bg : fg);  // 帯の上では背景色、帯の外では文字色で描く
+  }
+  // 戦略どおりなら今いるはずの位置を、帯の上辺の切り欠き（▼）で示す。現在地が切り欠きより左なら計画より遅れている
+  const float planned = StrategyAssist::plannedProgress(cfg, worktime);
+  if (isfinite(planned)) {
+    const int x = barX + static_cast<int>(constrain(planned, 0.0f, 1.0f) * barW);
+    lcd_s.fillTriangle(x - 4, 227, x + 4, 227, x, 232, (x >= barX + elapsedPx) ? bg : fg);
   }
   if (goal > 0) {
     const int x = barX + static_cast<int>(constrain(static_cast<float>(distance) / static_cast<float>(goal), 0.0f, 1.0f) * barW);
@@ -1668,6 +1697,11 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
     return;
   }
 
+  // 周回開始前（ECUの走行時間が0のまま）の通過は数えない（走行開始前の移動中にラインをまたぐことがある）
+  if (!LAP_COUNT_BEFORE_START && worktime <= 0.0f) {
+    return;
+  }
+
   double clLa1, clLn1, clLa2, clLn2;
   if (!getControlLineForLoc(Loc, clLa1, clLn1, clLa2, clLn2)) {
     return;  // コントロールライン座標が未定義のロケーションでは判定しない
@@ -1758,12 +1792,20 @@ bool hasValidLocationForGsiApi() {
   return isfinite(la) && isfinite(ln) && gps.location.isValid() && la >= -90.0 && la <= 90.0 && ln >= -180.0 && ln <= 180.0;
 }
 
+// 気圧を測れるセンサーが使えるかどうか
+bool isPressureSensorReady() {
+  return isEnvIIIReady || isBmx280Ready;
+}
+
 // 検出したセンサーから現在の気圧(Pa)を読み出す
 bool readPressurePa(float& outPressurePa) {
+  if (isEnvIIIReady) {
+    return envIII.readPressurePa(outPressurePa);
+  }
   if (!isBmx280Ready) {
     return false;
   }
-  outPressurePa = bme280.readPressure();
+  outPressurePa = envSensor.readPressure();
   return true;
 }
 
@@ -1776,9 +1818,17 @@ void updateEnvironmentSensors() {
     envPressureKPa = NAN;
   }
 
-  if (isBmx280Ready) {
-    float temperatureC = bme280.readTemperature();
-    float humidityPct = bme280.readHumidity();
+  if (isPressureSensorReady()) {
+    float temperatureC = NAN;
+    float humidityPct = NAN;
+    if (isEnvIIIReady) {
+      envIII.readTemperatureHumidity(temperatureC, humidityPct);
+    } else {
+      temperatureC = envSensor.readTemperature();
+#if !GNSS_MODULE_M5
+      humidityPct = envSensor.readHumidity();  // BMP280は湿度を測れない
+#endif
+    }
     envTemperatureC = (isfinite(temperatureC) && temperatureC > -40.0f && temperatureC < 100.0f) ? temperatureC : NAN;
     envHumidityPct = (isfinite(humidityPct) && humidityPct >= 0.0f && humidityPct <= 100.0f) ? humidityPct : NAN;
     return;
@@ -1788,13 +1838,13 @@ void updateEnvironmentSensors() {
   envHumidityPct = NAN;
 }
 
-// BME280から気圧を読み取って高度を更新する
-void updateAltitudeFromBmx280() {
-  if (!isBmx280Ready) {
+// 気圧センサーから気圧を読み取って高度を更新する
+void updateAltitudeFromPressureSensor() {
+  if (!isPressureSensorReady()) {
     return;
   }
 
-  // BME280から気圧を読み取る
+  // 気圧センサーから気圧を読み取る
   float pressurePa = NAN;
   if (!readPressurePa(pressurePa)) {
     return;
@@ -1887,7 +1937,7 @@ bool fetchGsiElevationMeters(float& outElevationMeters) {
   return false;
 }
 
-// 国土地理院API標高とBME280生高度との差分を取得し、高度オフセットを固定する
+// 国土地理院API標高と気圧センサー生高度との差分を取得し、高度オフセットを固定する
 void tryFetchAltitudeOffsetFromGsi() {
   // すでに正常に取得している場合は何もしない
   if (altitudeOffsetFixed) {
@@ -1899,7 +1949,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   }
 
   // 前提条件が未成立の間は待ち時刻を進めず、成立した瞬間に即実行できるようにする
-  if (!isBmx280Ready || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
+  if (!isPressureSensorReady() || WiFi.status() != WL_CONNECTED || !hasValidLocationForGsiApi()) {
     return;
   }
 
@@ -1926,7 +1976,7 @@ void tryFetchAltitudeOffsetFromGsi() {
     return;
   }
   if (!isfinite(pressurePa) || pressurePa < 30000.0f || pressurePa > 120000.0f) {
-    Serial.println("[GSI] BME280 pressure invalid while fixing offset");
+    Serial.println("[GSI] pressure invalid while fixing offset");
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -1934,7 +1984,7 @@ void tryFetchAltitudeOffsetFromGsi() {
   float pressureKPa = pressurePa / 1000.0f;
   float rawAltitudeMeters = 44330.0f * (1.0f - powf(pressureKPa / seaLevelPressureKPa, 0.1903f));
   if (!isfinite(rawAltitudeMeters) || rawAltitudeMeters < -1000.0f || rawAltitudeMeters > 12000.0f) {
-    Serial.printf("[GSI] BME280 raw altitude out of range: %.2f\n", rawAltitudeMeters);
+    Serial.printf("[GSI] raw altitude out of range: %.2f\n", rawAltitudeMeters);
     nextAltitudeOffsetFetchAt = millis() + ELEVATION_OFFSET_FETCH_RETRY_INTERVAL;
     return;
   }
@@ -1999,12 +2049,7 @@ void updateDisplay() {
     lcd_s.setTextDatum(top_right);
     lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
     lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
-    if (MQTTpush) lcd_s.drawString("MQTT: O", 320, 30);
-    if (ambientpush) lcd_s.drawString("Amb: O", 320, 30);
-    if (!ambientpush && !MQTTpush) {
-      lcd_s.drawString("MQTT: x", 320, 30);
-      // lcd_s.drawString("Amb: x", 320, 45);
-    }
+    lcd_s.drawString(MQTTpush ? "MQTT: O" : "MQTT: x", 320, 30);
   }
   
   // タイトル表示（表示モードごと）
@@ -2349,34 +2394,6 @@ void updateMQTT() {
   lastPublishAt = millis();
 }
 
-// Ambient送信
-void updateAmbient() {
-  if (WiFi.status() == WL_CONNECTED) {
-    char buf[16];
-    ambient.set(1, speed);
-    ambient.set(2, EngTemp);
-    ambient.set(3, Lapcount);
-    ambient.set(4, static_cast<int>(worktime));
-    ambient.set(5, tachoRpm);
-    ambient.set(6, distance);
-    ambient.set(7, gasml);
-    ambient.set(8, dispergas);
-    dtostrf(la, 12, 8, buf);
-    ambient.set(9, buf);
-    dtostrf(ln, 12, 8, buf);
-    ambient.set(10, buf);
-    // ambient.set(11, alt); // 高度追加 (フィールド11は使用上無いのでコメントアウト、文字列化は一旦せずに数値のまま送信、必要であれば文字列変換する)
-    if (ambient.send(1000)) {
-      Serial.println("Ambient: Success!");
-    } else {
-      Serial.println("Ambient: failure...");
-    }
-  } else {
-    Serial.println("WiFi disconnected for Ambient");
-    WiFi.reconnect();
-  }
-}
-
 // I2CデバイスからチップIDレジスタ(0xD0)を読み取る
 bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   Wire.beginTransmission(i2cAddress);
@@ -2392,12 +2409,18 @@ bool readPressureSensorChipId(uint8_t i2cAddress, uint8_t& outChipId) {
   return true;
 }
 
-// BME280向けにI2CをG21/G22で初期化し、0x76/0x77で探索する
+// Unit ENV-III（SHT30: 0x44 / QMP6988: 0x70）を探索する
+bool initializeUnitEnvIII() {
+  if (envIII.begin(Wire)) {
+    Serial.printf("Unit ENV-III initialized (SHT30=0x%02X, QMP6988=0x%02X)\n", UnitEnvIII::SHT30_ADDR, UnitEnvIII::QMP6988_ADDR);
+    return true;
+  }
+  Serial.println("Unit ENV-III not found");
+  return false;
+}
+
+// 気圧センサー（BME280 / GNSS Module内蔵のBMP280）を0x76/0x77で探索する
 bool initializePressureSensorForGnssModule() {
-  const uint8_t bme280ChipId = 0x60;
-
-  Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());
-
   const uint8_t addresses[] = {0x76, 0x77};
   for (uint8_t i = 0; i < sizeof(addresses); i++) {
     uint8_t chipId = 0;
@@ -2405,12 +2428,17 @@ bool initializePressureSensorForGnssModule() {
       continue;
     }
 
-    if (chipId == bme280ChipId) {
-      if (bme280.begin(addresses[i], &Wire)) {
-        Serial.printf("BME280 initialized (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+    if (chipId == ENV_SENSOR_CHIP_ID) {
+#if GNSS_MODULE_M5
+      const bool began = envSensor.begin(addresses[i], ENV_SENSOR_CHIP_ID);
+#else
+      const bool began = envSensor.begin(addresses[i], &Wire);
+#endif
+      if (began) {
+        Serial.printf("%s initialized (addr=0x%02X, id=0x%02X)\n", ENV_SENSOR_NAME, addresses[i], chipId);
         return true;
       }
-      Serial.printf("BME280 begin failed (addr=0x%02X, id=0x%02X)\n", addresses[i], chipId);
+      Serial.printf("%s begin failed (addr=0x%02X, id=0x%02X)\n", ENV_SENSOR_NAME, addresses[i], chipId);
       continue;
     }
 
@@ -2504,20 +2532,34 @@ void setup() {
   M5.update();
   M5.BtnB.setHoldThresh(1000);  // Bボタン長押し(1秒)で走行支援の加速パターンを切り替える（1秒未満で離すとモード0へ切替）
 #if STRATEGY_BEEP_AVAILABLE
+#if STRATEGY_SIM
+  M5.Speaker.setVolume(100);  // 机上確認用環境では音量を落とす
+#else
   M5.Speaker.setVolume(255);
+#endif
 #endif
   
   // デバッグ用Serial
   Serial.begin(115200);
 
-  // 気圧センサー初期化（BME280）
-  if (initializePressureSensorForGnssModule()) {
-    bme280.setSampling(Adafruit_BME280::MODE_NORMAL,
-                       Adafruit_BME280::SAMPLING_X2,
-                       Adafruit_BME280::SAMPLING_X16,
-                       Adafruit_BME280::SAMPLING_X1,
-                       Adafruit_BME280::FILTER_X16,
-                       Adafruit_BME280::STANDBY_MS_500);
+  // 環境センサー初期化（Unit ENV-IIIを優先し、見つからなければBME280 / GNSS Module内蔵のBMP280）
+  Wire.begin(M5.Ex_I2C.getSDA(), M5.Ex_I2C.getSCL());
+  isEnvIIIReady = initializeUnitEnvIII();
+  if (!isEnvIIIReady && initializePressureSensorForGnssModule()) {
+#if GNSS_MODULE_M5
+    envSensor.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                          Adafruit_BMP280::SAMPLING_X2,
+                          Adafruit_BMP280::SAMPLING_X16,
+                          Adafruit_BMP280::FILTER_X16,
+                          Adafruit_BMP280::STANDBY_MS_500);
+#else
+    envSensor.setSampling(Adafruit_BME280::MODE_NORMAL,
+                          Adafruit_BME280::SAMPLING_X2,
+                          Adafruit_BME280::SAMPLING_X16,
+                          Adafruit_BME280::SAMPLING_X1,
+                          Adafruit_BME280::FILTER_X16,
+                          Adafruit_BME280::STANDBY_MS_500);
+#endif
     isBmx280Ready = true;
   }
   updateEnvironmentSensors();
@@ -2542,7 +2584,7 @@ void setup() {
   // M5Unified側の初期化で400kHz(Fast Mode)になっている可能性が高い。Groveケーブル経由の
   // 配線ではFast Modeはノイズ・リンギングの影響を受けやすく、NanoC6側で本来存在しない
   // コマンドバイトを誤検出する一因になっていると考えられるため、Standard Mode(100kHz)に
-  // 明示的に固定してノイズ耐性のマージンを広げる（共有バスのBME280も100kHzで問題なく動作する）
+  // 明示的に固定してノイズ耐性のマージンを広げる（共有バスのUnit ENV-III / BME280も100kHzで問題なく動作する）
   BleI2C.setClock(100000);
 
   // LCD初期化
@@ -2602,6 +2644,10 @@ void setup() {
     }
   }
   
+#if STRATEGY_SIM
+  // 机上確認用環境ではインターネット接続が不要なので、Wi-Fi設定・接続をスキップする
+  MQTTpush = false;
+#else
   // WiFi設定（WiFiManagerを利用）
   wifiManager.setAPCallback([](WiFiManager* mgr){
     Serial.println("Entered config mode");
@@ -2609,8 +2655,9 @@ void setup() {
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
     showMessage(String(FPSTR(MSG_WIFI_CONFIG)) + portalSSID);
-    char ConfigSSID[40];
-    sprintf(ConfigSSID, "WIFI:S:%s;T:nopass;R:1;;", portalSSID);
+    // Wi-Fi接続用QRコード（パスワードなしのAP）。SSIDは最大32文字
+    char ConfigSSID[64];
+    snprintf(ConfigSSID, sizeof(ConfigSSID), "WIFI:S:%s;T:nopass;;", portalSSID.c_str());
     lcd.qrcode(ConfigSSID, 105, 92, 135, 5);
   });
   
@@ -2621,7 +2668,7 @@ void setup() {
   while (millis() - btnStart < 5000) {
     M5.update();
     if (M5.BtnA.isPressed()) { doManualConfig = true; break; }
-    if (M5.BtnC.isPressed()) { ambientpush = false; MQTTpush = false; break; }
+    if (M5.BtnC.isPressed()) { MQTTpush = false; break; }
     delay(10);
   }
   if (doManualConfig) {
@@ -2631,36 +2678,22 @@ void setup() {
       isWifiConfigSucceeded = false;
     }
   } else {
-    if (ambientpush || MQTTpush) {
+    if (MQTTpush) {
       lcd.fillScreen(TFT_BLACK);
       showMessage(FPSTR(MSG_WIFI_CONNECTING));
       if (wifiManager.autoConnect()) { isWifiConfigSucceeded = true; }
-      else { isWifiConfigSucceeded = false; ambientpush = false; MQTTpush = false; }
+      else { isWifiConfigSucceeded = false; MQTTpush = false; }
     } else {
       lcd.fillScreen(TFT_BLACK);
       lcd.drawString("Wi-Fi無効", lcd.width()/2, lcd.height()/2);
     }
   }
+#endif
 
   if (isWifiConfigSucceeded) {
     // ESP32の省電力動作でTLS受信が不安定になることがあるため無効化する
     WiFi.setSleep(false);
     Serial.println("WiFi modem sleep disabled");
-  }
-  
-  // Ambient設定
-  if (ambientpush && isWifiConfigSucceeded) {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    sprintf(devKey, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    if (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
-      Serial.printf("Cannot get channelId for device %s\n", devKey);
-      while (!ambient.getchannel(userKey, devKey, channelId, writeKey, sizeof(writeKey), &ambientClient)) {
-        M5.update();
-        delay(500);
-      }
-    }
-    ambient.begin(channelId, writeKey, &ambientClient);
   }
   
   // MQTT設定
@@ -2690,7 +2723,6 @@ void setup() {
 #if STRATEGY_SIM
   // 仮想走行の値をクラウドへ送らない
   MQTTpush = false;
-  ambientpush = false;
 #endif
 
   lcd.fillScreen(TFT_BLACK);
@@ -2700,7 +2732,6 @@ void setup() {
   t_Serial = millis();
   t_SD = millis();
   t_MQTT = millis();
-  t_amb = millis();
   t_alt = millis();
   t_env = millis();
   t_display = millis();
@@ -2801,18 +2832,12 @@ void loop() {
     }
   }
   
-  // AmbientはWi-Fi接続が必要なため、接続成功している場合のみ更新する
-  if (ambientpush && (millis() - t_amb >= AMBIENT_INTERVAL)) {
-    updateAmbient();
-    t_amb += AMBIENT_INTERVAL;
-  }
-  
-  // 高度更新はBME280が正常に初期化されている場合のみ実行する
+  // 高度更新は気圧センサーが正常に初期化されている場合のみ実行する
   if (millis() - t_alt >= ALTITUDE_INTERVAL) {
-    updateAltitudeFromBmx280();
+    updateAltitudeFromPressureSensor();
     t_alt += ALTITUDE_INTERVAL;
   }
-  // 環境センサー更新はBME280が正常に初期化されている場合のみ実行する
+  // 環境センサー更新は環境センサーが正常に初期化されている場合のみ実行する
   if (millis() - t_env >= ENV_SENSOR_INTERVAL) {
     updateEnvironmentSensors();
     t_env += ENV_SENSOR_INTERVAL;
@@ -2821,8 +2846,8 @@ void loop() {
     }
   }
 
-  // 国土地理院API呼び出しはBME280接続時のみ低頻度で実行し、成功したら以後実行しない
-  if (isBmx280Ready) tryFetchAltitudeOffsetFromGsi();
+  // 国土地理院API呼び出しは気圧センサー接続時のみ低頻度で実行し、成功したら以後実行しない
+  if (isPressureSensorReady()) tryFetchAltitudeOffsetFromGsi();
 
   delay(1);
 }
