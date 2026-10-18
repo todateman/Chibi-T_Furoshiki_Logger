@@ -57,8 +57,8 @@ FIRMWARE = REPO / "src" / "main.cpp"
 COURSES = {"suzuka": "su", "motegi": "mo", "toyota": "to"}
 
 # 対応している ECU 側の版数
-PARAMS_FORMAT_VERSION = 2  # パラメータ JSON の format_version
-SIM_INTERFACE_VERSION = 2  # strategy_sim.py の INTERFACE_VERSION
+PARAMS_FORMAT_VERSION = 3  # パラメータ JSON の format_version
+SIM_INTERFACE_VERSION = 3  # strategy_sim.py の INTERFACE_VERSION
 
 # ファーム側の上限（include/StrategyAssist.h, src/main.cpp）
 MAX_PATTERNS = 2  # 通常パターンと予備パターン
@@ -133,7 +133,7 @@ def recommend(sim, p: dict, course, target_s: float, n_min: int, n_max: int, fue
     """
     c = p["course"]
     guard = c.get("guard_kmh", 16.0)
-    lap_target = target_s / c["laps"] * 0.97
+    lap_target = sim.steady_lap_target(c, course, target_s)
     results = []
     for n in range(n_min, n_max + 1):
         placed = sim.place_marks(p, course, n, lap_target, guard + 1.0)
@@ -301,8 +301,9 @@ def main() -> int:
     parser.add_argument("--target", help="目標時間 MM:SS（既定はパラメータの target_s）")
     parser.add_argument("--n-min", type=int, default=2, help="1 周あたり加速回数の下限")
     parser.add_argument("--n-max", type=int, default=5, help="1 周あたり加速回数の上限")
-    parser.add_argument("--fuel-slack", type=float, default=0.05,
-                        help="推奨を選ぶとき、燃料最小からこの割合までは加速回数の少なさを優先する")
+    parser.add_argument("--fuel-slack", type=float,
+                        help="推奨を選ぶとき、燃料最小からこの割合までは加速回数の少なさを優先する"
+                             "（既定はパラメータの fuel_slack、無ければ 0.05）")
     parser.add_argument("--fallback-v-off", type=float, help="予備パターンの加速停止速度 km/h（既定は既存ファイルの値）")
     parser.add_argument("--fallback-marks", type=float, nargs="+", metavar="M",
                         help="予備パターンの加速開始位置 m（既定は既存ファイルの値）")
@@ -332,7 +333,7 @@ def main() -> int:
                 summary.append(f"警告: プランは規定時間 {sim.mmss(limit)} を超えます")
         else:
             target = sim.parse_mmss(args.target) if args.target else p["target_s"]
-            rec = recommend(sim, p, course, target, args.n_min, args.n_max, args.fuel_slack)
+            rec = recommend(sim, p, course, target, args.n_min, args.n_max, sim.fuel_slack(p, args.fuel_slack))
             if rec is None:
                 raise ValueError(f"目標 {sim.mmss(target)} に収まるパターンがありません")
             summary = [f"目標 {sim.mmss(target)} / 規定 {sim.mmss(limit)} / {p['course']['laps']} 周",

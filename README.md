@@ -275,9 +275,9 @@ SDカードのルートに置く (`sd/motegi_strategy.json`)。場所ごとに `
 | `v_off` | 加速停止速度 [km/h] | **必須** | 32.5 |
 | `marks_m` | 加速開始位置 [m] (スタートラインから、昇順、最大 6) | **必須** | 400, 800, 1400 |
 | `final_lap_marks` | 最終周に有効な位置の数 (先頭から) | 全位置が有効 | 2 |
-| `final_extra_if_split_over_s` | 最終周に入る通過タイムがこれを超えたら全位置を有効にする [s] | この判定をしない | 1961 |
+| `final_extra_if_split_over_s` | 最終周に入る通過タイムがこれを超えたら全位置を有効にする [s] | この判定をしない | 1980 |
 | `guard_kmh` | 最低限界速度 [km/h] | 最低限界速度の合図を出さない | 16.0 |
-| `splits_s` | n 周通過時の目標走行時間 [s] (最大 12)。最後はゴールの目標時間 | 加速停止速度を補正せず、計画上の現在地も出さない | 309, 630, 951, 1272, 1593, 1914, 2290 |
+| `splits_s` | n 周通過時の目標走行時間 [s] (最大 12)。最後はゴールの目標時間 | 加速停止速度を補正せず、計画上の現在地も出さない | 286, 607, 928, 1249, 1570, 1891, 2245 |
 | `fallback` | 予備パターン (`v_off` / `marks_m` / `final_lap_marks`) | 予備パターンなし (B長押しは無効) | 30.0 / 200, 600, 1000, 1400 / 3 |
 | `fuel_warn_mpa` | 加速中の燃圧がこれを下回ったら警告 [MPa] | 燃圧の警告を出さない | 0.30 |
 | `beep` | ブザーを鳴らすか | 鳴らす | true |
@@ -346,8 +346,8 @@ python3 tools/make_strategy_json.py motegi \
 
 | 照合するもの | ECU 側 | このスクリプト側 |
 | ---- | ---- | ---- |
-| パラメータ JSON の形式 (現在 2。`phases` を足した) | JSON の `"format_version"` | `PARAMS_FORMAT_VERSION` |
-| シミュレータの仕様 (推奨パターンの選び方、関数の引数・戻り値。現在 2) | `strategy_sim.py` の `INTERFACE_VERSION` | `SIM_INTERFACE_VERSION` |
+| パラメータ JSON の形式 (現在 3。`course.start_m` / `course.finish_m` と `fuel_slack` を足した) | JSON の `"format_version"` | `PARAMS_FORMAT_VERSION` |
+| シミュレータの仕様 (推奨パターンの選び方、関数の引数・戻り値。現在 3) | `strategy_sim.py` の `INTERFACE_VERSION` | `SIM_INTERFACE_VERSION` |
 | 規定周回数 | JSON の `course.laps` | `src/main.cpp` の `totallaps_su` / `totallaps_mo` |
 
 - 版数が違う・書かれていない場合は、ECU 側で何が変わったかを確かめ、スクリプトを合わせてから対応版数を上げる。スクリプトは `optimize` の選定手順を写して持っているので、ECU 側で選び方を変えたら `INTERFACE_VERSION` を上げること
