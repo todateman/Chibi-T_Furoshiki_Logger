@@ -2236,7 +2236,7 @@ void updateSDLog() {
                            "%s,%.1f,%u,%.1f,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f\n",
                            datetime,
                            speed,
-                           static_cast<unsigned int>(Lapcount),
+                           static_cast<unsigned int>(Lapcount) + 1u,  // ログは「周目」なので完了周回数+1（1周目=1）
                            worktime,
                            static_cast<unsigned int>(tachoRpm),
                            INJ_timems,
