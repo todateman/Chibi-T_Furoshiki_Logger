@@ -240,10 +240,12 @@ const float controlline_la1_su = 34.845093;  // 鈴鹿サーキット東コー�
 const float controlline_ln1_su = 136.538735;  // 鈴鹿サーキット東コースのコントロールライン(外側)の経度
 const float controlline_la2_su = 34.844847;  // 鈴鹿サーキット東コースのコントロールライン(内側)の緯度
 const float controlline_ln2_su = 136.538379;  // 鈴鹿サーキット東コースのコントロールライン(内側)の経度
-const float controlline_la1_mo = 36.532698;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の緯度
-const float controlline_ln1_mo = 140.226047;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の経度
-const float controlline_la2_mo = 36.533111;  // ツインリンクもてぎオーバルコースのコントロールライン(内側)の緯度
-const float controlline_ln2_mo = 140.226982;  // ツインリンクもてぎオーバルコースのコントロールライン(内側)の経度
+// もてぎはコース上のコントロールライン（ゴールラインと同じ並び、ウェイポイント ID 1 の約 117 m 手前）。2026/10/24 のコースウォークで確認。
+// ウェイポイントの線から外側へ約 30 m（本コースの外側の縁を越える）、内側へ約 70 m（ゴールレーンを越える）
+const float controlline_la1_mo = 36.533579;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の緯度
+const float controlline_ln1_mo = 140.225395;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の経度
+const float controlline_la2_mo = 36.533998;  // ツインリンクもてぎオーバルコースのコントロールライン(内側)の緯度
+const float controlline_ln2_mo = 140.226384;  // ツインリンクもてぎオーバルコースのコントロールライン(内側)の経度
 const float controlline_la1_to = 35.082069;  // 豊田市SENTANのコントロールライン(外側)の緯度
 const float controlline_ln1_to = 137.159997;  // 豊田市SENTANのコントロールライン(外側)の経度
 const float controlline_la2_to = 35.082060;  // 豊田市SENTANのコントロールライン(内側)の緯度
@@ -1121,7 +1123,7 @@ void drawStrategyMode() {
 bool getControlLineForLoc(const String& loc, double& outLa1, double& outLn1, double& outLa2, double& outLn2);
 
 // 現在地表示画面（モード2）の描画
-// コース図（北が上）に現在地・スタートライン・加速開始位置を重ね、四隅に速度・加速停止速度・残り周回・走行時間を出す
+// コース図（北が上）に現在地・コントロールライン・加速開始位置を重ね、四隅に速度・加速停止速度・残り周回・走行時間を出す
 // 合図は下端の帯だけで伝える（コース図の配色は変えない）。走行支援が無効な場所でもコース図と現在地は出す
 void drawCourseMapMode() {
   using StrategyAssist::Cue;
@@ -1154,7 +1156,7 @@ void drawCourseMapMode() {
       prevY = y;
     }
 
-    // スタートライン
+    // コントロールライン
     double clLa1, clLn1, clLa2, clLn2;
     if (getControlLineForLoc(Loc, clLa1, clLn1, clLa2, clLn2)) {
       int x1, y1, x2, y2;
@@ -2455,7 +2457,7 @@ bool initializePressureSensorForGnssModule() {
 // 仮想ドライバーは画面の合図どおりに加速・停止する。走行抵抗を2割増しにして、通過タイムの遅れと補正も出るようにしてある。
 void updateSimulatedRun() {
   static unsigned long lastMs = millis();
-  static float simS = -8.0f;   // スタートラインからの累積距離 [m]（グリッドはラインの8 m手前）
+  static float simS = -8.0f;   // ウェイポイント ID 1 からの累積距離 [m]（ID 1 の8 m手前から発進する）
   static float simV = 0.0f;    // 速度 [m/s]
   static float simT = 0.0f;    // 走行時間 [s]
   static float reactS = 0.0f;  // 合図に気づいてから操作するまでの時間 [s]

@@ -351,15 +351,18 @@ void test_marks_restart_without_lap_count() {
 void test_lap_count_before_position_wraps() {
   Runner r;
   const Output& o = r.assist.output();
-  r.at(2335.0f, 27.0f);
+  r.at(2222.0f, 27.0f);
 
-  // カウントの時点で位置がまだ終端を指していても、誤って「加速」を出さない
+  // コントロールライン（もてぎは周内位置 2224 m）でカウントした時点で位置がまだ終端を指していても、
+  // 誤って「加速」を出さず、次の目印までの距離は周の先頭をまたいで数える
   r.in.lapsDone = 1;
   r.assist.onLapCrossed(1, 309.0f);
-  r.at(2338.0f, 27.0f);
+  r.at(2226.0f, 27.0f);
   TEST_ASSERT_TRUE(o.cue == Cue::Coast);
   TEST_ASSERT_EQUAL_INT(0, o.nextMark);
-  TEST_ASSERT_FLOAT_WITHIN(0.5f, 400.0f, o.nextMarkDistM);
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, 515.4f, o.nextMarkDistM);
+  r.at(2338.0f, 27.0f);
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, 403.4f, o.nextMarkDistM);
 
   r.at(5.0f, 27.0f);
   TEST_ASSERT_TRUE(o.cue == Cue::Coast);
