@@ -85,9 +85,17 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 // GNSS受信バッファサイズ（1ループあたりの最大パース量。10Hzロギングでの取りこぼし防止のため広めに確保）
 #define GNSS_PARSE_BUDGET_BYTES 512
 
+// GNSSの受信が止まったときの自動復帰
+// 実走で位置が26分間止まり、電源を入れ直すまで戻らなかったことがあるため、ロガー側(UART)とモジュール側を順に立ち直らせる
+#define GNSS_STALL_MS 3000UL              // NMEAの文がこの時間届かなければUARTを開き直す
+#define GNSS_FIX_LOST_RESTART_MS 10000UL  // 文は届くのに測位がこの時間更新されなければモジュールを再起動する（一度測位した後のみ）
+#define GNSS_RESTART_RETRY_MS 30000UL     // 測位が戻らないときのモジュール再起動の最短間隔
+// モジュールの再起動コマンド($PCAS10)はATGM336H用。M5Stack GNSS Module(u-blox)には送らない
+#define GNSS_HOT_START_AVAILABLE (!GNSS_MODULE_M5)
+
 // ECU/SDログ処理の高速化用バッファ・しきい値（10Hzロギング対応）
 #define ECU_LINE_BUFFER_SIZE 128
-#define SD_LINE_BUFFER_SIZE 256
+#define SD_LINE_BUFFER_SIZE 320
 #define SD_BATCH_BUFFER_SIZE 1024
 #define SD_SYNC_LINE_THRESHOLD 40
 #define SD_SYNC_TIME_MS 5000UL
@@ -209,6 +217,13 @@ double la = 0.0, ln = 0.0;      // GPS緯度経度
 // double ln = 137.010875;   // KMMF2026の緯度経度初期値
 double alt = 0.0;   // GPS高度
 double spd = 0.0;   // GPS速度
+// GNSSの受信状況（自動復帰とSDログの診断列に使う）
+unsigned long gnssLastSentenceAt = 0;  // 最後にNMEAの文を正しく受信した時刻
+unsigned long gnssLastReinitAt = 0;    // 最後にUARTを開き直した時刻
+unsigned long gnssLastRestartAt = 0;   // 最後にモジュールへ再起動を送った時刻
+uint8_t gnssStallAttempts = 0;         // 受信が止まってからUARTを開き直した回数（文が届けば0に戻す）
+uint16_t gnssUartReinitCount = 0;      // UARTを開き直した累計回数
+uint16_t gnssRestartCount = 0;         // モジュールへ再起動を送った累計回数
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
 // 環境センサー（気圧・気温・湿度）。高度推定にも使う
@@ -1744,6 +1759,44 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
   }
 }
 
+// GNSSモジュールへホットスタート（保存した設定と衛星の軌道情報を保ったままの再起動）を送る
+void restartGnssModule() {
+  Serial2.print(F("$PCAS10,0*1C\r\n"));
+  gnssLastRestartAt = millis();
+  gnssRestartCount++;
+}
+
+// GNSSの受信が止まっていれば立ち直らせる
+// 1回目はUARTの開き直しだけを行い、それでも届かなければモジュールの再起動も送る
+// （どちらで戻ったかをSDログの回数の列から見分けられるようにする）
+void recoverGnssIfStalled() {
+  const unsigned long nowMs = millis();
+  if (nowMs - gnssLastSentenceAt >= GNSS_STALL_MS) {
+    if (nowMs - gnssLastReinitAt < GNSS_STALL_MS) {
+      return;
+    }
+    Serial2.begin(gnss_bps);  // 2回目以降のbegin()はUARTドライバを入れ直す（ピンは前回のまま）
+    gnssLastReinitAt = nowMs;
+    gnssUartReinitCount++;
+    if (GNSS_HOT_START_AVAILABLE && gnssStallAttempts > 0) {
+      restartGnssModule();
+    }
+    if (gnssStallAttempts < UINT8_MAX) {
+      gnssStallAttempts++;
+    }
+    Serial.printf("[GNSS] no sentence for %lums: UART reinit #%u, module restart #%u\n",
+                  nowMs - gnssLastSentenceAt, gnssUartReinitCount, gnssRestartCount);
+    return;
+  }
+
+  // 文は届くが測位が更新されない（衛星を見失ったまま戻らない）
+  if (GNSS_HOT_START_AVAILABLE && gps.location.isValid() && gps.location.age() >= GNSS_FIX_LOST_RESTART_MS &&
+      nowMs - gnssLastRestartAt >= GNSS_RESTART_RETRY_MS) {
+    restartGnssModule();
+    Serial.printf("[GNSS] no fix for %lums: module restart #%u\n", gps.location.age(), gnssRestartCount);
+  }
+}
+
 // GNSSからの位置・時刻読み取り
 void updateGNSS() {
   double prevLa = la;   // ラップカウント判定用に前回位置を退避
@@ -1755,6 +1808,8 @@ void updateGNSS() {
     char ch = Serial2.read();
     parsedBytes++;
     if (gps.encode(ch)) {
+      gnssLastSentenceAt = millis();
+      gnssStallAttempts = 0;
       if (gps.time.isUpdated()) {
         updateSystemTimeFromGnss();
         time_t gnssJst = 0;
@@ -1771,6 +1826,8 @@ void updateGNSS() {
       }
     }
   }
+  recoverGnssIfStalled();
+
   // ロケーション判定
   if (la >= 34.837989 && la <= 34.84828 && ln >= 136.522015 && ln <= 136.544450) {
     Loc = "su";
@@ -2050,7 +2107,7 @@ void updateDisplay() {
     }
     lcd_s.setTextDatum(top_right);
     lcd_s.drawString(LOGGING ? "SD: O" : "SD: x", 320, 0);
-    lcd_s.drawString(gps.location.isValid() ? "GNSS: O" : "GNSS: x", 320, 15);
+    lcd_s.drawString(positionFresh ? "GNSS: O" : "GNSS: x", 320, 15);  // 一度測位した後も、位置が古くなればxにする
     lcd_s.drawString(MQTTpush ? "MQTT: O" : "MQTT: x", 320, 30);
   }
   
@@ -2219,7 +2276,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa)"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa),GNSS測位経過(ms),GNSS受信文字数,GNSS正常文数,GNSSエラー文数,GNSS UART再初期化(回),GNSS再起動(回)"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -2231,11 +2288,15 @@ void updateSDLog() {
     if (isfinite(envPressureKPa)) { dtostrf(envPressureKPa, 0, 3, pressureStr); }
     if (isfinite(envTemperatureC)) { dtostrf(envTemperatureC, 0, 2, tempStr); }
     if (isfinite(envHumidityPct)) { dtostrf(envHumidityPct, 0, 1, humStr); }
+    char gnssAgeStr[12] = {0};  // 一度も測位していなければ空欄
+    if (gps.location.isValid()) {
+      snprintf(gnssAgeStr, sizeof(gnssAgeStr), "%lu", static_cast<unsigned long>(min<uint32_t>(gps.location.age(), 9999999UL)));
+    }
 
     char logLine[SD_LINE_BUFFER_SIZE] = {0};
     int lineLen = snprintf(logLine,
                            sizeof(logLine),
-                           "%s,%.1f,%u,%.1f,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f\n",
+                           "%s,%.1f,%u,%.1f,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f,%s,%lu,%lu,%lu,%u,%u\n",
                            datetime,
                            speed,
                            static_cast<unsigned int>(Lapcount) + 1u,  // ログは「周目」なので完了周回数+1（1周目=1）
@@ -2257,7 +2318,13 @@ void updateSDLog() {
                            humStr,
                            PriPre,
                            SecPre,
-                           FuelPre);
+                           FuelPre,
+                           gnssAgeStr,
+                           static_cast<unsigned long>(gps.charsProcessed()),
+                           static_cast<unsigned long>(gps.passedChecksum()),
+                           static_cast<unsigned long>(gps.failedChecksum()),
+                           static_cast<unsigned int>(gnssUartReinitCount),
+                           static_cast<unsigned int>(gnssRestartCount));
 
     if (lineLen <= 0 || lineLen >= static_cast<int>(sizeof(logLine))) {
       Serial.println("SD log line build failed");
@@ -2573,6 +2640,8 @@ void setup() {
   Serial1.setTimeout(5);  // readStringUntilのブロッキング待ちを最小化
   
   // GNSS初期化
+  // ECUと同じく、MQTT/HTTP等のブロッキング中もNMEAを取りこぼさないようbegin()より前にRXバッファを拡大する
+  Serial2.setRxBufferSize(1024);
   Serial2.begin(gnss_bps);
 
   // BLE中継機(NanoC6)用I2Cバスの初期化
@@ -2738,6 +2807,7 @@ void setup() {
   t_env = millis();
   t_display = millis();
   lastSdSyncAt = millis();
+  gnssLastSentenceAt = millis();  // 起動処理の待ち時間を受信停止と誤判定しない
 }
 
 //==================== loop() =====================
