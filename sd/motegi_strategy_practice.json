@@ -3,9 +3,9 @@
   "v_off": 35.0,
   "marks_m": [350, 600, 1100],
   "final_lap_marks": 3,
-  "final_extra_if_split_over_s": 1980,
+  "final_extra_if_split_over_s": 1964,
   "guard_kmh": 16.0,
-  "splits_s": [273, 587, 900, 1228, 1549, 1870, 2225],
+  "splits_s": [257, 570, 884, 1213, 1534, 1855, 2225],
   "fallback": {
     "v_off": 32.5,
     "marks_m": [400, 800, 1400],

@@ -57,8 +57,8 @@ FIRMWARE = REPO / "src" / "main.cpp"
 COURSES = {"suzuka": "su", "motegi": "mo", "toyota": "to"}
 
 # 対応している ECU 側の版数
-PARAMS_FORMAT_VERSION = 3  # パラメータ JSON の format_version
-SIM_INTERFACE_VERSION = 3  # strategy_sim.py の INTERFACE_VERSION
+PARAMS_FORMAT_VERSION = 4  # パラメータ JSON の format_version
+SIM_INTERFACE_VERSION = 4  # strategy_sim.py の INTERFACE_VERSION
 
 # ファーム側の上限（include/StrategyAssist.h, src/main.cpp）
 MAX_PATTERNS = 2  # 通常パターンと予備パターン

@@ -230,10 +230,11 @@ public:
     float pos = NAN;
     if (posValid) {
       pos = in.lapPosM;
-      // 周回カウントの直後は、位置がまだ周の終端付近を指していることがある。先頭へ戻るまでは0として扱う
+      // コントロールラインは周内位置の0 mより手前にある（もてぎは約117 m手前のゴールラインの横）。
+      // 周回カウントの直後は位置がまだ周の終端付近を指すので、先頭へ戻るまでは負の位置（次の周の手前）として扱う
       if (awaitWrap_) {
         if (pos > 0.8f * cfg_.lapM) {
-          pos = 0.0f;
+          pos -= cfg_.lapM;
         } else {
           awaitWrap_ = false;
         }
