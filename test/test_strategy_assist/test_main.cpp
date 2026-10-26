@@ -41,6 +41,47 @@ Config motegiConfig() {
   return c;
 }
 
+// 頂上の止め時・加速しない区間を持つ設定（sd/suzuka_strategy.json の形。表は間隔を粗くした値）
+Config suzukaConfig() {
+  Config c;
+  c.enabled = true;
+  c.lapM = 2234.0f;
+  c.totalLaps = 8;
+  c.guardKmh = 21.0f;
+  c.primary.vOffKmh = 29.0f;
+  c.primary.markCount = 2;
+  c.primary.marksM[0] = 1350.0f;
+  c.primary.marksM[1] = 1730.0f;
+  c.primary.finalLapMarks = 2;
+  c.crestCount = 2;
+  StrategyAssist::CrestCut& s = c.crests[0];  // S 字: 1300, 1350, …, 1500 m と頂上 1533 m
+  s.fromM = 1300.0f;
+  s.crestM = 1533.0f;
+  s.stepM = 50.0f;
+  s.count = 6;
+  const float sKmh[6] = {50.0f, 42.0f, 35.0f, 28.0f, 20.0f, 14.0f};
+  for (uint8_t i = 0; i < 6; i++) {
+    s.kmh[i] = sKmh[i];
+  }
+  StrategyAssist::CrestCut& d = c.crests[1];  // ダンロップ: 1780, 1830, 1880 m と頂上 1916 m
+  d.fromM = 1780.0f;
+  d.crestM = 1916.0f;
+  d.stepM = 50.0f;
+  d.count = 4;
+  const float dKmh[4] = {40.0f, 32.0f, 20.0f, 10.0f};
+  for (uint8_t i = 0; i < 4; i++) {
+    d.kmh[i] = dKmh[i];
+  }
+  c.cutLagS = 0.5f;
+  c.restartKmh = 5.0f;
+  c.coastZoneCount = 2;
+  c.coastZonesM[0][0] = 1533.0f;
+  c.coastZonesM[0][1] = 1652.0f;
+  c.coastZonesM[1][0] = 1914.0f;  // 周の終端をまたぐ
+  c.coastZonesM[1][1] = 740.0f;
+  return c;
+}
+
 // 0.1秒刻みで入力を進めるための補助
 struct Runner {
   Assist assist;
@@ -460,6 +501,119 @@ void test_reset_on_new_run() {
   TEST_ASSERT_FALSE(o.hasSplit);
 }
 
+void test_zone_and_crest_table() {
+  using StrategyAssist::crestCutKmh;
+  using StrategyAssist::inZone;
+  TEST_ASSERT_TRUE(inZone(1600.0f, 1533.0f, 1652.0f));
+  TEST_ASSERT_FALSE(inZone(1700.0f, 1533.0f, 1652.0f));
+  TEST_ASSERT_TRUE(inZone(2000.0f, 1914.0f, 740.0f));  // 周の終端をまたぐ区間
+  TEST_ASSERT_TRUE(inZone(100.0f, 1914.0f, 740.0f));
+  TEST_ASSERT_FALSE(inZone(1000.0f, 1914.0f, 740.0f));
+
+  const Config c = suzukaConfig();
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, 50.0f, crestCutKmh(c.crests[0], 1300.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, 38.5f, crestCutKmh(c.crests[0], 1375.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, 20.0f, crestCutKmh(c.crests[0], 1500.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, 17.0f, crestCutKmh(c.crests[0], 1516.5f));  // 最後の区間は頂上まで（33 m）
+  TEST_ASSERT_FLOAT_WITHIN(1e-3f, 14.0f, crestCutKmh(c.crests[0], 1533.0f));
+  TEST_ASSERT_TRUE(isnan(crestCutKmh(c.crests[0], 1299.0f)));
+  TEST_ASSERT_TRUE(isnan(crestCutKmh(c.crests[0], 1534.0f)));
+}
+
+void test_crest_cut_sequence() {
+  Runner r(suzukaConfig());
+  const Output& o = r.assist.output();
+
+  r.at(1305.0f, 21.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::BurnNow);
+  TEST_ASSERT_TRUE(o.guard);
+
+  // 頂上の区間では、加速停止速度（29 km/h）を超えても表の速度に届くまで止めない
+  r.in.engineOn = true;
+  r.at(1320.0f, 30.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::Burning);
+  TEST_ASSERT_TRUE(o.crestZone);
+  TEST_ASSERT_FLOAT_WITHIN(0.1f, 46.1f, o.cutKmh);  // 0.5秒先（4.2 m先）の位置の値
+  TEST_ASSERT_EQUAL_FLOAT(29.0f, o.vOffKmh);
+
+  // 0.5秒先（4.3 m先）の表の速度 30.2 km/h に届いた
+  r.at(1430.0f, 31.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::CutNow);
+  // エンジンが止まるまで「停止」を保つ
+  r.at(1440.0f, 28.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::CutNow);
+
+  // 止めたあとは頂上まで、最低限界速度を割っても「加速」を出さない
+  r.in.engineOn = false;
+  r.step(0.5f);
+  TEST_ASSERT_TRUE(o.cresting);
+  TEST_ASSERT_FALSE(o.crestZone);
+  r.at(1500.0f, 14.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::Coast);
+  TEST_ASSERT_TRUE(o.cresting);
+  // 止まりそうになったら出す
+  r.at(1520.0f, 4.5f);
+  TEST_ASSERT_TRUE(o.cue == Cue::BurnNow);
+  TEST_ASSERT_TRUE(o.guard);
+
+  // 頂上を越えたら解除。その先の下り（加速しない区間）でも出さない
+  r.at(1600.0f, 12.0f);
+  TEST_ASSERT_FALSE(o.cresting);
+  TEST_ASSERT_TRUE(o.cue == Cue::Coast);
+  // 区間を出たら最低限界速度で出す
+  r.at(1700.0f, 21.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::BurnNow);
+  TEST_ASSERT_TRUE(o.guard);
+}
+
+void test_own_cut_in_crest_zone_keeps_guard() {
+  // 頂上の止め時の合図より前に自分で止めた場合は、最低限界速度の「加速」を出す
+  Runner r(suzukaConfig());
+  const Output& o = r.assist.output();
+  r.in.engineOn = true;
+  r.at(1320.0f, 30.0f);
+  r.in.engineOn = false;
+  r.step(0.5f);
+  TEST_ASSERT_FALSE(o.cresting);
+  r.at(1400.0f, 20.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::BurnNow);
+}
+
+void test_coast_only_zone() {
+  Runner r(suzukaConfig());
+  const Output& o = r.assist.output();
+
+  // 加速中に下りに入ったら止める（周の終端をまたぐ区間）
+  r.in.engineOn = true;
+  r.at(1950.0f, 25.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::CutNow);
+  r.in.engineOn = false;
+  r.step(0.5f);
+
+  // 区間の中では最低限界速度を割っても出さない
+  r.at(1960.0f, 12.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::Coast);
+  r.at(100.0f, 15.0f);
+  TEST_ASSERT_FALSE(o.cue == Cue::BurnNow);
+  r.at(800.0f, 21.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::BurnNow);
+}
+
+void test_crest_cut_without_position() {
+  // 位置が分からなければ、頂上の止め時は使わず加速停止速度で止める
+  Runner r(suzukaConfig());
+  const Output& o = r.assist.output();
+  r.in.engineOn = true;
+  r.at(NAN, 29.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::CutNow);
+  TEST_ASSERT_FALSE(o.crestZone);
+  TEST_ASSERT_EQUAL_FLOAT(29.0f, o.cutKmh);
+  r.in.engineOn = false;
+  r.step(0.5f);
+  r.at(NAN, 20.0f);
+  TEST_ASSERT_TRUE(o.cue == Cue::BurnNow);
+}
+
 }  // namespace
 
 void setUp() {}
@@ -488,5 +642,10 @@ int main(int, char**) {
   RUN_TEST(test_fuel_pressure_warning);
   RUN_TEST(test_optional_features_off_when_not_configured);
   RUN_TEST(test_reset_on_new_run);
+  RUN_TEST(test_zone_and_crest_table);
+  RUN_TEST(test_crest_cut_sequence);
+  RUN_TEST(test_own_cut_in_crest_zone_keeps_guard);
+  RUN_TEST(test_coast_only_zone);
+  RUN_TEST(test_crest_cut_without_position);
   return UNITY_END();
 }

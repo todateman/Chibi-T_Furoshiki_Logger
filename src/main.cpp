@@ -741,6 +741,81 @@ bool isValidStrategyConfig(const StrategyAssist::Config& cfg) {
       return false;
     }
   }
+  // 頂上の止め時: 区間は1周の内側で昇順・重ならない。表の最後の点が頂上に当たる個数で、速度は正
+  for (uint8_t i = 0; i < cfg.crestCount; i++) {
+    const StrategyAssist::CrestCut& cc = cfg.crests[i];
+    if (!(cc.fromM >= 0.0f && cc.fromM < cc.crestM && cc.crestM < cfg.lapM && cc.stepM > 0.0f) || cc.count < 2) {
+      return false;
+    }
+    if (!(cc.fromM + cc.stepM * (cc.count - 2) < cc.crestM && cc.crestM <= cc.fromM + cc.stepM * (cc.count - 1) + 0.5f)) {
+      return false;
+    }
+    for (uint8_t k = 0; k < cc.count; k++) {
+      if (!isfinite(cc.kmh[k]) || cc.kmh[k] <= 0.0f) {
+        return false;
+      }
+    }
+    if (i > 0 && cc.fromM <= cfg.crests[i - 1].crestM) {
+      return false;
+    }
+  }
+  if (!(cfg.cutLagS >= 0.0f && cfg.cutLagS <= 3.0f) || !(cfg.restartKmh >= 0.0f)) {
+    return false;
+  }
+  for (uint8_t i = 0; i < cfg.coastZoneCount; i++) {
+    const float from = cfg.coastZonesM[i][0];
+    const float to = cfg.coastZonesM[i][1];
+    if (!(from >= 0.0f && from < cfg.lapM && to >= 0.0f && to < cfg.lapM) || from == to) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 頂上の止め時・加速しない区間をJSONから読み込む関数。表や区間が多すぎる場合はfalseを返す
+bool readCrestCutJson(JsonVariantConst root, StrategyAssist::Config& cfg) {
+  JsonArrayConst crests = root["crest_cut"];
+  if (!crests.isNull()) {
+    if (crests.size() > StrategyAssist::MAX_CRESTS) {
+      Serial.printf("[Strategy] crest_cut has too many zones: %u\n", static_cast<unsigned int>(crests.size()));
+      return false;
+    }
+    cfg.crestCount = 0;
+    for (JsonVariantConst src : crests) {
+      StrategyAssist::CrestCut& cc = cfg.crests[cfg.crestCount++];
+      cc.fromM = src["from_m"].as<float>();
+      cc.crestM = src["crest_m"].as<float>();
+      cc.stepM = src["step_m"].as<float>();
+      JsonArrayConst kmh = src["kmh"];
+      if (kmh.size() > StrategyAssist::MAX_CREST_POINTS) {
+        Serial.printf("[Strategy] crest_cut kmh has too many points: %u\n", static_cast<unsigned int>(kmh.size()));
+        return false;
+      }
+      cc.count = 0;
+      for (JsonVariantConst v : kmh) {
+        cc.kmh[cc.count++] = v.as<float>();
+      }
+    }
+  }
+  if (root["cut_lag_s"].is<float>()) { cfg.cutLagS = root["cut_lag_s"].as<float>(); }
+  if (root["restart_kmh"].is<float>()) { cfg.restartKmh = root["restart_kmh"].as<float>(); }
+  JsonArrayConst zones = root["coast_only_m"];
+  if (!zones.isNull()) {
+    if (zones.size() > StrategyAssist::MAX_COAST_ZONES) {
+      Serial.printf("[Strategy] coast_only_m has too many zones: %u\n", static_cast<unsigned int>(zones.size()));
+      return false;
+    }
+    cfg.coastZoneCount = 0;
+    for (JsonVariantConst zone : zones) {
+      if (zone.size() != 2) {
+        Serial.println("[Strategy] coast_only_m needs [from, to]");
+        return false;
+      }
+      cfg.coastZonesM[cfg.coastZoneCount][0] = zone[0].as<float>();
+      cfg.coastZonesM[cfg.coastZoneCount][1] = zone[1].as<float>();
+      cfg.coastZoneCount++;
+    }
+  }
   return true;
 }
 
@@ -807,6 +882,9 @@ bool parseStrategyConfigJson(const char* json, StrategyAssist::Config& cfg, Limi
       }
       cfg.splitsS[cfg.splitCount++] = split.as<float>();
     }
+  }
+  if (!readCrestCutJson(root, cfg)) {
+    return false;
   }
   return readLimitMarginJson(root, cfg.lapM, mcfg);
 }
@@ -980,16 +1058,20 @@ bool formatStrategyCue(const StrategyAssist::Output& out, char* buf, size_t bufS
       snprintf(buf, bufSize, "スタート待ち");
       break;
     case Cue::Approach:
-      caution = true;
+      caution = !out.cresting;
       // fallthrough
     case Cue::Coast:
-      snprintf(buf, bufSize, "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      if (out.cresting) {
+        snprintf(buf, bufSize, "頂上まで惰行");
+      } else {
+        snprintf(buf, bufSize, "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      }
       break;
     case Cue::BurnNow:
       snprintf(buf, bufSize, out.guard ? "加速! 速度低下" : "加速!");
       break;
     case Cue::Burning:
-      snprintf(buf, bufSize, "%.1fで停止", out.vOffKmh);
+      snprintf(buf, bufSize, out.crestZone ? "頂上%.1fで停止" : "%.1fで停止", out.cutKmh);
       break;
     case Cue::CutNow:
       snprintf(buf, bufSize, "停止!");
@@ -1077,12 +1159,14 @@ void drawStrategyMode() {
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd_s.setTextSize(2);
   lcd_s.setTextDatum(TR_DATUM);
-  if (plainBg && out.bumpKmh > 0.0f) {
+  // 頂上の止め時の区間で加速中は、位置ごとの止める速度を出す（補正の色は付けない）
+  const bool bumpColor = plainBg && !out.crestZone;
+  if (bumpColor && out.bumpKmh > 0.0f) {
     lcd_s.setTextColor(TFT_MAGENTA);  // 遅れを取り戻すために上げている
-  } else if (plainBg && out.bumpKmh < 0.0f) {
+  } else if (bumpColor && out.bumpKmh < 0.0f) {
     lcd_s.setTextColor(TFT_CYAN);
   }
-  snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+  snprintf(buf, sizeof(buf), "%.1f", out.cutKmh);
   lcd_s.drawString(buf, 316, 26);
   lcd_s.setTextColor(fg);
   lcd_s.setTextSize(1);
@@ -1094,7 +1178,7 @@ void drawStrategyMode() {
   lcd_s.drawRect(barX - 1, 70, barW + 2, 12, fg);
   lcd_s.fillRect(barX, 71, static_cast<int>(constrain(speed, 0.0f, barMaxKmh) / barMaxKmh * barW), 10, fg);
   const int guardX = barX + static_cast<int>(constrain(cfg.guardKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
-  const int vOffX = barX + static_cast<int>(constrain(out.vOffKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
+  const int vOffX = barX + static_cast<int>(constrain(out.cutKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
   if (cfg.guardKmh > 0.0f) {
     lcd_s.fillRect(guardX - 1, 67, 3, 18, plainBg ? TFT_YELLOW : fg);
   }
@@ -1417,14 +1501,15 @@ void drawCourseMapMode() {
   lcd_s.drawString(buf, 4, 164);
 
   // 右上: 今の周の加速停止速度（遅れを取り戻すために上げていればマゼンタ、下げていれば水色）
+  // 頂上の止め時の区間で加速中は、位置ごとの止める速度
   lcd_s.setTextDatum(TR_DATUM);
   if (cfg.enabled) {
-    if (out.bumpKmh > 0.0f) {
+    if (!out.crestZone && out.bumpKmh > 0.0f) {
       lcd_s.setTextColor(TFT_MAGENTA);
-    } else if (out.bumpKmh < 0.0f) {
+    } else if (!out.crestZone && out.bumpKmh < 0.0f) {
       lcd_s.setTextColor(TFT_CYAN);
     }
-    snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+    snprintf(buf, sizeof(buf), "%.1f", out.cutKmh);
     lcd_s.drawString(buf, 316, 20);
     lcd_s.setTextColor(TFT_WHITE);
   }

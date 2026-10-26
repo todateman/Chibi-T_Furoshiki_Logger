@@ -54,7 +54,7 @@ rm -f out/*.ppm
 echo "出力: $B/out"
 
 if [ "${1:-}" = "--install" ]; then
-  for n in idle coast approach burn_now burning cut_now guard coast_home fuel_low fallback; do
+  for n in idle coast approach burn_now burning cut_now guard coast_home fuel_low fallback crest_burning crest_cut_now crest_cresting; do
     cp "out/strategy_$n.png" "$R/docs/strategy_screen_$n.png"
   done
   for n in approach burn_now cut_now coast_home fallback_fuel_low suzuka_no_plan; do

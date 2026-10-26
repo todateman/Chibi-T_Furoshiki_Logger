@@ -18,6 +18,11 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
   - limit_s                          パラメータの course からそのまま
   - plan_step_m, plan_t_s            計画の「道のり → 累積時間」表。splits_s と同じ走行（ずらさない）の速度トレースから、
                                      道のり 0, 100, 200 m, … の時刻と、最後にゴールの時刻を取る（ゴール時の余裕の予測に使う）
+  - crest_cut, cut_lag_s             パラメータの course.crest_cut があれば、頂上の止め時の表（crest_cut_table を 5 m ごとに引き、
+                                     最後に頂上の目標速度）と、止める合図からエンジンが止まるまでの遅れ（burn.cut_lag_s）
+  - coast_only_m                     パラメータの course.coast_only_zones_m（加速しない区間）
+  - restart_kmh                      頂上の止め時で止めたあと・加速しない区間で「加速」を出す速度。既存ファイルの値か
+                                     --restart-kmh、どちらも無ければ 5 km/h（上の 2 つのどちらかがあるときだけ書く）
 
 最終周の 2 項目は、加速開始位置を ±30 m ずらした 3 通りのうち完走側（回数は最大、所要時間は最長）を採る。
 
@@ -81,8 +86,13 @@ MAX_SPLITS = 12
 MAX_PLAN_POINTS = 200  # include/LimitMargin.h
 MAX_FILE_BYTES = 4095  # STRATEGY_FILE_BUFFER_SIZE - 1
 MAX_V_OFF_KMH = 60.0
+MAX_CRESTS = 2
+MAX_CREST_POINTS = 64
+MAX_COAST_ZONES = 4
 
 PLAN_STEP_M = 100  # 計画の「道のり → 累積時間」表の間隔
+CREST_STEP_M = 5   # 頂上の止め時の表の間隔（点が多すぎる区間は広げる）
+RESTART_KMH = 5.0  # 頂上の止め時で止めたあと・加速しない区間で「加速」を出す速度の既定（戦略書のドライバー向けの決まり）
 
 
 class Literal(str):
@@ -220,6 +230,22 @@ def plan_table(trace: list, s0: float, race_m: float, goal_s: float) -> list:
     return table
 
 
+def crest_tables(sim, p: dict, course) -> list:
+    """頂上の止め時の表。crest_cut_table の 1 m ごとの値を CREST_STEP_M ごとに引き、最後に頂上の目標速度を足す。"""
+    req = sim.crest_cut_table(p, course)
+    out = []
+    for cc in sim.crest_cuts(p["course"]):
+        s0, s1 = float(cc["from_m"]), float(cc["crest_m"])
+        step = CREST_STEP_M
+        while math.ceil((s1 - s0) / step) + 1 > MAX_CREST_POINTS:
+            step *= 2
+        n = math.ceil((s1 - s0) / step)  # 頂上より手前の点の数
+        kmh = [round(req[int(s0 + step * i) % int(course.lap_m)], 1) for i in range(n)]
+        out.append({"from_m": number(s0), "crest_m": number(s1), "step_m": step,
+                    "kmh": kmh + [number(float(cc["target_kmh"]))]})
+    return out
+
+
 def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, list[str]]:
     """(設定ファイルの内容, 注意書き) を返す。"""
     c = p["course"]
@@ -271,6 +297,23 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
             cfg[key] = existing[key]
         else:
             notes.append(f"{key}: 既存の値も指定も無いので書き出しません")
+
+    # 頂上の止め時と加速しない区間
+    crests = crest_tables(sim, p, course) if sim.crest_cuts(c) else []
+    zones = c.get("coast_only_zones_m") or []
+    if crests:
+        cfg["crest_cut"] = crests
+        cfg["cut_lag_s"] = p["burn"].get("cut_lag_s", 0.0)
+        for cc in crests:
+            notes.append(f"頂上の止め時: {cc['from_m']}〜{cc['crest_m']} m、{cc['step_m']} m ごと {len(cc['kmh'])} 点"
+                         f"（{cc['kmh'][0]} → {cc['kmh'][-1]} km/h）")
+    if zones:
+        cfg["coast_only_m"] = [[number(a), number(b)] for a, b in zones]
+    if crests or zones:
+        if args.restart_kmh is not None:
+            cfg["restart_kmh"] = args.restart_kmh
+        else:
+            cfg["restart_kmh"] = existing.get("restart_kmh", RESTART_KMH)
 
     # 規定時間の仮想車と、ゴール時の余裕の予測
     s0, total, _ = sim.race_span(c, course.lap_m)
@@ -327,6 +370,36 @@ def check_margin(cfg: dict, lap_m: float) -> list[str]:
     return problems
 
 
+def check_crest(cfg: dict, lap_m: float) -> list[str]:
+    """頂上の止め時・加速しない区間で、ファームが採用しない条件（src/main.cpp の isValidStrategyConfig）。"""
+    problems = []
+    crests = cfg.get("crest_cut", [])
+    if len(crests) > MAX_CRESTS:
+        problems.append(f"crest_cut は {MAX_CRESTS} 区間まで（{len(crests)} 区間）")
+    prev_crest = None
+    for cc in crests:
+        s0, s1, step, kmh = float(cc["from_m"]), float(cc["crest_m"]), float(cc["step_m"]), cc["kmh"]
+        n = len(kmh)
+        if not (0 <= s0 < s1 < lap_m and step > 0) or not 2 <= n <= MAX_CREST_POINTS:
+            problems.append(f"crest_cut {s0:g}〜{s1:g} m: 区間が 1 周の外か、点の数が 2〜{MAX_CREST_POINTS} 個でない")
+        elif not s0 + step * (n - 2) < s1 <= s0 + step * (n - 1) + 0.5:
+            problems.append(f"crest_cut {s0:g}〜{s1:g} m: 点の数が区間と step_m に合わない")
+        if any(not float(v) > 0 for v in kmh):
+            problems.append(f"crest_cut {s0:g}〜{s1:g} m: 速度が正でない")
+        if prev_crest is not None and s0 <= prev_crest:
+            problems.append("crest_cut の区間が昇順でないか重なっている")
+        prev_crest = s1
+    if not 0 <= float(cfg.get("cut_lag_s", 0.0)) <= 3 or not float(cfg.get("restart_kmh", RESTART_KMH)) >= 0:
+        problems.append("cut_lag_s が 0〜3 秒の外か、restart_kmh が負")
+    zones = cfg.get("coast_only_m", [])
+    if len(zones) > MAX_COAST_ZONES:
+        problems.append(f"coast_only_m は {MAX_COAST_ZONES} 区間まで（{len(zones)} 区間）")
+    if any(len(z) != 2 or not (0 <= float(z[0]) < lap_m and 0 <= float(z[1]) < lap_m) or float(z[0]) == float(z[1])
+           for z in zones):
+        problems.append("coast_only_m は [開始, 終了] で、どちらも 1 周の内側の違う位置")
+    return problems
+
+
 def check(cfg: dict, text: str) -> list[str]:
     """ファームが設定を採用しない条件（src/main.cpp の isValidStrategyConfig）に当たるものを返す。"""
     lap_m, guard = float(cfg["lap_m"]), float(cfg["guard_kmh"])
@@ -342,6 +415,7 @@ def check(cfg: dict, text: str) -> list[str]:
     if any(s <= 0 for s in splits) or any(b <= a for a, b in zip(splits, splits[1:])):
         problems.append("splits_s が正の昇順でない")
     problems += check_margin(cfg, lap_m)
+    problems += check_crest(cfg, lap_m)
     size = len(text.encode("utf-8"))
     if size > MAX_FILE_BYTES:
         problems.append(f"ファイルが大きすぎる（{size} バイト、上限 {MAX_FILE_BYTES}）")
@@ -349,11 +423,16 @@ def check(cfg: dict, text: str) -> list[str]:
 
 
 def dump(value, depth: int = 0) -> str:
-    """配列を 1 行に収めた JSON 文字列にする。"""
+    """配列を 1 行に収めた JSON 文字列にする。オブジェクトの配列（crest_cut）は要素ごとに 1 行にする。"""
     if isinstance(value, dict):
         pad = "  " * (depth + 1)
         body = ",\n".join(f"{pad}{json.dumps(k)}: {dump(v, depth + 1)}" for k, v in value.items())
         return "{\n" + body + "\n" + "  " * depth + "}"
+    if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+        pad = "  " * (depth + 1)
+        rows = ",\n".join(pad + "{" + ", ".join(f"{json.dumps(k)}: {dump(v)}" for k, v in item.items()) + "}"
+                          for item in value)
+        return "[\n" + rows + "\n" + "  " * depth + "]"
     if isinstance(value, list):
         return "[" + ", ".join(dump(v) for v in value) + "]"
     if isinstance(value, Literal):
@@ -392,6 +471,9 @@ def main() -> int:
     parser.add_argument("--beep", action=argparse.BooleanOptionalAction, help="ブザーを鳴らすか（既定は既存ファイルの値）")
     parser.add_argument("--margin-band", type=float, nargs=2, metavar=("LOW", "HIGH"),
                         help="規定時間に対する余裕の目標の帯 秒（既定は既存ファイルの値、無ければファームの既定 10〜30）")
+    parser.add_argument("--restart-kmh", type=float,
+                        help="頂上の止め時で止めたあと・加速しない区間で「加速」を出す速度 km/h"
+                             f"（既定は既存ファイルの値、無ければ {RESTART_KMH}）")
     parser.add_argument("--dry-run", action="store_true", help="書き込まずに結果だけ表示する")
     args = parser.parse_args()
     output = args.output or REPO / "sd" / f"{args.course}_strategy.json"

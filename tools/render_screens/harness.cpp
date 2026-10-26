@@ -243,5 +243,23 @@ int main(int argc, char** argv) {
   totallaps = 8; reset("su", su.c_str(), false); worktime = 754; Lapcount = 2;
   step(900, 25.2f, false);
   save("map_suzuka_no_plan", false);
+
+  // 鈴鹿の頂上の止め時（sd/suzuka_strategy.json）: S 字の登りで 21 km/h から加速し、表の速度で止めて頂上へ惰行する
+  loadPlan((sd + "/suzuka_strategy.json").c_str());
+  reset("su", su.c_str(), true); worktime = 493; Lapcount = 2;
+  strategy.onLapCrossed(2, 493.0f);
+  limitMargin.onLapCrossed(2, 493.0f);
+  for (float p = 1306.0f; p <= 1405.0f; p += 1.0f) {
+    worktime += 0.2f;
+    step(p, 21.0f + (p - 1306.0f) * 0.1f, true);
+  }
+  save("strategy_crest_burning", true); save("map_crest_burning", false);
+  worktime += 0.2f; step(1414.0f, 33.0f, true);
+  save("strategy_crest_cut_now", true);
+  for (float p = 1416.0f, v = 33.0f; p <= 1500.0f; p += 4.0f, v -= 0.8f) {
+    worktime += 0.4f;
+    step(p, v, false);
+  }
+  save("strategy_crest_cresting", true); save("map_crest_cresting", false);
   return 0;
 }

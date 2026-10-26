@@ -21,7 +21,7 @@ def block(start_pat):
 out = []
 out.append("\n".join(l for l in src.splitlines() if re.match(r"const (float|uint8_t|uint16_t) (controlline_|totallaps_|goal_|limittime_)", l)) + "\n\n")
 for pat in [r"^struct Waypoint \{", r"^double approxDistanceMeters\(", r"^bool lapPositionToLatLng\(",
-            r"^void readStrategyPatternJson\(", r"^bool isValidStrategyPattern\(", r"^bool isValidStrategyConfig\(",
+            r"^void readStrategyPatternJson\(", r"^bool isValidStrategyPattern\(", r"^bool isValidStrategyConfig\(", r"^bool readCrestCutJson\(",
             r"^bool readLimitMarginJson\(", r"^bool parseStrategyConfigJson\(", r"^float currentLapPositionMeters\(",
             r"^void formatMinSec\(", r"^bool formatStrategyCue\(", r"^int limitMarginColor\(", r"^int limitMarginSeconds\(",
             r"^void drawStrategyMode\(", r"^bool getControlLineForLoc\(.*\{$", r"^void drawCourseMapMode\("]:
