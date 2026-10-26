@@ -13,6 +13,12 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
   - final_extra_if_split_over_s      規定時間 - 余裕 - 最終周の所要時間。これより遅く最終周に入ると
                                      惰行で終えたときの余裕が足りない
 
+  - start_m, control_m, race_m      発進位置・コントロールライン（周内位置）と、発進からゴールまでの道のり
+                                     （race_span と同じ。規定時間の仮想車と、規定時間に対する余裕に使う）
+  - limit_s                          パラメータの course からそのまま
+  - plan_step_m, plan_t_s            計画の「道のり → 累積時間」表。splits_s と同じ走行（ずらさない）の速度トレースから、
+                                     道のり 0, 100, 200 m, … の時刻と、最後にゴールの時刻を取る（ゴール時の余裕の予測に使う）
+
 最終周の 2 項目は、加速開始位置を ±30 m ずらした 3 通りのうち完走側（回数は最大、所要時間は最長）を採る。
 
 パラメータに "phases"（周ごとのパターン。練習走行用）があるときは探索をせず、書かれたとおりに作る:
@@ -25,6 +31,7 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
 オプションで与える:
   - fallback の v_off / marks_m（--fallback-v-off / --fallback-marks。final_lap_marks は計算し直す）
   - fuel_warn_mpa（--fuel-warn-mpa）, beep（--beep / --no-beep）
+  - margin_band_s（--margin-band。規定時間に対する余裕の目標の帯 [下限, 上限] 秒。無ければファームの既定 10〜30 秒）
 
 ECU 側の形式が変わったことに気づけるよう、次の 2 つの版数を照合する。違えば何も書き出さない:
   - パラメータ JSON の "format_version"        ↔ PARAMS_FORMAT_VERSION
@@ -36,6 +43,7 @@ ECU 側の形式が変わったことに気づけるよう、次の 2 つの版�
   python3 tools/make_strategy_json.py motegi              # → sd/motegi_strategy.json
   python3 tools/make_strategy_json.py suzuka --target 38:30
   python3 tools/make_strategy_json.py suzuka --params ../UNOR4_Chibi-T_EFI/tools/strategy/suzuka_2027.json
+  python3 tools/make_strategy_json.py motegi --margin-band 10 30   # 余裕の目標の帯を変える
 
   # 練習走行用（本番用の sd/motegi_strategy.json を上書きしないよう出力先を分ける）
   python3 tools/make_strategy_json.py motegi --params ../UNOR4_Chibi-T_EFI/tools/strategy/practice_motegi_2026.json \
@@ -64,8 +72,11 @@ SIM_INTERFACE_VERSION = 4  # strategy_sim.py の INTERFACE_VERSION
 MAX_PATTERNS = 2  # 通常パターンと予備パターン
 MAX_MARKS = 6
 MAX_SPLITS = 12
-MAX_FILE_BYTES = 1535  # STRATEGY_FILE_BUFFER_SIZE - 1
+MAX_PLAN_POINTS = 200  # include/LimitMargin.h
+MAX_FILE_BYTES = 4095  # STRATEGY_FILE_BUFFER_SIZE - 1
 MAX_V_OFF_KMH = 60.0
+
+PLAN_STEP_M = 100  # 計画の「道のり → 累積時間」表の間隔
 
 
 class Literal(str):
@@ -182,6 +193,24 @@ def number(value: float):
     return int(value) if float(value).is_integer() else value
 
 
+def plan_table(trace: list, s0: float, race_m: float, goal_s: float) -> list:
+    """計画の「道のり → 累積時間」表。道のり 0, PLAN_STEP_M, 2·PLAN_STEP_M, … の時刻と、最後にゴールの時刻。
+
+    trace は simulate(trace=..., trace_every=1) の (累積時間, コース距離, …) の並び。
+    """
+    pts = [(0.0, 0.0)] + [(s - s0, t) for t, s, *_ in trace]
+    table, i, d = [], 0, 0.0
+    while d < race_m:
+        while i + 2 < len(pts) and pts[i + 1][0] < d:
+            i += 1
+        (d0, t0), (d1, t1) = pts[i], pts[i + 1]
+        t = t0 + (d - d0) / (d1 - d0) * (t1 - t0) if d1 > d0 else t0  # 発進直後は道のりが 0 のままの行が続く
+        table.append(number(round(t, 1)))
+        d += PLAN_STEP_M
+    table.append(number(round(goal_s, 1)))
+    return table
+
+
 def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, list[str]]:
     """(設定ファイルの内容, 注意書き) を返す。"""
     c = p["course"]
@@ -203,7 +232,8 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
     if count < len(final_marks):
         cfg["final_extra_if_split_over_s"] = math.floor(limit - sim.HOME_MARGIN_S - longest)
     cfg["guard_kmh"] = guard
-    nominal = sim.simulate(p, course, v_off, marks=marks, v_on=guard, switches=switches)
+    trace = []
+    nominal = sim.simulate(p, course, v_off, marks=marks, v_on=guard, switches=switches, trace=trace, trace_every=1)
     cfg["splits_s"] = [round(t) for t, _, _ in nominal["crossings"][:laps]]  # 最後はゴールの目標時間
 
     kept = existing.get("fallback") or {}
@@ -232,6 +262,24 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
             cfg[key] = existing[key]
         else:
             notes.append(f"{key}: 既存の値も指定も無いので書き出しません")
+
+    # 規定時間の仮想車と、ゴール時の余裕の予測
+    s0, total, _ = sim.race_span(c, course.lap_m)
+    race_m = total - s0
+    cfg["start_m"] = number(s0)
+    cfg["control_m"] = number(sim.control_m(c))
+    cfg["race_m"] = round(race_m, 2)
+    cfg["limit_s"] = limit
+    if args.margin_band is not None:
+        cfg["margin_band_s"] = [number(v) for v in args.margin_band]
+    elif "margin_band_s" in existing:
+        cfg["margin_band_s"] = existing["margin_band_s"]
+    else:
+        notes.append("margin_band_s: 既存の値も指定も無いので書き出しません（ファームの既定 10〜30 秒）")
+    cfg["plan_step_m"] = PLAN_STEP_M
+    cfg["plan_t_s"] = plan_table(trace, s0, race_m, nominal["time_s"])
+    notes.append(f"規定時間の仮想車: 道のり {race_m:.0f} m ÷ 規定 {sim.mmss(limit)} = 平均 {race_m / limit * 3.6:.2f} km/h"
+                 f"、計画のゴールで規定まで {limit - nominal['time_s']:+.0f} 秒")
     return cfg, notes
 
 
@@ -249,6 +297,27 @@ def check_pattern(name: str, pattern: dict, lap_m: float, guard: float) -> list[
     return problems
 
 
+def check_margin(cfg: dict, lap_m: float) -> list[str]:
+    """規定時間に対する余裕の項目で、ファームが採用しない条件（include/LimitMargin.h の isValidConfig）。"""
+    problems = []
+    race_m, limit_s = float(cfg["race_m"]), float(cfg["limit_s"])
+    if race_m <= 0 or limit_s <= 0:
+        problems.append("race_m か limit_s が 0 以下")
+    if any(not 0 <= float(cfg[k]) < lap_m for k in ("start_m", "control_m")):
+        problems.append(f"start_m か control_m が 1 周の距離 {lap_m} m の外")
+    band = cfg.get("margin_band_s")
+    if band is not None and (len(band) != 2 or float(band[0]) > float(band[1])):
+        problems.append("margin_band_s は [下限, 上限] で下限 ≦ 上限")
+    plan, step = [float(t) for t in cfg["plan_t_s"]], float(cfg["plan_step_m"])
+    if not 2 <= len(plan) <= MAX_PLAN_POINTS:
+        problems.append(f"plan_t_s は 2〜{MAX_PLAN_POINTS} 個（{len(plan)} 個）")
+    elif not (len(plan) - 2) * step < race_m <= (len(plan) - 1) * step + 0.5:
+        problems.append("plan_t_s の個数が race_m と plan_step_m に合わない")
+    if plan[0] < 0 or any(b <= a for a, b in zip(plan, plan[1:])):
+        problems.append("plan_t_s が 0 以上の昇順でない")
+    return problems
+
+
 def check(cfg: dict, text: str) -> list[str]:
     """ファームが設定を採用しない条件（src/main.cpp の isValidStrategyConfig）に当たるものを返す。"""
     lap_m, guard = float(cfg["lap_m"]), float(cfg["guard_kmh"])
@@ -263,6 +332,7 @@ def check(cfg: dict, text: str) -> list[str]:
         problems.append(f"splits_s は {MAX_SPLITS} 個まで（{len(splits)} 個）")
     if any(s <= 0 for s in splits) or any(b <= a for a, b in zip(splits, splits[1:])):
         problems.append("splits_s が正の昇順でない")
+    problems += check_margin(cfg, lap_m)
     size = len(text.encode("utf-8"))
     if size > MAX_FILE_BYTES:
         problems.append(f"ファイルが大きすぎる（{size} バイト、上限 {MAX_FILE_BYTES}）")
@@ -309,6 +379,8 @@ def main() -> int:
                         help="予備パターンの加速開始位置 m（既定は既存ファイルの値）")
     parser.add_argument("--fuel-warn-mpa", type=float, help="燃圧の警告しきい値 MPa（既定は既存ファイルの値）")
     parser.add_argument("--beep", action=argparse.BooleanOptionalAction, help="ブザーを鳴らすか（既定は既存ファイルの値）")
+    parser.add_argument("--margin-band", type=float, nargs=2, metavar=("LOW", "HIGH"),
+                        help="規定時間に対する余裕の目標の帯 秒（既定は既存ファイルの値、無ければファームの既定 10〜30）")
     parser.add_argument("--dry-run", action="store_true", help="書き込まずに結果だけ表示する")
     args = parser.parse_args()
     output = args.output or REPO / "sd" / f"{args.course}_strategy.json"
