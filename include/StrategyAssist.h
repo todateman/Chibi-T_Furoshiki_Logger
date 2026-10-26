@@ -11,6 +11,9 @@ namespace StrategyAssist {
 
 constexpr uint8_t MAX_MARKS = 6;    // 1周あたりの加速開始位置の最大数
 constexpr uint8_t MAX_SPLITS = 12;  // 目標通過タイムの最大数
+constexpr uint8_t MAX_CRESTS = 2;   // 頂上の止め時の区間の最大数
+constexpr uint8_t MAX_CREST_POINTS = 64;  // 頂上の止め時の表の最大点数（1区間あたり）
+constexpr uint8_t MAX_COAST_ZONES = 4;    // 加速しない区間の最大数
 
 constexpr uint32_t ENGINE_HOLD_MS = 300;    // 噴射0が一瞬混じっても「加速中」を保つ時間
 constexpr uint32_t BURN_CONFIRM_MS = 1500;  // これだけ噴射が続いたら始動成功とみなす（スタータのタイムアウト1秒より長く）
@@ -25,6 +28,16 @@ struct Pattern {
   uint8_t markCount = 0;       // 加速開始位置の数
   float marksM[MAX_MARKS] = {};  // 加速開始位置 [m]（スタートラインから、昇順）
   uint8_t finalLapMarks = 0;   // 最終周で有効にする目印の数（先頭から）
+};
+
+// 頂上の止め時: 頂上の手前の登り（fromM〜crestM）で加速しているとき、惰行で頂上を目標速度で越えられる速度に
+// 達したらエンジンを止める。その速度の表（位置 fromM, fromM+stepM, … と最後に crestM）
+struct CrestCut {
+  float fromM = 0.0f;
+  float crestM = 0.0f;
+  float stepM = 0.0f;
+  uint8_t count = 0;
+  float kmh[MAX_CREST_POINTS] = {};
 };
 
 struct Config {
@@ -42,7 +55,39 @@ struct Config {
   float finalExtraIfSplitOverS = 0.0f; // 最終周に入る通過タイムがこれを超えたら全目印を有効にする（0以下で無効）
   float fuelWarnMpa = 0.0f;    // 加速中の燃圧がこれを下回ったら警告（0で無効）
   bool beep = true;
+  uint8_t crestCount = 0;
+  CrestCut crests[MAX_CRESTS];  // 頂上の止め時（周内位置の昇順）
+  float cutLagS = 0.0f;         // 止める合図からエンジンが止まるまでの遅れ [s]（頂上の止め時はこの先の位置で表を引く）
+  float restartKmh = 5.0f;      // 頂上の止め時で止めたあと・加速しない区間では、この速度まで落ちるまで「加速」を出さない
+  uint8_t coastZoneCount = 0;
+  float coastZonesM[MAX_COAST_ZONES][2] = {};  // 加速しない区間 [開始 m, 終了 m]（開始 > 終了なら周の終端をまたぐ）
 };
+
+// 周内位置 pos が区間 [fromM, toM] の中か（fromM > toM なら周の終端をまたぐ区間）
+inline bool inZone(float pos, float fromM, float toM) {
+  return fromM <= toM ? (pos >= fromM && pos <= toM) : (pos >= fromM || pos <= toM);
+}
+
+// 頂上の止め時の表の i 番目の位置 [m]（最後の点は頂上）
+inline float crestPointM(const CrestCut& cc, uint8_t i) {
+  const float m = cc.fromM + cc.stepM * static_cast<float>(i);
+  return m < cc.crestM ? m : cc.crestM;
+}
+
+// 位置 pos でエンジンを止めてよい速度 [km/h]（表を直線で補間）。区間の外はNAN
+inline float crestCutKmh(const CrestCut& cc, float pos) {
+  if (cc.count < 2 || cc.stepM <= 0.0f || !(pos >= cc.fromM && pos <= cc.crestM)) {
+    return NAN;
+  }
+  uint8_t i = static_cast<uint8_t>((pos - cc.fromM) / cc.stepM);
+  if (i > cc.count - 2) {
+    i = cc.count - 2;
+  }
+  const float m0 = crestPointM(cc, i);
+  const float m1 = crestPointM(cc, i + 1);
+  const float t = (m1 > m0) ? (pos - m0) / (m1 - m0) : 0.0f;
+  return cc.kmh[i] + (cc.kmh[i + 1] - cc.kmh[i]) * t;
+}
 
 // 周回通過時の遅れ（+ が遅れ）から、次の周の加速停止速度の上げ幅 [km/h] を決める
 inline float paceBumpKmh(float delayS) {
@@ -102,6 +147,9 @@ struct Input {
 struct Output {
   Cue cue = Cue::Off;
   float vOffKmh = 0.0f;      // 今の周の加速停止速度（補正込み）
+  float cutKmh = 0.0f;       // 今エンジンを止める速度（頂上の止め時の区間で加速中は表の値、それ以外は vOffKmh）
+  bool crestZone = false;    // 頂上の止め時の区間で加速中（cutKmh は表の値）
+  bool cresting = false;     // 頂上の止め時で止め、頂上へ惰行している
   float bumpKmh = 0.0f;      // 加速停止速度の補正量
   bool guard = false;        // 最低限界速度で「加速」を出している
   int8_t nextMark = -1;      // 次の目印の番号（無ければ -1）
@@ -166,6 +214,7 @@ public:
     o.usingFallback = useFallback_;
     o.bumpKmh = bumpKmh_;
     o.vOffKmh = pat.vOffKmh + bumpKmh_;
+    o.cutKmh = o.vOffKmh;
     o.hasSplit = hasSplit_;
     o.splitLap = splitLap_;
     o.splitS = splitS_;
@@ -195,6 +244,10 @@ public:
     } else if (engineOn_ && in.nowMs - lastEngineOnMs_ > ENGINE_HOLD_MS) {
       engineOn_ = false;
     }
+    if (!engineOn_ && crestPending_ >= 0) {
+      cresting_ = crestPending_;  // 頂上の止め時の合図でエンジンが止まった
+      crestPending_ = -1;
+    }
     const bool burnConfirmed = engineOn_ && in.nowMs - burnStartMs_ >= BURN_CONFIRM_MS;
 
     if (engineOn_ && in.nowMs - burnStartMs_ >= FUEL_CHECK_DELAY_MS &&
@@ -209,6 +262,7 @@ public:
         resetRun();
         o.bumpKmh = 0.0f;
         o.vOffKmh = pat.vOffKmh;
+        o.cutKmh = pat.vOffKmh;
         o.hasSplit = false;
         o.delayS = NAN;
       }
@@ -258,6 +312,26 @@ public:
     }
     posWasValid_ = posValid;
 
+    // 頂上の止め時の区間と、加速しない区間（位置が分かるときだけ）
+    int8_t crest = -1;
+    bool coastOnly = false;
+    if (posValid) {
+      for (uint8_t i = 0; i < cfg_.crestCount; i++) {
+        if (pos >= cfg_.crests[i].fromM && pos <= cfg_.crests[i].crestM) {
+          crest = static_cast<int8_t>(i);
+        }
+      }
+      for (uint8_t i = 0; i < cfg_.coastZoneCount; i++) {
+        coastOnly = coastOnly || inZone(pos, cfg_.coastZonesM[i][0], cfg_.coastZonesM[i][1]);
+      }
+      if (cresting_ >= 0 && crest != cresting_) {
+        cresting_ = -1;  // 頂上を越えた
+      }
+    }
+    o.cresting = cresting_ >= 0;
+    // 頂上へ惰行している・加速しない区間では、止まりそうになるまで「加速」を出さない
+    const bool holdBurn = posValid && (o.cresting || coastOnly);
+
     // 目印の通過判定
     int8_t pending = -1;
     if (posValid) {
@@ -271,7 +345,7 @@ public:
         if (seen_[i] && !done_[i]) {
           const bool pastWindow = pos >= pat.marksM[i] + cfg_.missWindowM;
           const bool nextIsNear = i + 1 < activeMarks && pos >= pat.marksM[i + 1] - cfg_.approachM;
-          if (burnConfirmed || pastWindow || nextIsNear) {
+          if (burnConfirmed || pastWindow || nextIsNear || holdBurn) {
             done_[i] = true;
           } else if (pending < 0) {
             pending = static_cast<int8_t>(i);
@@ -293,9 +367,25 @@ public:
     }
 
     // 合図の決定
-    if (engineOn_) {
+    const float guardKmh = (holdBurn && cfg_.restartKmh < cfg_.guardKmh) ? cfg_.restartKmh : cfg_.guardKmh;
+    if (engineOn_ && coastOnly) {
+      o.cue = Cue::CutNow;  // 下りなどに入ったら止める
+    } else if (engineOn_ && crest >= 0) {
+      // 頂上の止め時: 合図からエンジンが止まるまでの遅れのあいだに進む先の位置で、止めてよい速度を引く
+      // （加速度の分は見込まない。合図はわずかに遅れ、頂上の速度は高めになる）
+      const CrestCut& cc = cfg_.crests[crest];
+      const float needKmh = crestCutKmh(cc, pos + in.speedKmh / 3.6f * cfg_.cutLagS);
+      o.crestZone = true;
+      o.cutKmh = isfinite(needKmh) ? needKmh : crestCutKmh(cc, pos);
+      if (crestPending_ >= 0 || (isfinite(needKmh) && in.speedKmh >= needKmh)) {
+        crestPending_ = crest;
+        o.cue = Cue::CutNow;
+      } else {
+        o.cue = Cue::Burning;  // 頂上の手前の登りでは、加速停止速度で止めず頂上の止め時まで回す
+      }
+    } else if (engineOn_) {
       o.cue = (in.speedKmh >= o.vOffKmh) ? Cue::CutNow : Cue::Burning;
-    } else if (in.speedKmh >= STOPPED_KMH && in.speedKmh <= cfg_.guardKmh) {
+    } else if (in.speedKmh >= STOPPED_KMH && in.speedKmh <= guardKmh) {
       o.cue = Cue::BurnNow;
       o.guard = true;
     } else if (pending >= 0) {
@@ -340,6 +430,8 @@ private:
     delayS_ = NAN;
     bumpKmh_ = 0.0f;
     finalAllMarks_ = false;
+    crestPending_ = -1;
+    cresting_ = -1;
   }
 
   Config cfg_;
@@ -362,6 +454,8 @@ private:
   float delayS_ = NAN;
   float bumpKmh_ = 0.0f;
   bool finalAllMarks_ = false;
+  int8_t crestPending_ = -1;  // 頂上の止め時の「停止」を出した区間（エンジンが止まるまで保持）
+  int8_t cresting_ = -1;      // 頂上の止め時で止め、頂上へ惰行している区間
 };
 
 }  // namespace StrategyAssist

@@ -9,9 +9,11 @@
 # 使い方:
 #   tools/render_screens/render.sh             # .pio/render_screens/out/ に全場面の PNG を出す（確認用）
 #   tools/render_screens/render.sh --install   # さらに README で使う画像を docs/ へ上書きする
+#   tools/render_screens/render.sh --video suzuka   # 仮想走行の動画（ブザーの音つき）を .pio/render_screens/video/suzuka_sim.mp4 に出す
+#                                                   # （motegi も可。設定は sd/<コース>_strategy.json。ffmpeg が要る）
 #
 # 場面（位置・速度・遅れなど）は harness.cpp の main() にある。描画関数の名前や、描画に使う関数・変数が
-# 変わったら extract.py の抜き出し対象と harness.cpp の宣言を合わせる。
+# 変わったら extract.py の抜き出し対象と common.h の宣言を合わせる。
 # M5GFX を更新したら .pio/render_screens/obj を消してから回す（ライブラリのオブジェクトを使い回しているため）。
 set -euo pipefail
 
@@ -45,6 +47,28 @@ for f in "$G"/lgfx/utility/*.c "$G"/lgfx/Fonts/efont/*.c "$G"/lgfx/Fonts/IPA/*.c
 done
 
 python3 "$HERE/extract.py" "$R/src/main.cpp" extracted.inc
+
+# 仮想走行の動画: 走行支援画面と現在地画面を並べ、ブザーの音を付けた MP4（等倍、10 fps）
+if [ "${1:-}" = "--video" ]; then
+  COURSE=${2:-suzuka}
+  case "$COURSE" in
+    suzuka) SU=1 ;;
+    motegi) SU=0 ;;
+    *) echo "コースは suzuka か motegi で指定してください" >&2; exit 1 ;;
+  esac
+  command -v ffmpeg >/dev/null || { echo "ffmpeg が見つかりません（macOS: brew install ffmpeg）" >&2; exit 1; }
+  mkdir -p "$B/video"
+  clang++ -std=gnu++17 $CF -DSTRATEGY_SIM_SUZUKA=$SU -I"$B" -I"$R/include" -I"$J" -c "$HERE/video.cpp" -o "video_$COURSE.o"
+  clang++ "video_$COURSE.o" obj/*.o $("$SDL2_CONFIG" --libs) -o "video_$COURSE"
+  ./"video_$COURSE" "$R/sd" "video/$COURSE.wav" |
+    ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s 640x240 -r 10 -i - \
+      -vf scale=1280:480:flags=neighbor -c:v libx264 -pix_fmt yuv420p -crf 20 -tune animation "video/${COURSE}_noaudio.mp4"
+  ffmpeg -y -loglevel error -i "video/${COURSE}_noaudio.mp4" -i "video/$COURSE.wav" -c:v copy -c:a aac -b:a 96k "video/${COURSE}_sim.mp4"
+  rm -f "video/${COURSE}_noaudio.mp4" "video/$COURSE.wav"
+  echo "出力: $B/video/${COURSE}_sim.mp4"
+  exit 0
+fi
+
 clang++ -std=gnu++17 $CF -I"$B" -I"$R/include" -I"$J" -c "$HERE/harness.cpp" -o harness.o
 clang++ harness.o obj/*.o $("$SDL2_CONFIG" --libs) -o harness
 rm -f out/*
@@ -54,7 +78,7 @@ rm -f out/*.ppm
 echo "出力: $B/out"
 
 if [ "${1:-}" = "--install" ]; then
-  for n in idle coast approach burn_now burning cut_now guard coast_home fuel_low fallback; do
+  for n in idle coast approach burn_now burning cut_now guard coast_home fuel_low fallback crest_burning crest_cut_now crest_cresting; do
     cp "out/strategy_$n.png" "$R/docs/strategy_screen_$n.png"
   done
   for n in approach burn_now cut_now coast_home fallback_fuel_low suzuka_no_plan; do

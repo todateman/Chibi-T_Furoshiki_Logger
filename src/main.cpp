@@ -105,6 +105,9 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #ifndef STRATEGY_SIM
 #define STRATEGY_SIM 0  // 机上確認用の仮想走行（0:無効, 1以上:時間の倍率）。本番は必ず0
 #endif
+#ifndef STRATEGY_SIM_SUZUKA
+#define STRATEGY_SIM_SUZUKA 0  // 仮想走行のコース（0:もてぎ, 1:鈴鹿）
+#endif
 #define STRATEGY_FILE_BUFFER_SIZE 4096        // 走行支援の設定ファイル(JSON)の最大サイズ（計画の「道のり → 累積時間」表を含む）
 #define STRATEGY_POSITION_MAX_AGE_MS 3000UL   // GNSS測位がこれより古ければ位置不明として扱う
 #define STRATEGY_OFF_COURSE_M 60.0            // ウェイポイントを結んだ線からこれ以上離れていればコース外として扱う
@@ -252,10 +255,32 @@ unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセッ
 // サーキットごとの設定
 const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの規定周回数
 const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの規定周回数
-const float controlline_la1_su = 34.845093;  // 鈴鹿サーキット東コースのコントロールライン(外側)の緯度
-const float controlline_ln1_su = 136.538735;  // 鈴鹿サーキット東コースのコントロールライン(外側)の経度
-const float controlline_la2_su = 34.844847;  // 鈴鹿サーキット東コースのコントロールライン(内側)の緯度
-const float controlline_ln2_su = 136.538379;  // 鈴鹿サーキット東コースのコントロールライン(内側)の経度
+// 鈴鹿は、スタートライン（ピットレーン）・計測ライン・ゴールライン（最終コーナーの出口で分かれるピット入口の道）・コントロールライン（本コース）が、
+// 路面の白線（ウェイポイント ID 1 の約 6 m 手前。以前はここで数えていた）とは別の場所にある。
+// 位置は 2026 年「競技会の流れ」の図・自チームのピットインの GPS の軌跡・車載動画（ゴールは 2015 年 名城大 SPICA の発進から
+// 公式記録 26:34.288 後の位置、コントロールラインは自チームの 2024 年本番のドライブモニター映像）から推定した仮の値で、
+// 2027 年の大会当日のコースウォークで確定させる（ECU リポジトリの document/suzuka_strategy_2027.md）。
+// 距離はウェイポイント ID 1 から、横位置はウェイポイントの線から（+ が進行方向の右手 = 内側）
+// 競技規則（第 4 項 スタート）から、スタートライン = 車両を発進させる位置（110 m のピットレーン）、
+// 計測ライン = その 2 m 先でトランスポンダが通過を検出して計時を始める位置（112 m）、コントロールライン = 計測ラインの延長線上とした。
+// 線は本コースだけを横切る（外側 15 m〜内側 16 m）。ピットレーンの計測ライン（内側 18〜32 m）には掛けないので、
+// ピットレーンから発進しても数えない（本コースから発進しても、発進直後の通過は走行距離のガードで数えない）
+const float controlline_la1_su = 34.844279;  // 鈴鹿サーキット東コースのコントロールライン(外側)の緯度
+const float controlline_ln1_su = 136.539568;  // 鈴鹿サーキット東コースのコントロールライン(外側)の経度
+const float controlline_la2_su = 34.844102;  // 鈴鹿サーキット東コースのコントロールライン(内側)の緯度
+const float controlline_ln2_su = 136.539306;  // 鈴鹿サーキット東コースのコントロールライン(内側)の経度
+// ゴールライン: 2,135 m のピット入口の道の上（内側 9〜21 m）。最終周はコントロールラインを通らずにここでゴールするので、
+// 最終周だけ、ここを横切ったら周回数を進める
+const float goalline_la1_su = 34.845558;  // 鈴鹿サーキット東コースのゴールライン(コース側)の緯度
+const float goalline_ln1_su = 136.537863;  // 鈴鹿サーキット東コースのゴールライン(コース側)の経度
+const float goalline_la2_su = 34.845475;  // 鈴鹿サーキット東コースのゴールライン(内側)の緯度
+const float goalline_ln2_su = 136.537780;  // 鈴鹿サーキット東コースのゴールライン(内側)の経度
+// スタートライン: 110 m のピットレーン上（内側 18〜32 m）。計測ラインはその 2 m 先（112 m）。
+// どちらも周回の数え方には使わない（発進は ECU の走行時間で判定する）。コースウォークで確かめる位置の記録として持つ
+const float startline_la1_su = 34.844106;  // 鈴鹿サーキット東コースのスタートライン(コース側)の緯度
+const float startline_ln1_su = 136.539274;  // 鈴鹿サーキット東コースのスタートライン(コース側)の経度
+const float startline_la2_su = 34.844026;  // 鈴鹿サーキット東コースのスタートライン(内側)の緯度
+const float startline_ln2_su = 136.539156;  // 鈴鹿サーキット東コースのスタートライン(内側)の経度
 // もてぎはコース上のコントロールライン（ゴールラインと同じ並び、ウェイポイント ID 1 の約 117 m 手前）。2026/10/24 のコースウォークで確認。
 // ウェイポイントの線から外側へ約 30 m（本コースの外側の縁を越える）、内側へ約 70 m（ゴールレーンを越える）
 const float controlline_la1_mo = 36.533579;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の緯度
@@ -716,6 +741,81 @@ bool isValidStrategyConfig(const StrategyAssist::Config& cfg) {
       return false;
     }
   }
+  // 頂上の止め時: 区間は1周の内側で昇順・重ならない。表の最後の点が頂上に当たる個数で、速度は正
+  for (uint8_t i = 0; i < cfg.crestCount; i++) {
+    const StrategyAssist::CrestCut& cc = cfg.crests[i];
+    if (!(cc.fromM >= 0.0f && cc.fromM < cc.crestM && cc.crestM < cfg.lapM && cc.stepM > 0.0f) || cc.count < 2) {
+      return false;
+    }
+    if (!(cc.fromM + cc.stepM * (cc.count - 2) < cc.crestM && cc.crestM <= cc.fromM + cc.stepM * (cc.count - 1) + 0.5f)) {
+      return false;
+    }
+    for (uint8_t k = 0; k < cc.count; k++) {
+      if (!isfinite(cc.kmh[k]) || cc.kmh[k] <= 0.0f) {
+        return false;
+      }
+    }
+    if (i > 0 && cc.fromM <= cfg.crests[i - 1].crestM) {
+      return false;
+    }
+  }
+  if (!(cfg.cutLagS >= 0.0f && cfg.cutLagS <= 3.0f) || !(cfg.restartKmh >= 0.0f)) {
+    return false;
+  }
+  for (uint8_t i = 0; i < cfg.coastZoneCount; i++) {
+    const float from = cfg.coastZonesM[i][0];
+    const float to = cfg.coastZonesM[i][1];
+    if (!(from >= 0.0f && from < cfg.lapM && to >= 0.0f && to < cfg.lapM) || from == to) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 頂上の止め時・加速しない区間をJSONから読み込む関数。表や区間が多すぎる場合はfalseを返す
+bool readCrestCutJson(JsonVariantConst root, StrategyAssist::Config& cfg) {
+  JsonArrayConst crests = root["crest_cut"];
+  if (!crests.isNull()) {
+    if (crests.size() > StrategyAssist::MAX_CRESTS) {
+      Serial.printf("[Strategy] crest_cut has too many zones: %u\n", static_cast<unsigned int>(crests.size()));
+      return false;
+    }
+    cfg.crestCount = 0;
+    for (JsonVariantConst src : crests) {
+      StrategyAssist::CrestCut& cc = cfg.crests[cfg.crestCount++];
+      cc.fromM = src["from_m"].as<float>();
+      cc.crestM = src["crest_m"].as<float>();
+      cc.stepM = src["step_m"].as<float>();
+      JsonArrayConst kmh = src["kmh"];
+      if (kmh.size() > StrategyAssist::MAX_CREST_POINTS) {
+        Serial.printf("[Strategy] crest_cut kmh has too many points: %u\n", static_cast<unsigned int>(kmh.size()));
+        return false;
+      }
+      cc.count = 0;
+      for (JsonVariantConst v : kmh) {
+        cc.kmh[cc.count++] = v.as<float>();
+      }
+    }
+  }
+  if (root["cut_lag_s"].is<float>()) { cfg.cutLagS = root["cut_lag_s"].as<float>(); }
+  if (root["restart_kmh"].is<float>()) { cfg.restartKmh = root["restart_kmh"].as<float>(); }
+  JsonArrayConst zones = root["coast_only_m"];
+  if (!zones.isNull()) {
+    if (zones.size() > StrategyAssist::MAX_COAST_ZONES) {
+      Serial.printf("[Strategy] coast_only_m has too many zones: %u\n", static_cast<unsigned int>(zones.size()));
+      return false;
+    }
+    cfg.coastZoneCount = 0;
+    for (JsonVariantConst zone : zones) {
+      if (zone.size() != 2) {
+        Serial.println("[Strategy] coast_only_m needs [from, to]");
+        return false;
+      }
+      cfg.coastZonesM[cfg.coastZoneCount][0] = zone[0].as<float>();
+      cfg.coastZonesM[cfg.coastZoneCount][1] = zone[1].as<float>();
+      cfg.coastZoneCount++;
+    }
+  }
   return true;
 }
 
@@ -782,6 +882,9 @@ bool parseStrategyConfigJson(const char* json, StrategyAssist::Config& cfg, Limi
       }
       cfg.splitsS[cfg.splitCount++] = split.as<float>();
     }
+  }
+  if (!readCrestCutJson(root, cfg)) {
+    return false;
   }
   return readLimitMarginJson(root, cfg.lapM, mcfg);
 }
@@ -955,16 +1058,20 @@ bool formatStrategyCue(const StrategyAssist::Output& out, char* buf, size_t bufS
       snprintf(buf, bufSize, "スタート待ち");
       break;
     case Cue::Approach:
-      caution = true;
+      caution = !out.cresting;
       // fallthrough
     case Cue::Coast:
-      snprintf(buf, bufSize, "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      if (out.cresting) {
+        snprintf(buf, bufSize, "頂上まで惰行");
+      } else {
+        snprintf(buf, bufSize, "加速まで %dm", static_cast<int>(out.nextMarkDistM));
+      }
       break;
     case Cue::BurnNow:
       snprintf(buf, bufSize, out.guard ? "加速! 速度低下" : "加速!");
       break;
     case Cue::Burning:
-      snprintf(buf, bufSize, "%.1fで停止", out.vOffKmh);
+      snprintf(buf, bufSize, out.crestZone ? "頂上%.1fで停止" : "%.1fで停止", out.cutKmh);
       break;
     case Cue::CutNow:
       snprintf(buf, bufSize, "停止!");
@@ -1052,12 +1159,14 @@ void drawStrategyMode() {
   lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
   lcd_s.setTextSize(2);
   lcd_s.setTextDatum(TR_DATUM);
-  if (plainBg && out.bumpKmh > 0.0f) {
+  // 頂上の止め時の区間で加速中は、位置ごとの止める速度を出す（補正の色は付けない）
+  const bool bumpColor = plainBg && !out.crestZone;
+  if (bumpColor && out.bumpKmh > 0.0f) {
     lcd_s.setTextColor(TFT_MAGENTA);  // 遅れを取り戻すために上げている
-  } else if (plainBg && out.bumpKmh < 0.0f) {
+  } else if (bumpColor && out.bumpKmh < 0.0f) {
     lcd_s.setTextColor(TFT_CYAN);
   }
-  snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+  snprintf(buf, sizeof(buf), "%.1f", out.cutKmh);
   lcd_s.drawString(buf, 316, 26);
   lcd_s.setTextColor(fg);
   lcd_s.setTextSize(1);
@@ -1069,7 +1178,7 @@ void drawStrategyMode() {
   lcd_s.drawRect(barX - 1, 70, barW + 2, 12, fg);
   lcd_s.fillRect(barX, 71, static_cast<int>(constrain(speed, 0.0f, barMaxKmh) / barMaxKmh * barW), 10, fg);
   const int guardX = barX + static_cast<int>(constrain(cfg.guardKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
-  const int vOffX = barX + static_cast<int>(constrain(out.vOffKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
+  const int vOffX = barX + static_cast<int>(constrain(out.cutKmh, 0.0f, barMaxKmh) / barMaxKmh * barW);
   if (cfg.guardKmh > 0.0f) {
     lcd_s.fillRect(guardX - 1, 67, 3, 18, plainBg ? TFT_YELLOW : fg);
   }
@@ -1392,14 +1501,15 @@ void drawCourseMapMode() {
   lcd_s.drawString(buf, 4, 164);
 
   // 右上: 今の周の加速停止速度（遅れを取り戻すために上げていればマゼンタ、下げていれば水色）
+  // 頂上の止め時の区間で加速中は、位置ごとの止める速度
   lcd_s.setTextDatum(TR_DATUM);
   if (cfg.enabled) {
-    if (out.bumpKmh > 0.0f) {
+    if (!out.crestZone && out.bumpKmh > 0.0f) {
       lcd_s.setTextColor(TFT_MAGENTA);
-    } else if (out.bumpKmh < 0.0f) {
+    } else if (!out.crestZone && out.bumpKmh < 0.0f) {
       lcd_s.setTextColor(TFT_CYAN);
     }
-    snprintf(buf, sizeof(buf), "%.1f", out.vOffKmh);
+    snprintf(buf, sizeof(buf), "%.1f", out.cutKmh);
     lcd_s.drawString(buf, 316, 20);
     lcd_s.setTextColor(TFT_WHITE);
   }
@@ -1833,6 +1943,18 @@ bool getControlLineForLoc(const String& loc, double& outLa1, double& outLn1, dou
   return false;
 }
 
+// 現在のロケーションに、コントロールラインとは別のゴールラインがあれば座標を返す関数
+// （鈴鹿はピット入口の道の上。もてぎはゴールラインがコントロールラインと同じ並びにあり、コントロールラインがゴールレーンまで
+// 掛かっているので持たない）
+bool getGoalLineForLoc(const String& loc, double& outLa1, double& outLn1, double& outLa2, double& outLn2) {
+  if (loc == "su") {
+    outLa1 = goalline_la1_su; outLn1 = goalline_ln1_su;
+    outLa2 = goalline_la2_su; outLn2 = goalline_ln2_su;
+    return true;
+  }
+  return false;
+}
+
 // GPSの前回位置→今回位置を結ぶ線分がコントロールラインと交差したか判定し、
 // 交差していればLapcountをインクリメントする関数（多重カウント防止のデバウンス・GPSロスト後の誤検出防止のテレポートガード付き）
 void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, double prevLng) {
@@ -1872,7 +1994,14 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
     return;
   }
 
-  if (segmentsIntersect(prevLat, prevLng, la, ln, clLa1, clLn1, clLa2, clLn2)) {
+  bool crossed = segmentsIntersect(prevLat, prevLng, la, ln, clLa1, clLn1, clLa2, clLn2);
+  // 最終周は、コントロールラインとは別のゴールライン（鈴鹿のピット入口の道）を横切ったときもゴールとして数える
+  double glLa1, glLn1, glLa2, glLn2;
+  if (!crossed && totallaps > 0 && Lapcount == totallaps - 1 && getGoalLineForLoc(Loc, glLa1, glLn1, glLa2, glLn2)) {
+    crossed = segmentsIntersect(prevLat, prevLng, la, ln, glLa1, glLn1, glLa2, glLn2);
+  }
+
+  if (crossed) {
     // ECU受信中は、前回カウントからの走行距離が1周の半分に満たない交差を数えない
     // （グリッドがラインの手前にある場合の発進直後の通過や、ライン付近での二重カウントを防ぐ）
     if (distance < lapCountDistanceBase) {
@@ -2654,9 +2783,25 @@ bool initializePressureSensorForGnssModule() {
 }
 
 #if STRATEGY_SIM
+// 仮想走行の累積距離 [m] でのウェイポイントの標高 [m]（ウェイポイント間を補間する）
+float simAltitudeAt(float simS) {
+  const float lapM = strategy.config().lapM;
+  const float rawPos = fmodf(fmodf(simS, lapM) + lapM, lapM) * (waypointRawLapMeters / lapM);
+  size_t i = 0;
+  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
+    i++;
+  }
+  const Waypoint& from = waypoints[i];
+  const Waypoint& to = waypoints[(i + 1) % waypointCount];
+  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;  // 末尾→先頭の区間は1周の距離まで
+  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  return from.alt + (to.alt - from.alt) * ratio;
+}
+
 // 机上確認用の仮想走行
 // ウェイポイント上を走らせ、位置・速度・噴射・走行時間・燃圧を差し替えて走行支援画面を確認する。
 // 仮想ドライバーは画面の合図どおりに加速・停止する。走行抵抗を2割増しにして、通過タイムの遅れと補正も出るようにしてある。
+// 勾配はウェイポイントの標高から取る（鈴鹿は高低差が約34 mあり、下りで70 km/hを超える）。
 void updateSimulatedRun() {
   static unsigned long lastMs = millis();
   static float simStartS = -8.0f;  // 発進位置 [m]（設定ファイルの start_m。無ければ ID 1 の8 m手前）
@@ -2666,12 +2811,20 @@ void updateSimulatedRun() {
   static float reactS = 0.0f;  // 合図に気づいてから操作するまでの時間 [s]
   static bool launched = false;
   static bool engine = false;
+  static float insideM = 0.0f;  // ウェイポイントを結んだ線から右（内側）へずらす量 [m]（鈴鹿の最終周のピット入口の道）
 
-  // もてぎとして扱う（ウェイポイントと走行支援の設定はloop()側で読み込まれる）
+  // ウェイポイントと走行支援の設定はloop()側で読み込まれる
+#if STRATEGY_SIM_SUZUKA
+  Loc = "su";
+  totallaps = totallaps_su;
+  goal = goal_su;
+  limittime = limittime_su;
+#else
   Loc = "mo";
   totallaps = totallaps_mo;
   goal = goal_mo;
   limittime = limittime_mo;
+#endif
 
   const unsigned long nowMs = millis();
   const float dt = static_cast<float>(nowMs - lastMs) / 1000.0f * static_cast<float>(STRATEGY_SIM);
@@ -2705,10 +2858,16 @@ void updateSimulatedRun() {
     reactS = 0.0f;
   }
 
-  // 運動（勾配は無視）
+  // 運動（発進前は勾配があっても動かさない。ゴール後はブレーキで止める）
   const float kmh = simV * 3.6f;
   float accel = engine ? (1.6f - 0.03f * kmh) : 0.0f;
   accel -= 1.2f * (9.8f * 0.00164f + 0.000391f * simV * simV);
+  if (launched) {
+    accel -= 9.8f * (simAltitudeAt(simS + 15.0f) - simAltitudeAt(simS - 15.0f)) / 30.0f;
+  }
+  if (cue == StrategyAssist::Cue::Finished) {
+    accel -= 1.5f;
+  }
   simV = max(simV + accel * dt, 0.0f);
   simS += simV * dt;
   if (launched) {
@@ -2719,6 +2878,25 @@ void updateSimulatedRun() {
   const double prevLa = la;
   const double prevLn = ln;
   lapPositionToLatLng(simS, la, ln);
+#if STRATEGY_SIM_SUZUKA
+  // 最終周は分岐（約1,990 m）から20 mかけてピット入口の道（コースの約15 m内側）へ移り、ゴールライン（2,135 m）を横切る。
+  // 右回りなので内側は進行方向の右
+  const float lapPos = fmodf(simS, lapM);
+  if (Lapcount >= totallaps || (Lapcount == totallaps - 1 && lapPos >= 1990.0f && lapPos < 2200.0f)) {
+    insideM = max(insideM, constrain((lapPos - 1990.0f) / 20.0f * 15.0f, 0.0f, 15.0f));
+  }
+  double aheadLa, aheadLn;
+  if (insideM > 0.0f && lapPositionToLatLng(simS + 5.0f, aheadLa, aheadLn)) {
+    const double metersPerDegLng = 111320.0 * cos(la * pi / 180.0);
+    const double east = (aheadLn - ln) * metersPerDegLng;
+    const double north = (aheadLa - la) * 111320.0;
+    const double len = sqrt(east * east + north * north);
+    if (len > 0.0) {
+      la += -east / len * insideM / 111320.0;
+      ln += north / len * insideM / metersPerDegLng;
+    }
+  }
+#endif
 
   // ECU・BLEの受信値を差し替える
   receiveECUtime = nowMs;

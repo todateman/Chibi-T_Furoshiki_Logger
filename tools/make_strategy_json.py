@@ -18,6 +18,11 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
   - limit_s                          パラメータの course からそのまま
   - plan_step_m, plan_t_s            計画の「道のり → 累積時間」表。splits_s と同じ走行（ずらさない）の速度トレースから、
                                      道のり 0, 100, 200 m, … の時刻と、最後にゴールの時刻を取る（ゴール時の余裕の予測に使う）
+  - crest_cut, cut_lag_s             パラメータの course.crest_cut があれば、頂上の止め時の表（crest_cut_table を 5 m ごとに引き、
+                                     最後に頂上の目標速度）と、止める合図からエンジンが止まるまでの遅れ（burn.cut_lag_s）
+  - coast_only_m                     パラメータの course.coast_only_zones_m（加速しない区間）
+  - restart_kmh                      頂上の止め時で止めたあと・加速しない区間で「加速」を出す速度。既存ファイルの値か
+                                     --restart-kmh、どちらも無ければ 5 km/h（上の 2 つのどちらかがあるときだけ書く）
 
 最終周の 2 項目は、加速開始位置を ±30 m ずらした 3 通りのうち完走側（回数は最大、所要時間は最長）を採る。
 
@@ -26,6 +31,8 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
   - splits_s は途中でパターンを切り替えて走ったときの通過タイム
   - 最終周の 2 項目は最終周を走る側（予備パターン）について計算する
   - 段階は 2 つまで（ファームが持てるパターンが 2 つのため）
+  - --marks を与えると 1 つ目の段階の marks_m を置き換える（鈴鹿のように速度だけで加速を始めるプランでも、
+    ファームは目印が 1 個以上要る）
 
 パラメータからは決まらない項目は、出力先に既にあるファイルの値を引き継ぐ。初めて作るコースでは
 オプションで与える:
@@ -44,6 +51,10 @@ ECU 側の形式が変わったことに気づけるよう、次の 2 つの版�
   python3 tools/make_strategy_json.py suzuka --target 38:30
   python3 tools/make_strategy_json.py suzuka --params ../UNOR4_Chibi-T_EFI/tools/strategy/suzuka_2027.json
   python3 tools/make_strategy_json.py motegi --margin-band 10 30   # 余裕の目標の帯を変える
+
+  # 2027 鈴鹿（phases の marks_m が空なので目印を与える。21 km/h まで落ちる位置 1,305・1,694 m より先に置き、
+  # 最低限界速度の加速が先に出るようにする）
+  python3 tools/make_strategy_json.py suzuka --marks 1350 1730 --fuel-warn-mpa 0.30 --beep --margin-band 60 900
 
   # 練習走行用（本番用の sd/motegi_strategy.json を上書きしないよう出力先を分ける）
   python3 tools/make_strategy_json.py motegi --params ../UNOR4_Chibi-T_EFI/tools/strategy/practice_motegi_2026.json \
@@ -65,8 +76,8 @@ FIRMWARE = REPO / "src" / "main.cpp"
 COURSES = {"suzuka": "su", "motegi": "mo", "toyota": "to"}
 
 # 対応している ECU 側の版数
-PARAMS_FORMAT_VERSION = 4  # パラメータ JSON の format_version
-SIM_INTERFACE_VERSION = 4  # strategy_sim.py の INTERFACE_VERSION
+PARAMS_FORMAT_VERSION = (4, 5)  # パラメータ JSON の format_version（5 は course.lap_m などを足した版）
+SIM_INTERFACE_VERSION = 5  # strategy_sim.py の INTERFACE_VERSION（5 から 1 周の長さは course.lap_m）
 
 # ファーム側の上限（include/StrategyAssist.h, src/main.cpp）
 MAX_PATTERNS = 2  # 通常パターンと予備パターン
@@ -75,16 +86,22 @@ MAX_SPLITS = 12
 MAX_PLAN_POINTS = 200  # include/LimitMargin.h
 MAX_FILE_BYTES = 4095  # STRATEGY_FILE_BUFFER_SIZE - 1
 MAX_V_OFF_KMH = 60.0
+MAX_CRESTS = 2
+MAX_CREST_POINTS = 64
+MAX_COAST_ZONES = 4
 
 PLAN_STEP_M = 100  # 計画の「道のり → 累積時間」表の間隔
+CREST_STEP_M = 5   # 頂上の止め時の表の間隔（点が多すぎる区間は広げる）
+RESTART_KMH = 5.0  # 頂上の止め時で止めたあと・加速しない区間で「加速」を出す速度の既定（戦略書のドライバー向けの決まり）
 
 
 class Literal(str):
     """既存ファイルの数値を、書かれていた表記のまま持ち回る（0.30 を 0.3 に変えない）。"""
 
 
-def check_version(name: str, found, supported: int) -> None:
-    if found != supported:
+def check_version(name: str, found, supported) -> None:
+    """supported は版数 1 つか、対応する版数のタプル。"""
+    if found not in (supported if isinstance(supported, tuple) else (supported,)):
         raise ValueError(
             f"{name} が対応していない版です（見つかった版: {'なし' if found is None else found}、"
             f"このスクリプトが対応する版: {supported}）\n"
@@ -173,6 +190,8 @@ def plan(sim, p: dict, course, args) -> dict | None:
         raise ValueError("phases のあるパラメータでは探索をしないので、--target は使えません")
     if pol["switches"] and (args.fallback_v_off is not None or args.fallback_marks is not None):
         raise ValueError("phases の 2 つ目の段階が予備パターンになるので、--fallback-v-off / --fallback-marks は使えません")
+    if args.marks is not None:
+        pol["marks"] = sorted(args.marks)
     return sim.evaluate(p, course, pol)
 
 
@@ -211,6 +230,22 @@ def plan_table(trace: list, s0: float, race_m: float, goal_s: float) -> list:
     return table
 
 
+def crest_tables(sim, p: dict, course) -> list:
+    """頂上の止め時の表。crest_cut_table の 1 m ごとの値を CREST_STEP_M ごとに引き、最後に頂上の目標速度を足す。"""
+    req = sim.crest_cut_table(p, course)
+    out = []
+    for cc in sim.crest_cuts(p["course"]):
+        s0, s1 = float(cc["from_m"]), float(cc["crest_m"])
+        step = CREST_STEP_M
+        while math.ceil((s1 - s0) / step) + 1 > MAX_CREST_POINTS:
+            step *= 2
+        n = math.ceil((s1 - s0) / step)  # 頂上より手前の点の数
+        kmh = [round(req[int(s0 + step * i) % int(course.lap_m)], 1) for i in range(n)]
+        out.append({"from_m": number(s0), "crest_m": number(s1), "step_m": step,
+                    "kmh": kmh + [number(float(cc["target_kmh"]))]})
+    return out
+
+
 def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, list[str]]:
     """(設定ファイルの内容, 注意書き) を返す。"""
     c = p["course"]
@@ -224,7 +259,7 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
     count, longest = final_lap(sim, p, course, pol)
     final_marks = switches[-1][2] if switches else marks
     cfg = {
-        "lap_m": round(c["total_m"] / laps, 2),
+        "lap_m": round(course.lap_m, 2),  # 1 周の長さ（course.lap_m。無ければ公式距離 ÷ 周回数）
         "v_off": v_off,
         "marks_m": [number(m) for m in marks],
         "final_lap_marks": len(marks) if switches else count,
@@ -262,6 +297,23 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
             cfg[key] = existing[key]
         else:
             notes.append(f"{key}: 既存の値も指定も無いので書き出しません")
+
+    # 頂上の止め時と加速しない区間
+    crests = crest_tables(sim, p, course) if sim.crest_cuts(c) else []
+    zones = c.get("coast_only_zones_m") or []
+    if crests:
+        cfg["crest_cut"] = crests
+        cfg["cut_lag_s"] = p["burn"].get("cut_lag_s", 0.0)
+        for cc in crests:
+            notes.append(f"頂上の止め時: {cc['from_m']}〜{cc['crest_m']} m、{cc['step_m']} m ごと {len(cc['kmh'])} 点"
+                         f"（{cc['kmh'][0]} → {cc['kmh'][-1]} km/h）")
+    if zones:
+        cfg["coast_only_m"] = [[number(a), number(b)] for a, b in zones]
+    if crests or zones:
+        if args.restart_kmh is not None:
+            cfg["restart_kmh"] = args.restart_kmh
+        else:
+            cfg["restart_kmh"] = existing.get("restart_kmh", RESTART_KMH)
 
     # 規定時間の仮想車と、ゴール時の余裕の予測
     s0, total, _ = sim.race_span(c, course.lap_m)
@@ -318,6 +370,36 @@ def check_margin(cfg: dict, lap_m: float) -> list[str]:
     return problems
 
 
+def check_crest(cfg: dict, lap_m: float) -> list[str]:
+    """頂上の止め時・加速しない区間で、ファームが採用しない条件（src/main.cpp の isValidStrategyConfig）。"""
+    problems = []
+    crests = cfg.get("crest_cut", [])
+    if len(crests) > MAX_CRESTS:
+        problems.append(f"crest_cut は {MAX_CRESTS} 区間まで（{len(crests)} 区間）")
+    prev_crest = None
+    for cc in crests:
+        s0, s1, step, kmh = float(cc["from_m"]), float(cc["crest_m"]), float(cc["step_m"]), cc["kmh"]
+        n = len(kmh)
+        if not (0 <= s0 < s1 < lap_m and step > 0) or not 2 <= n <= MAX_CREST_POINTS:
+            problems.append(f"crest_cut {s0:g}〜{s1:g} m: 区間が 1 周の外か、点の数が 2〜{MAX_CREST_POINTS} 個でない")
+        elif not s0 + step * (n - 2) < s1 <= s0 + step * (n - 1) + 0.5:
+            problems.append(f"crest_cut {s0:g}〜{s1:g} m: 点の数が区間と step_m に合わない")
+        if any(not float(v) > 0 for v in kmh):
+            problems.append(f"crest_cut {s0:g}〜{s1:g} m: 速度が正でない")
+        if prev_crest is not None and s0 <= prev_crest:
+            problems.append("crest_cut の区間が昇順でないか重なっている")
+        prev_crest = s1
+    if not 0 <= float(cfg.get("cut_lag_s", 0.0)) <= 3 or not float(cfg.get("restart_kmh", RESTART_KMH)) >= 0:
+        problems.append("cut_lag_s が 0〜3 秒の外か、restart_kmh が負")
+    zones = cfg.get("coast_only_m", [])
+    if len(zones) > MAX_COAST_ZONES:
+        problems.append(f"coast_only_m は {MAX_COAST_ZONES} 区間まで（{len(zones)} 区間）")
+    if any(len(z) != 2 or not (0 <= float(z[0]) < lap_m and 0 <= float(z[1]) < lap_m) or float(z[0]) == float(z[1])
+           for z in zones):
+        problems.append("coast_only_m は [開始, 終了] で、どちらも 1 周の内側の違う位置")
+    return problems
+
+
 def check(cfg: dict, text: str) -> list[str]:
     """ファームが設定を採用しない条件（src/main.cpp の isValidStrategyConfig）に当たるものを返す。"""
     lap_m, guard = float(cfg["lap_m"]), float(cfg["guard_kmh"])
@@ -333,6 +415,7 @@ def check(cfg: dict, text: str) -> list[str]:
     if any(s <= 0 for s in splits) or any(b <= a for a, b in zip(splits, splits[1:])):
         problems.append("splits_s が正の昇順でない")
     problems += check_margin(cfg, lap_m)
+    problems += check_crest(cfg, lap_m)
     size = len(text.encode("utf-8"))
     if size > MAX_FILE_BYTES:
         problems.append(f"ファイルが大きすぎる（{size} バイト、上限 {MAX_FILE_BYTES}）")
@@ -340,11 +423,16 @@ def check(cfg: dict, text: str) -> list[str]:
 
 
 def dump(value, depth: int = 0) -> str:
-    """配列を 1 行に収めた JSON 文字列にする。"""
+    """配列を 1 行に収めた JSON 文字列にする。オブジェクトの配列（crest_cut）は要素ごとに 1 行にする。"""
     if isinstance(value, dict):
         pad = "  " * (depth + 1)
         body = ",\n".join(f"{pad}{json.dumps(k)}: {dump(v, depth + 1)}" for k, v in value.items())
         return "{\n" + body + "\n" + "  " * depth + "}"
+    if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+        pad = "  " * (depth + 1)
+        rows = ",\n".join(pad + "{" + ", ".join(f"{json.dumps(k)}: {dump(v)}" for k, v in item.items()) + "}"
+                          for item in value)
+        return "[\n" + rows + "\n" + "  " * depth + "]"
     if isinstance(value, list):
         return "[" + ", ".join(dump(v) for v in value) + "]"
     if isinstance(value, Literal):
@@ -374,6 +462,8 @@ def main() -> int:
     parser.add_argument("--fuel-slack", type=float,
                         help="推奨を選ぶとき、燃料最小からこの割合までは加速回数の少なさを優先する"
                              "（既定はパラメータの fuel_slack、無ければ 0.05）")
+    parser.add_argument("--marks", type=float, nargs="+", metavar="M",
+                        help="phases の 1 つ目の段階の加速開始位置 m をこの値で置き換える（既定はパラメータの marks_m）")
     parser.add_argument("--fallback-v-off", type=float, help="予備パターンの加速停止速度 km/h（既定は既存ファイルの値）")
     parser.add_argument("--fallback-marks", type=float, nargs="+", metavar="M",
                         help="予備パターンの加速開始位置 m（既定は既存ファイルの値）")
@@ -381,6 +471,9 @@ def main() -> int:
     parser.add_argument("--beep", action=argparse.BooleanOptionalAction, help="ブザーを鳴らすか（既定は既存ファイルの値）")
     parser.add_argument("--margin-band", type=float, nargs=2, metavar=("LOW", "HIGH"),
                         help="規定時間に対する余裕の目標の帯 秒（既定は既存ファイルの値、無ければファームの既定 10〜30）")
+    parser.add_argument("--restart-kmh", type=float,
+                        help="頂上の止め時で止めたあと・加速しない区間で「加速」を出す速度 km/h"
+                             f"（既定は既存ファイルの値、無ければ {RESTART_KMH}）")
     parser.add_argument("--dry-run", action="store_true", help="書き込まずに結果だけ表示する")
     args = parser.parse_args()
     output = args.output or REPO / "sd" / f"{args.course}_strategy.json"
@@ -404,6 +497,8 @@ def main() -> int:
             if rec["time_s"] > limit:
                 summary.append(f"警告: プランは規定時間 {sim.mmss(limit)} を超えます")
         else:
+            if args.marks is not None:
+                raise ValueError("--marks は phases のあるパラメータでだけ使えます（無ければ optimize で探す）")
             target = sim.parse_mmss(args.target) if args.target else p["target_s"]
             rec = recommend(sim, p, course, target, args.n_min, args.n_max, sim.fuel_slack(p, args.fuel_slack))
             if rec is None:
