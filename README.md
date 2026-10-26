@@ -19,7 +19,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
 | ---- | ---- |
 | 周回/距離管理 | 位置範囲からサーキット判定 (鈴鹿/茂木/その他) 、コントロールライン通過検知による周回数カウント、走行時間計算 |
 | 表示モード切替 | Bボタン=`モード 0` 速度/残周回/走行時間(デフォルト)。走行支援が有効な場所では走行支援画面<BR>Aボタン=`モード 1` 回転数/噴射時間/進角(セッティング向け)<BR>Cボタン=`モード 2` コース図上の現在地表示 (加速開始位置・加速停止速度つき) |
-| 走行支援 | 加速開始位置・加速停止速度・通過タイムの遅れを画面の色と文字で合図する (SDに設定ファイル `motegi_strategy.json` があるときだけ有効。削除すれば無効)。詳細は「走行支援」を参照 |
+| 走行支援 | 加速開始位置・加速停止速度・通過タイムの遅れを画面の色と文字で合図する (SDに設定ファイル `motegi_strategy.json` / `suzuka_strategy.json` があるときだけ有効。削除すれば無効)。詳細は「走行支援」を参照 |
 | 現在地表示 (コース図) | `sd`ディレクトリのウェイポイントCSV (`suzuka_waypoint.csv` / `motegi_waypoint.csv` / `toyota_waypoint.csv`) を読み込み、北を上にしたコース図を描く。GNSSの現在地と、走行支援の加速開始位置・加速停止速度を重ねて表示。詳細は「モード2(現在地表示)」を参照 |
 | ログ保存 | `/LOG/LOGxxxx.CSV` (UTF-8 BOM付き, ヘッダ日本語) |
 | 高度推定 | Unit ENV-III (見つからなければ BME280) の気圧から高度推定 (標準大気式) |
@@ -336,8 +336,8 @@ python3 tools/make_strategy_json.py motegi                  # sd/motegi_strategy
 python3 tools/make_strategy_json.py motegi --target 38:30   # 目標時間を変える (既定はパラメータの target_s)
 python3 tools/make_strategy_json.py motegi --margin-band 10 30   # 規定時間に対する余裕の目標の帯を変える
 
-# 初めて作るコースは、パラメータから決まらない項目をオプションで与える
-python3 tools/make_strategy_json.py suzuka --fallback-v-off 30 --fallback-marks 200 600 1000 1400 --fuel-warn-mpa 0.30 --beep
+# 初めて作るコースは、パラメータから決まらない項目をオプションで与える (2027 鈴鹿。目印は下の phases の節)
+python3 tools/make_strategy_json.py suzuka --marks 1350 1730 --fuel-warn-mpa 0.30 --beep --margin-band 60 900
 ```
 
 - コースは `suzuka` / `motegi` / `toyota` で指定する (必須)。出力は `sd/<コース>_strategy.json`
@@ -380,6 +380,7 @@ python3 tools/make_strategy_json.py motegi \
 | `final_lap_marks` / `final_extra_if_split_over_s` | 最終周を走る側 (予備パターン) について計算する。通常パターンの `final_lap_marks` は全位置 |
 
 - 段階は 2 つまで (ファームが持てるパターンは通常と予備の 2 つ)。3 つ以上はエラーで終了する
+- `--marks` で 1 つ目の段階の `marks_m` を置き換える。鈴鹿 2027 の `phases` は `marks_m` が空 (登りで最低限界速度 21 km/h まで落ちたら加速する) だが、ファームは目印が 1 個以上要るので与える。目印は速度が `v_off` − 2 km/h 未満なら加速を出すので、21 km/h まで落ちる位置 (約 1,305・1,694 m) より手前に置くと、下りの勢いが残っている周に早く加速が出て、29 km/h で止めたあともう一度始動することになる。そこで先 (1,350・1,730 m) に置き、最低限界速度の加速が先に出るようにしている (シミュレータでは乾いた路面・雨とも目印なしの計画と同じ走り)
 - `--target` と、段階が 2 つあるときの `--fallback-v-off` / `--fallback-marks` は使えない (エラーで終了する)
 - 入力の既定 (`tools/strategy/<コース>_*.json` のうち名前順で最後) に練習用が選ばれないよう、練習用のファイル名は `<コース>_` で始めない。`--params` で指定する
 - 出力先を分けた場合は `fuel_warn_mpa` / `beep` を引き継ぐファイルが無いので、オプションで与える

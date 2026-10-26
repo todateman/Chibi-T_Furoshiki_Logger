@@ -26,6 +26,8 @@ tools/strategy/<コース>_<年>.json を書き換えてから、このスクリ
   - splits_s は途中でパターンを切り替えて走ったときの通過タイム
   - 最終周の 2 項目は最終周を走る側（予備パターン）について計算する
   - 段階は 2 つまで（ファームが持てるパターンが 2 つのため）
+  - --marks を与えると 1 つ目の段階の marks_m を置き換える（鈴鹿のように速度だけで加速を始めるプランでも、
+    ファームは目印が 1 個以上要る）
 
 パラメータからは決まらない項目は、出力先に既にあるファイルの値を引き継ぐ。初めて作るコースでは
 オプションで与える:
@@ -44,6 +46,10 @@ ECU 側の形式が変わったことに気づけるよう、次の 2 つの版�
   python3 tools/make_strategy_json.py suzuka --target 38:30
   python3 tools/make_strategy_json.py suzuka --params ../UNOR4_Chibi-T_EFI/tools/strategy/suzuka_2027.json
   python3 tools/make_strategy_json.py motegi --margin-band 10 30   # 余裕の目標の帯を変える
+
+  # 2027 鈴鹿（phases の marks_m が空なので目印を与える。21 km/h まで落ちる位置 1,305・1,694 m より先に置き、
+  # 最低限界速度の加速が先に出るようにする）
+  python3 tools/make_strategy_json.py suzuka --marks 1350 1730 --fuel-warn-mpa 0.30 --beep --margin-band 60 900
 
   # 練習走行用（本番用の sd/motegi_strategy.json を上書きしないよう出力先を分ける）
   python3 tools/make_strategy_json.py motegi --params ../UNOR4_Chibi-T_EFI/tools/strategy/practice_motegi_2026.json \
@@ -174,6 +180,8 @@ def plan(sim, p: dict, course, args) -> dict | None:
         raise ValueError("phases のあるパラメータでは探索をしないので、--target は使えません")
     if pol["switches"] and (args.fallback_v_off is not None or args.fallback_marks is not None):
         raise ValueError("phases の 2 つ目の段階が予備パターンになるので、--fallback-v-off / --fallback-marks は使えません")
+    if args.marks is not None:
+        pol["marks"] = sorted(args.marks)
     return sim.evaluate(p, course, pol)
 
 
@@ -375,6 +383,8 @@ def main() -> int:
     parser.add_argument("--fuel-slack", type=float,
                         help="推奨を選ぶとき、燃料最小からこの割合までは加速回数の少なさを優先する"
                              "（既定はパラメータの fuel_slack、無ければ 0.05）")
+    parser.add_argument("--marks", type=float, nargs="+", metavar="M",
+                        help="phases の 1 つ目の段階の加速開始位置 m をこの値で置き換える（既定はパラメータの marks_m）")
     parser.add_argument("--fallback-v-off", type=float, help="予備パターンの加速停止速度 km/h（既定は既存ファイルの値）")
     parser.add_argument("--fallback-marks", type=float, nargs="+", metavar="M",
                         help="予備パターンの加速開始位置 m（既定は既存ファイルの値）")
@@ -405,6 +415,8 @@ def main() -> int:
             if rec["time_s"] > limit:
                 summary.append(f"警告: プランは規定時間 {sim.mmss(limit)} を超えます")
         else:
+            if args.marks is not None:
+                raise ValueError("--marks は phases のあるパラメータでだけ使えます（無ければ optimize で探す）")
             target = sim.parse_mmss(args.target) if args.target else p["target_s"]
             rec = recommend(sim, p, course, target, args.n_min, args.n_max, sim.fuel_slack(p, args.fuel_slack))
             if rec is None:
