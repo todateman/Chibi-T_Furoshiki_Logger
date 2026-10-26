@@ -22,6 +22,7 @@
 #include <Adafruit_BME280.h>
 #endif
 #include "CourseMap.h"
+#include "LimitMargin.h"
 #include "StrategyAssist.h"
 #include "UnitEnvIII.h"
 #include "secrets.h"
@@ -104,7 +105,7 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #ifndef STRATEGY_SIM
 #define STRATEGY_SIM 0  // 机上確認用の仮想走行（0:無効, 1以上:時間の倍率）。本番は必ず0
 #endif
-#define STRATEGY_FILE_BUFFER_SIZE 1536        // 走行支援の設定ファイル(JSON)の最大サイズ
+#define STRATEGY_FILE_BUFFER_SIZE 4096        // 走行支援の設定ファイル(JSON)の最大サイズ（計画の「道のり → 累積時間」表を含む）
 #define STRATEGY_POSITION_MAX_AGE_MS 3000UL   // GNSS測位がこれより古ければ位置不明として扱う
 #define STRATEGY_OFF_COURSE_M 60.0            // ウェイポイントを結んだ線からこれ以上離れていればコース外として扱う
 #define STRATEGY_BEEP_REPEAT_MS 2000UL        // 「加速」「停止」が続いている間のブザーの繰り返し間隔
@@ -466,6 +467,7 @@ float waypointRawLapMeters = 0.0f;  // ウェイポイントCSV上の1周の距�
 
 // 走行支援
 StrategyAssist::Assist strategy;
+LimitMargin::Tracker limitMargin;  // 規定時間に対する余裕（規定時間ちょうどにゴールする仮想車との比較）
 String loadedStrategyLoc = "";
 enum StrategySource : uint8_t { STRATEGY_SRC_NONE, STRATEGY_SRC_SD, STRATEGY_SRC_SD_ERROR };
 StrategySource strategySource = STRATEGY_SRC_NONE;  // 設定ファイルの読み込み結果（無し / 読み込み済み / 内容に異常）
@@ -717,8 +719,43 @@ bool isValidStrategyConfig(const StrategyAssist::Config& cfg) {
   return true;
 }
 
-// 走行支援の設定(JSON文字列)を解釈し、指定された項目でcfgを上書きする関数
-bool parseStrategyConfigJson(const char* json, StrategyAssist::Config& cfg) {
+// 規定時間に対する余裕の設定をJSONから読み込む関数
+// race_m と limit_s が無ければ無効のまま（余裕を出さない）。項目の形が違う・表が大きすぎる場合はfalseを返す
+bool readLimitMarginJson(JsonVariantConst root, float lapM, LimitMargin::Config& mcfg) {
+  if (!root["race_m"].is<float>() || !root["limit_s"].is<float>()) {
+    return true;
+  }
+  mcfg.enabled = true;
+  mcfg.lapM = lapM;
+  mcfg.raceM = root["race_m"].as<float>();
+  mcfg.limitS = root["limit_s"].as<float>();
+  if (root["start_m"].is<float>()) { mcfg.startM = root["start_m"].as<float>(); }
+  if (root["control_m"].is<float>()) { mcfg.controlM = root["control_m"].as<float>(); }
+  JsonArrayConst band = root["margin_band_s"];
+  if (!band.isNull()) {
+    if (band.size() != 2) {
+      Serial.println("[Strategy] margin_band_s needs [low, high]");
+      return false;
+    }
+    mcfg.bandLoS = band[0].as<float>();
+    mcfg.bandHiS = band[1].as<float>();
+  }
+  if (root["plan_step_m"].is<float>()) { mcfg.planStepM = root["plan_step_m"].as<float>(); }
+  JsonArrayConst plan = root["plan_t_s"];
+  if (!plan.isNull()) {
+    if (plan.size() > LimitMargin::MAX_PLAN_POINTS) {
+      Serial.printf("[Strategy] plan_t_s has too many points: %u\n", static_cast<unsigned int>(plan.size()));
+      return false;
+    }
+    for (JsonVariantConst t : plan) {
+      mcfg.planS[mcfg.planCount++] = t.as<float>();
+    }
+  }
+  return true;
+}
+
+// 走行支援の設定(JSON文字列)を解釈し、指定された項目でcfg・mcfgを上書きする関数
+bool parseStrategyConfigJson(const char* json, StrategyAssist::Config& cfg, LimitMargin::Config& mcfg) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, json);
   if (err) {
@@ -746,12 +783,12 @@ bool parseStrategyConfigJson(const char* json, StrategyAssist::Config& cfg) {
       cfg.splitsS[cfg.splitCount++] = split.as<float>();
     }
   }
-  return true;
+  return readLimitMarginJson(root, cfg.lapM, mcfg);
 }
 
-// SDカードの設定ファイル(JSON)を読み込み、cfgを上書きする関数
+// SDカードの設定ファイル(JSON)を読み込み、cfg・mcfgを上書きする関数
 // ファイルが無い場合はfalseを返す。ファイルはあるが解釈できなかった場合はoutParsedがfalseになる
-bool readStrategyConfigFile(const char* path, StrategyAssist::Config& cfg, bool& outParsed) {
+bool readStrategyConfigFile(const char* path, StrategyAssist::Config& cfg, LimitMargin::Config& mcfg, bool& outParsed) {
   outParsed = false;
   file_t strategyFile = sd.open(path, O_READ);
   if (!strategyFile) {
@@ -763,7 +800,7 @@ bool readStrategyConfigFile(const char* path, StrategyAssist::Config& cfg, bool&
   strategyFile.close();
   if (len > 0) {
     buf[len] = '\0';
-    outParsed = parseStrategyConfigJson(buf, cfg);
+    outParsed = parseStrategyConfigJson(buf, cfg, mcfg);
   }
   return true;
 }
@@ -773,19 +810,22 @@ bool readStrategyConfigFile(const char* path, StrategyAssist::Config& cfg, bool&
 void loadStrategyConfigForLoc(const String& loc) {
   StrategyAssist::Config cfg;
   cfg.totalLaps = totallaps;
+  static LimitMargin::Config marginCfg;  // 計画の表を持つので大きい。スタックに置かない
+  marginCfg = LimitMargin::Config();
   strategySource = STRATEGY_SRC_NONE;
 
   if (LOGGING) {
     const char* path = getStrategyFilePathByLoc(loc);
     bool parsed = false;
-    if (readStrategyConfigFile(path, cfg, parsed)) {
-      if (parsed && isValidStrategyConfig(cfg)) {
+    if (readStrategyConfigFile(path, cfg, marginCfg, parsed)) {
+      if (parsed && isValidStrategyConfig(cfg) && (!marginCfg.enabled || LimitMargin::isValidConfig(marginCfg))) {
         cfg.enabled = true;
         strategySource = STRATEGY_SRC_SD;
-        Serial.printf("[Strategy] loaded %s\n", path);
+        Serial.printf("[Strategy] loaded %s%s\n", path, marginCfg.enabled ? " (limit margin)" : "");
       } else {
         // 設定ファイルが壊れている場合は走行支援を無効にし、モード0の画面に異常を出す
         cfg = StrategyAssist::Config();
+        marginCfg = LimitMargin::Config();
         strategySource = STRATEGY_SRC_SD_ERROR;
         Serial.printf("[Strategy] invalid config: %s\n", path);
       }
@@ -793,6 +833,7 @@ void loadStrategyConfigForLoc(const String& loc) {
   }
 
   strategy.configure(cfg);
+  limitMargin.configure(marginCfg);
 }
 
 // 現在のロケーションに対応する走行支援の設定がロードされていない場合にロードする関数
@@ -878,6 +919,7 @@ void updateStrategyAssist() {
 
   const StrategyAssist::Cue prevCue = strategy.output().cue;
   const StrategyAssist::Output& out = strategy.update(in);
+  limitMargin.update(worktime, Lapcount, in.lapPosM);
 
 #if STRATEGY_BEEP_AVAILABLE
   static unsigned long lastBeepAt = 0;
@@ -942,6 +984,25 @@ bool formatStrategyCue(const StrategyAssist::Output& out, char* buf, size_t bufS
       break;
   }
   return caution;
+}
+
+// 規定時間に対する余裕の表示色: 帯より大=水色, 帯の中=緑, 帯より小=黄, マイナス=マゼンタ
+int limitMarginColor(float marginS) {
+  switch (LimitMargin::bandOf(limitMargin.config(), marginS)) {
+    case LimitMargin::Band::Over:
+      return TFT_CYAN;
+    case LimitMargin::Band::In:
+      return TFT_GREEN;
+    case LimitMargin::Band::Under:
+      return TFT_YELLOW;
+    default:
+      return TFT_MAGENTA;
+  }
+}
+
+// 余裕の秒数を表示用の整数にする（±999秒で頭打ち）
+int limitMarginSeconds(float marginS) {
+  return static_cast<int>(constrain(lroundf(marginS), -999L, 999L));
 }
 
 // 走行支援画面（支援が有効なときのモード0）の描画
@@ -1099,9 +1160,45 @@ void drawStrategyMode() {
     lcd_s.fillRect(x - 2, 225, 5, 14, plainBg ? TFT_CYAN : fg);
   }
 
-  // 直近の通過タイムと目標との差。まだ通過していなければ加速開始位置の一覧
+  // 規定時間に対する余裕（大きい数字）と、見出しの行に直近の通過時の余裕・ゴール時の予測。
+  // 余裕の設定が無ければ直近の通過タイムと目標との差。発進前（位置がまだ取れていない間も）は加速開始位置の一覧
+  const LimitMargin::Output& margin = limitMargin.output();
   lcd_s.setTextDatum(TR_DATUM);
-  if (out.hasSplit) {
+  if (margin.valid) {
+    // 走行時間の数字の右端より右に収める。3桁で収まらなければ数字を小さくし、それでも収まらなければ「余裕」を省く
+    char timeStr[8];
+    formatMinSec(timeStr, sizeof(timeStr), worktime);
+    const int freeLeft = 84 + lcd_s.textWidth(timeStr) + 6;
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextSize(1);
+    const int labelW = lcd_s.textWidth("余裕");
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+    snprintf(buf, sizeof(buf), "%+d", limitMarginSeconds(margin.marginS));
+    lcd_s.setTextSize(2);
+    int valueY = 182;
+    if (316 - lcd_s.textWidth(buf) - 4 - labelW < freeLeft) {
+      lcd_s.setTextSize(1.5);
+      valueY = 192;  // 下端を大きい数字とそろえる
+    }
+    const int valueW = lcd_s.textWidth(buf);
+    lcd_s.setTextColor(plainBg ? limitMarginColor(margin.marginS) : fg);
+    lcd_s.drawString(buf, 316, valueY);
+    lcd_s.setTextColor(fg);
+    lcd_s.setTextSize(1);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    if (316 - valueW - 4 - labelW >= freeLeft) {
+      lcd_s.drawString("余裕", 316 - valueW - 4, 202);
+    }
+    int len = 0;
+    buf[0] = '\0';
+    if (margin.hasLapMargin) {
+      len += snprintf(buf + len, sizeof(buf) - len, "通過%+d", limitMarginSeconds(margin.lapMarginS));
+    }
+    if (isfinite(margin.predictedS)) {
+      snprintf(buf + len, sizeof(buf) - len, "%s予測%+d", len > 0 ? " " : "", limitMarginSeconds(margin.predictedS));
+    }
+    lcd_s.drawString(buf, 316, 162);
+  } else if (out.hasSplit) {
     if (isfinite(out.delayS)) {
       snprintf(buf, sizeof(buf), "%+ds", static_cast<int>(constrain(lroundf(out.delayS), -99L, 99L)));
     } else {
@@ -1209,6 +1306,17 @@ void drawCourseMapMode() {
     }
     lcd_s.setTextColor(TFT_WHITE);
 
+    // 規定時間の仮想車（規定時間ちょうどにゴールする一定の速さ）。マゼンタの菱形を、自車が上に来るよう先に描く
+    double virtualLat, virtualLng;
+    if (lapPositionToLatLng(limitMargin.virtualLapPosM(worktime), virtualLat, virtualLng)) {
+      int x, y;
+      proj.toScreen(virtualLat, virtualLng, x, y);
+      lcd_s.fillTriangle(x - 8, y, x, y - 8, x + 8, y, TFT_BLACK);  // コース線の上でも見えるよう黒で縁取る
+      lcd_s.fillTriangle(x - 8, y, x, y + 8, x + 8, y, TFT_BLACK);
+      lcd_s.fillTriangle(x - 6, y, x, y - 6, x + 6, y, TFT_MAGENTA);
+      lcd_s.fillTriangle(x - 6, y, x, y + 6, x + 6, y, TFT_MAGENTA);
+    }
+
     // 現在地（GNSSの測位位置そのまま）。向きはコースの進行方向
     if (nearestWaypointIndex >= 0) {
       int x, y;
@@ -1300,6 +1408,32 @@ void drawCourseMapMode() {
   lcd_s.setTextSize(1.5);
   formatMinSec(buf, sizeof(buf), worktime);
   lcd_s.drawString(buf, 316, 168);
+
+  // 左の中ほど: 規定時間に対する余裕, 右の中ほど: ゴール時の予測（帯で色分け）
+  const LimitMargin::Output& margin = limitMargin.output();
+  if (margin.valid) {
+    lcd_s.setTextSize(1);
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_16);
+    lcd_s.setTextDatum(TL_DATUM);
+    lcd_s.drawString("余裕", 4, 76);
+    if (isfinite(margin.predictedS)) {
+      lcd_s.setTextDatum(TR_DATUM);
+      lcd_s.drawString("予測", 316, 94);
+    }
+    lcd_s.setFont(&fonts::lgfxJapanGothicP_20);
+    lcd_s.setTextSize(1.5);
+    lcd_s.setTextDatum(TL_DATUM);
+    snprintf(buf, sizeof(buf), "%+d", limitMarginSeconds(margin.marginS));
+    lcd_s.setTextColor(limitMarginColor(margin.marginS));
+    lcd_s.drawString(buf, 4, 94);
+    if (isfinite(margin.predictedS)) {
+      lcd_s.setTextDatum(TR_DATUM);
+      snprintf(buf, sizeof(buf), "%+d", limitMarginSeconds(margin.predictedS));
+      lcd_s.setTextColor(limitMarginColor(margin.predictedS));
+      lcd_s.drawString(buf, 316, 112);
+    }
+    lcd_s.setTextColor(TFT_WHITE);
+  }
 
   // 合図の帯: 加速=緑, 停止=赤
   int bandBg = TFT_BLACK;
@@ -1756,6 +1890,7 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
     lapCountDistanceBase = distance;
     lapCountDistanceBaseValid = true;
     strategy.onLapCrossed(Lapcount, worktime);  // 通過タイムを保持し、次の周の加速停止速度を決める
+    limitMargin.onLapCrossed(Lapcount, worktime);  // 通過時の規定時間に対する余裕を保持する
   }
 }
 
@@ -2524,7 +2659,8 @@ bool initializePressureSensorForGnssModule() {
 // 仮想ドライバーは画面の合図どおりに加速・停止する。走行抵抗を2割増しにして、通過タイムの遅れと補正も出るようにしてある。
 void updateSimulatedRun() {
   static unsigned long lastMs = millis();
-  static float simS = -8.0f;   // ウェイポイント ID 1 からの累積距離 [m]（ID 1 の8 m手前から発進する）
+  static float simStartS = -8.0f;  // 発進位置 [m]（設定ファイルの start_m。無ければ ID 1 の8 m手前）
+  static float simS = simStartS;   // ウェイポイント ID 1 からの累積距離 [m]
   static float simV = 0.0f;    // 速度 [m/s]
   static float simT = 0.0f;    // 走行時間 [s]
   static float reactS = 0.0f;  // 合図に気づいてから操作するまでの時間 [s]
@@ -2543,6 +2679,11 @@ void updateSimulatedRun() {
   const float lapM = strategy.config().lapM;
   if (waypointCount < 2 || waypointRawLapMeters <= 0.0f || lapM <= 0.0f) {
     return;
+  }
+
+  if (!launched) {
+    simStartS = limitMargin.config().enabled ? limitMargin.config().startM : -8.0f;
+    simS = simStartS;
   }
 
   // 仮想ドライバー
@@ -2586,7 +2727,7 @@ void updateSimulatedRun() {
   tachoRpm = engine ? 3500 : 0;
   INJ_timems = engine ? 3.0f : 0.0f;
   worktime = simT;
-  distance = launched ? static_cast<uint16_t>(simS + 8.0f) : 0;
+  distance = launched ? static_cast<uint16_t>(simS - simStartS) : 0;
   FuelPre = (engine && Lapcount == 2) ? 0.26f : 0.32f;  // 3周目の加速だけ燃圧低下を再現する
 
   updateLapCountByControlLineCrossing(true, prevLa, prevLn);
