@@ -65,8 +65,8 @@ FIRMWARE = REPO / "src" / "main.cpp"
 COURSES = {"suzuka": "su", "motegi": "mo", "toyota": "to"}
 
 # 対応している ECU 側の版数
-PARAMS_FORMAT_VERSION = 4  # パラメータ JSON の format_version
-SIM_INTERFACE_VERSION = 4  # strategy_sim.py の INTERFACE_VERSION
+PARAMS_FORMAT_VERSION = (4, 5)  # パラメータ JSON の format_version（5 は course.lap_m などを足した版）
+SIM_INTERFACE_VERSION = 5  # strategy_sim.py の INTERFACE_VERSION（5 から 1 周の長さは course.lap_m）
 
 # ファーム側の上限（include/StrategyAssist.h, src/main.cpp）
 MAX_PATTERNS = 2  # 通常パターンと予備パターン
@@ -83,8 +83,9 @@ class Literal(str):
     """既存ファイルの数値を、書かれていた表記のまま持ち回る（0.30 を 0.3 に変えない）。"""
 
 
-def check_version(name: str, found, supported: int) -> None:
-    if found != supported:
+def check_version(name: str, found, supported) -> None:
+    """supported は版数 1 つか、対応する版数のタプル。"""
+    if found not in (supported if isinstance(supported, tuple) else (supported,)):
         raise ValueError(
             f"{name} が対応していない版です（見つかった版: {'なし' if found is None else found}、"
             f"このスクリプトが対応する版: {supported}）\n"
@@ -224,7 +225,7 @@ def build(sim, p: dict, course, rec: dict, existing: dict, args) -> tuple[dict, 
     count, longest = final_lap(sim, p, course, pol)
     final_marks = switches[-1][2] if switches else marks
     cfg = {
-        "lap_m": round(c["total_m"] / laps, 2),
+        "lap_m": round(course.lap_m, 2),  # 1 周の長さ（course.lap_m。無ければ公式距離 ÷ 周回数）
         "v_off": v_off,
         "marks_m": [number(m) for m in marks],
         "final_lap_marks": len(marks) if switches else count,

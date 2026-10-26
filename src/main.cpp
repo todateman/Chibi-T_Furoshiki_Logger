@@ -252,10 +252,28 @@ unsigned long nextAltitudeOffsetFetchAt = 0;      // 次回の標高オフセッ
 // サーキットごとの設定
 const uint8_t totallaps_su = 8; // 鈴鹿サーキット東コースの規定周回数
 const uint8_t totallaps_mo = 7; // ツインリンクもてぎオーバルコースの規定周回数
-const float controlline_la1_su = 34.845093;  // 鈴鹿サーキット東コースのコントロールライン(外側)の緯度
-const float controlline_ln1_su = 136.538735;  // 鈴鹿サーキット東コースのコントロールライン(外側)の経度
-const float controlline_la2_su = 34.844847;  // 鈴鹿サーキット東コースのコントロールライン(内側)の緯度
-const float controlline_ln2_su = 136.538379;  // 鈴鹿サーキット東コースのコントロールライン(内側)の経度
+// 鈴鹿は、スタートライン（ピットレーン）・ゴールライン（最終コーナーの出口で分かれるピット入口の道）・コントロールライン（本コース）が、
+// 路面の白線（ウェイポイント ID 1 の約 6 m 手前。以前はここで数えていた）とは別の場所にある。
+// 位置は 2026 年「競技会の流れ」の図・自チームのピットインの GPS の軌跡・他チームの車載動画（2015 年 名城大 SPICA の発進から
+// 公式記録 26:34.288 後の位置）から推定した仮の値で、2027 年の大会当日のコースウォークで確定させる（ECU リポジトリの
+// document/suzuka_strategy_2027.md）。距離はウェイポイント ID 1 から、横位置はウェイポイントの線から（+ が進行方向の右手 = 内側）
+// コントロールラインは位置が分からないので、もてぎと同じくゴールラインと同じ並び（2,135 m）の本コース上と仮定した。
+// 線はコースだけを横切る（外側 15 m〜内側 8 m）。内側 14 m を並んで走るピット入口の道には掛けない
+const float controlline_la1_su = 34.845724;  // 鈴鹿サーキット東コースのコントロールライン(外側)の緯度
+const float controlline_ln1_su = 136.538031;  // 鈴鹿サーキット東コースのコントロールライン(外側)の経度
+const float controlline_la2_su = 34.845565;  // 鈴鹿サーキット東コースのコントロールライン(内側)の緯度
+const float controlline_ln2_su = 136.537870;  // 鈴鹿サーキット東コースのコントロールライン(内側)の経度
+// ゴールライン: 2,135 m のピット入口の道の上（内側 9〜21 m）。最終周だけ、ここを横切ったら周回数を進める
+const float goalline_la1_su = 34.845558;  // 鈴鹿サーキット東コースのゴールライン(コース側)の緯度
+const float goalline_ln1_su = 136.537863;  // 鈴鹿サーキット東コースのゴールライン(コース側)の経度
+const float goalline_la2_su = 34.845475;  // 鈴鹿サーキット東コースのゴールライン(内側)の緯度
+const float goalline_ln2_su = 136.537780;  // 鈴鹿サーキット東コースのゴールライン(内側)の経度
+// スタートライン: 110 m のピットレーン上（内側 18〜32 m）。周回の数え方には使わない（発進は ECU の走行時間で判定する）。
+// コースウォークで確かめる位置の記録として持つ
+const float startline_la1_su = 34.844106;  // 鈴鹿サーキット東コースのスタートライン(コース側)の緯度
+const float startline_ln1_su = 136.539274;  // 鈴鹿サーキット東コースのスタートライン(コース側)の経度
+const float startline_la2_su = 34.844026;  // 鈴鹿サーキット東コースのスタートライン(内側)の緯度
+const float startline_ln2_su = 136.539156;  // 鈴鹿サーキット東コースのスタートライン(内側)の経度
 // もてぎはコース上のコントロールライン（ゴールラインと同じ並び、ウェイポイント ID 1 の約 117 m 手前）。2026/10/24 のコースウォークで確認。
 // ウェイポイントの線から外側へ約 30 m（本コースの外側の縁を越える）、内側へ約 70 m（ゴールレーンを越える）
 const float controlline_la1_mo = 36.533579;  // ツインリンクもてぎオーバルコースのコントロールライン(外側)の緯度
@@ -1833,6 +1851,18 @@ bool getControlLineForLoc(const String& loc, double& outLa1, double& outLn1, dou
   return false;
 }
 
+// 現在のロケーションに、コントロールラインとは別のゴールラインがあれば座標を返す関数
+// （鈴鹿はピット入口の道の上。もてぎはゴールラインがコントロールラインと同じ並びにあり、コントロールラインがゴールレーンまで
+// 掛かっているので持たない）
+bool getGoalLineForLoc(const String& loc, double& outLa1, double& outLn1, double& outLa2, double& outLn2) {
+  if (loc == "su") {
+    outLa1 = goalline_la1_su; outLn1 = goalline_ln1_su;
+    outLa2 = goalline_la2_su; outLn2 = goalline_ln2_su;
+    return true;
+  }
+  return false;
+}
+
 // GPSの前回位置→今回位置を結ぶ線分がコントロールラインと交差したか判定し、
 // 交差していればLapcountをインクリメントする関数（多重カウント防止のデバウンス・GPSロスト後の誤検出防止のテレポートガード付き）
 void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, double prevLng) {
@@ -1872,7 +1902,14 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
     return;
   }
 
-  if (segmentsIntersect(prevLat, prevLng, la, ln, clLa1, clLn1, clLa2, clLn2)) {
+  bool crossed = segmentsIntersect(prevLat, prevLng, la, ln, clLa1, clLn1, clLa2, clLn2);
+  // 最終周は、コントロールラインとは別のゴールライン（鈴鹿のピット入口の道）を横切ったときもゴールとして数える
+  double glLa1, glLn1, glLa2, glLn2;
+  if (!crossed && totallaps > 0 && Lapcount == totallaps - 1 && getGoalLineForLoc(Loc, glLa1, glLn1, glLa2, glLn2)) {
+    crossed = segmentsIntersect(prevLat, prevLng, la, ln, glLa1, glLn1, glLa2, glLn2);
+  }
+
+  if (crossed) {
     // ECU受信中は、前回カウントからの走行距離が1周の半分に満たない交差を数えない
     // （グリッドがラインの手前にある場合の発進直後の通過や、ライン付近での二重カウントを防ぐ）
     if (distance < lapCountDistanceBase) {
