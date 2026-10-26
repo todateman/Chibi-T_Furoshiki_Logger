@@ -142,7 +142,21 @@ tools/render_screens/render.sh --install    # README で使う画像を docs/ �
 
 - 必要なもの: clang、SDL2 (macOS は `brew install sdl2`)、Python 3
 - 場面 (周回数・位置・速度・計画からの遅れ) は `tools/render_screens/harness.cpp` の `main()`。設定は `sd/motegi_strategy.json` をファームと同じ関数で読む
-- 描画に使う関数・変数が増えたら、`extract.py` の抜き出し対象と `harness.cpp` の宣言を合わせる。M5GFX を更新したら `.pio/render_screens/obj` を消してから回す
+- 描画に使う関数・変数が増えたら、`extract.py` の抜き出し対象と `common.h` の宣言を合わせる。M5GFX を更新したら `.pio/render_screens/obj` を消してから回す
+
+#### 仮想走行の動画
+
+`m5stack-basic-sim` / `m5stack-basic-sim-suzuka` と同じ仮想走行を PC 上で等倍で回し、走行支援画面 (左) と現在地画面 (右) を並べた動画 (MP4、1280×480、10 fps、ブザーの音つき) にする。実機に書き込まずに、8 周ぶんの合図と画面の動きを確かめられる。
+
+```sh
+tools/render_screens/render.sh --video suzuka   # .pio/render_screens/video/suzuka_sim.mp4 (約 32 分)
+tools/render_screens/render.sh --video motegi   # .pio/render_screens/video/motegi_sim.mp4
+```
+
+- 必要なもの: 上と同じもの + ffmpeg (macOS は `brew install ffmpeg`)。設定は `sd/<コース>_strategy.json` と `sd/<コース>_waypoint.csv`
+- 仮想走行 (`updateSimulatedRun()`)・周回の判定・走行支援の更新とブザー (`updateStrategyAssist()`)・描画は `src/main.cpp` から抜き出したものをそのまま使う (`tools/render_screens/video.cpp`)。`loop()` 1 回を 20 ms、表示を 100 ms ごととして時計を進める
+- ブザーは `M5.Speaker.tone()` の代わりに矩形波を書く (加速は短く 2 回、停止は長く 1 回、続いている間は 2 秒ごと)
+- ゴールして止まってから 15 秒で終わる。1 時間でゴールしなければ打ち切る
 
 ### デバッグ
 
