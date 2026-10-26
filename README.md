@@ -127,6 +127,7 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 | ---- | ---- | ---- |
 | `native` | 走行支援の判定ロジック (`include/StrategyAssist.h`)・規定時間に対する余裕の計算 (`include/LimitMargin.h`)・コース図の投影 (`include/CourseMap.h`) のテストをPC上で実行 | `pio test -e native` |
 | `m5stack-basic-sim` | 走行支援画面・現在地表示画面の机上確認。もてぎのウェイポイント上を8倍速で仮想走行する (`STRATEGY_SIM=8`)。設定ファイルの `start_m` (無ければウェイポイント ID 1 の 8 m 手前) から発進する。SDに `motegi_waypoint.csv` と `motegi_strategy.json` が必要。SDログ・MQTTは止まる。**本番には書き込まない** (状態行に `SIM` と出る) | `pio run -e m5stack-basic-sim -t upload` |
+| `m5stack-basic-sim-suzuka` | `m5stack-basic-sim` の鈴鹿版 (`STRATEGY_SIM_SUZUKA=1`)。SDに `suzuka_waypoint.csv` と `suzuka_strategy.json` が必要。勾配はウェイポイントの標高から取る (もてぎも同じ)。発進は本コース上の `start_m` (112 m) から。最終周は分岐 (約 1,990 m) から 15 m 内側のピット入口の道へ移り、ゴールライン (2,135 m) で周回を数える。ゴール後はブレーキで止まる。仮想ドライバーは頂上の止め時を使わず 29 km/h で止めるので、計画 (30:08) より速く走る (約 27 分) | `pio run -e m5stack-basic-sim-suzuka -t upload` |
 | `m5stack-basic-portable` | 車体に載せずコースウォークなどで使うポータブル仕様 (M5Stack Basic + M5Stack GNSS Module)。GNSS は NEO-M9N (38400 bps)、気圧は BMP280 から取り、SD への記録は 1Hz になる (`GNSS_MODULE_M5=1`)。車載用のハードでは GNSS も気圧も取れないので**車載には書き込まない** | `pio run -e m5stack-basic-portable -t upload` |
 
 ### 画面例の描き直し

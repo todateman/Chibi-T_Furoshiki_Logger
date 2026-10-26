@@ -105,6 +105,9 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #ifndef STRATEGY_SIM
 #define STRATEGY_SIM 0  // 机上確認用の仮想走行（0:無効, 1以上:時間の倍率）。本番は必ず0
 #endif
+#ifndef STRATEGY_SIM_SUZUKA
+#define STRATEGY_SIM_SUZUKA 0  // 仮想走行のコース（0:もてぎ, 1:鈴鹿）
+#endif
 #define STRATEGY_FILE_BUFFER_SIZE 4096        // 走行支援の設定ファイル(JSON)の最大サイズ（計画の「道のり → 累積時間」表を含む）
 #define STRATEGY_POSITION_MAX_AGE_MS 3000UL   // GNSS測位がこれより古ければ位置不明として扱う
 #define STRATEGY_OFF_COURSE_M 60.0            // ウェイポイントを結んだ線からこれ以上離れていればコース外として扱う
@@ -2695,9 +2698,25 @@ bool initializePressureSensorForGnssModule() {
 }
 
 #if STRATEGY_SIM
+// 仮想走行の累積距離 [m] でのウェイポイントの標高 [m]（ウェイポイント間を補間する）
+float simAltitudeAt(float simS) {
+  const float lapM = strategy.config().lapM;
+  const float rawPos = fmodf(fmodf(simS, lapM) + lapM, lapM) * (waypointRawLapMeters / lapM);
+  size_t i = 0;
+  while (i + 1 < waypointCount && waypoints[i + 1].dist <= rawPos) {
+    i++;
+  }
+  const Waypoint& from = waypoints[i];
+  const Waypoint& to = waypoints[(i + 1) % waypointCount];
+  const float segEnd = (i + 1 < waypointCount) ? to.dist : waypointRawLapMeters;  // 末尾→先頭の区間は1周の距離まで
+  const float ratio = (segEnd > from.dist) ? (rawPos - from.dist) / (segEnd - from.dist) : 0.0f;
+  return from.alt + (to.alt - from.alt) * ratio;
+}
+
 // 机上確認用の仮想走行
 // ウェイポイント上を走らせ、位置・速度・噴射・走行時間・燃圧を差し替えて走行支援画面を確認する。
 // 仮想ドライバーは画面の合図どおりに加速・停止する。走行抵抗を2割増しにして、通過タイムの遅れと補正も出るようにしてある。
+// 勾配はウェイポイントの標高から取る（鈴鹿は高低差が約34 mあり、下りで70 km/hを超える）。
 void updateSimulatedRun() {
   static unsigned long lastMs = millis();
   static float simStartS = -8.0f;  // 発進位置 [m]（設定ファイルの start_m。無ければ ID 1 の8 m手前）
@@ -2707,12 +2726,20 @@ void updateSimulatedRun() {
   static float reactS = 0.0f;  // 合図に気づいてから操作するまでの時間 [s]
   static bool launched = false;
   static bool engine = false;
+  static float insideM = 0.0f;  // ウェイポイントを結んだ線から右（内側）へずらす量 [m]（鈴鹿の最終周のピット入口の道）
 
-  // もてぎとして扱う（ウェイポイントと走行支援の設定はloop()側で読み込まれる）
+  // ウェイポイントと走行支援の設定はloop()側で読み込まれる
+#if STRATEGY_SIM_SUZUKA
+  Loc = "su";
+  totallaps = totallaps_su;
+  goal = goal_su;
+  limittime = limittime_su;
+#else
   Loc = "mo";
   totallaps = totallaps_mo;
   goal = goal_mo;
   limittime = limittime_mo;
+#endif
 
   const unsigned long nowMs = millis();
   const float dt = static_cast<float>(nowMs - lastMs) / 1000.0f * static_cast<float>(STRATEGY_SIM);
@@ -2746,10 +2773,16 @@ void updateSimulatedRun() {
     reactS = 0.0f;
   }
 
-  // 運動（勾配は無視）
+  // 運動（発進前は勾配があっても動かさない。ゴール後はブレーキで止める）
   const float kmh = simV * 3.6f;
   float accel = engine ? (1.6f - 0.03f * kmh) : 0.0f;
   accel -= 1.2f * (9.8f * 0.00164f + 0.000391f * simV * simV);
+  if (launched) {
+    accel -= 9.8f * (simAltitudeAt(simS + 15.0f) - simAltitudeAt(simS - 15.0f)) / 30.0f;
+  }
+  if (cue == StrategyAssist::Cue::Finished) {
+    accel -= 1.5f;
+  }
   simV = max(simV + accel * dt, 0.0f);
   simS += simV * dt;
   if (launched) {
@@ -2760,6 +2793,25 @@ void updateSimulatedRun() {
   const double prevLa = la;
   const double prevLn = ln;
   lapPositionToLatLng(simS, la, ln);
+#if STRATEGY_SIM_SUZUKA
+  // 最終周は分岐（約1,990 m）から20 mかけてピット入口の道（コースの約15 m内側）へ移り、ゴールライン（2,135 m）を横切る。
+  // 右回りなので内側は進行方向の右
+  const float lapPos = fmodf(simS, lapM);
+  if (Lapcount >= totallaps || (Lapcount == totallaps - 1 && lapPos >= 1990.0f && lapPos < 2200.0f)) {
+    insideM = max(insideM, constrain((lapPos - 1990.0f) / 20.0f * 15.0f, 0.0f, 15.0f));
+  }
+  double aheadLa, aheadLn;
+  if (insideM > 0.0f && lapPositionToLatLng(simS + 5.0f, aheadLa, aheadLn)) {
+    const double metersPerDegLng = 111320.0 * cos(la * pi / 180.0);
+    const double east = (aheadLn - ln) * metersPerDegLng;
+    const double north = (aheadLa - la) * 111320.0;
+    const double len = sqrt(east * east + north * north);
+    if (len > 0.0) {
+      la += -east / len * insideM / 111320.0;
+      ln += north / len * insideM / metersPerDegLng;
+    }
+  }
+#endif
 
   // ECU・BLEの受信値を差し替える
   receiveECUtime = nowMs;
