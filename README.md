@@ -129,6 +129,20 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 | `m5stack-basic-sim` | 走行支援画面・現在地表示画面の机上確認。もてぎのウェイポイント上を8倍速で仮想走行する (`STRATEGY_SIM=8`)。設定ファイルの `start_m` (無ければウェイポイント ID 1 の 8 m 手前) から発進する。SDに `motegi_waypoint.csv` と `motegi_strategy.json` が必要。SDログ・MQTTは止まる。**本番には書き込まない** (状態行に `SIM` と出る) | `pio run -e m5stack-basic-sim -t upload` |
 | `m5stack-basic-portable` | 車体に載せずコースウォークなどで使うポータブル仕様 (M5Stack Basic + M5Stack GNSS Module)。GNSS は NEO-M9N (38400 bps)、気圧は BMP280 から取り、SD への記録は 1Hz になる (`GNSS_MODULE_M5=1`)。車載用のハードでは GNSS も気圧も取れないので**車載には書き込まない** | `pio run -e m5stack-basic-portable -t upload` |
 
+### 画面例の描き直し
+
+README の画面例 (`docs/strategy_screen_*.png` / `docs/course_map_*.png`) は、`src/main.cpp` の描画関数を抜き出して PC 上で描いている (`tools/render_screens/`)。走行支援画面・現在地表示画面の描画を変えたら描き直す。
+
+```sh
+pio run -e m5stack-basic                    # 初回だけ: M5GFX / ArduinoJson を .pio/libdeps に取得する
+tools/render_screens/render.sh              # .pio/render_screens/out/ に全場面の PNG を出す (確認用)
+tools/render_screens/render.sh --install    # README で使う画像を docs/ へ上書きする
+```
+
+- 必要なもの: clang、SDL2 (macOS は `brew install sdl2`)、Python 3
+- 場面 (周回数・位置・速度・計画からの遅れ) は `tools/render_screens/harness.cpp` の `main()`。設定は `sd/motegi_strategy.json` をファームと同じ関数で読む
+- 描画に使う関数・変数が増えたら、`extract.py` の抜き出し対象と `harness.cpp` の宣言を合わせる。M5GFX を更新したら `.pio/render_screens/obj` を消してから回す
+
 ### デバッグ
 
 - シリアル出力: CSV形式 `lat, lon, alt, loc, Spd_GPS, rpm, Spd_PULSE, distance, gasml, dispergas, worktime, EngTemp, Pressure, Temp, Humidity, PRI, SEC, FUEL, datetime`
@@ -163,7 +177,7 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 
 #### 画面例
 
-実機の写真ではなく、`src/main.cpp` の描画処理 (`drawCourseMapMode()`) を PC 上で動かして出力した画像 (2 倍に拡大)。数値は例 (設定は `sd/motegi_strategy.json`。走行時間は計画の時間に遅れ・進みを足した値)。
+実機の写真ではなく、`src/main.cpp` の描画処理 (`drawCourseMapMode()`) を PC 上で動かして出力した画像 (2 倍に拡大)。数値は例 (設定は `sd/motegi_strategy.json`。走行時間は計画の時間に遅れ・進みを足した値)。描画を変えたら `tools/render_screens/render.sh --install` で描き直す ([画面例の描き直し](#画面例の描き直し))。
 
 | 加速開始位置の手前 | 加速開始 | 加速停止速度に到達 |
 | :----: | :----: | :----: |
@@ -199,7 +213,7 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 
 ### 走行支援の画面例
 
-実機の写真ではなく、`src/main.cpp` の描画処理 (`drawStrategyMode()`) を PC 上で動かして出力した画像 (2 倍に拡大)。数値は例 (設定は `sd/motegi_strategy.json`。走行時間は計画の時間に遅れ・進みを足した値)。
+実機の写真ではなく、`src/main.cpp` の描画処理 (`drawStrategyMode()`) を PC 上で動かして出力した画像 (2 倍に拡大)。数値は例 (設定は `sd/motegi_strategy.json`。走行時間は計画の時間に遅れ・進みを足した値)。描画を変えたら `tools/render_screens/render.sh --install` で描き直す ([画面例の描き直し](#画面例の描き直し))。
 
 | 走り出すまで | 惰行中 | 加速開始位置の手前 |
 | :----: | :----: | :----: |
