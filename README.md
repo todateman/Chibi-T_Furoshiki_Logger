@@ -107,6 +107,25 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 - ロガーが使うのは時刻・日付・緯度経度・速度で、すべて RMC に入っている。RMC のみにすると衛星数・HDOP・GNSS高度は出ないが、ファームでは使っていない
 - ファーム側の変更は不要 (`src/main.cpp` の `gnss_bps` は 115200 のまま)。配線は GY-NEO-6MV2 と同じで、つないだあと屋外で画面右上の GNSS の表示が `O` になることを確認する (`O` は直近 3 秒以内に測位した位置があること。一度測位したあとも、位置が古くなれば `x` に戻る)
 
+#### 測位中の更新レートを測る
+
+`setup_atgm336h.py` の確認は 5 秒しか受信しないので、測位して数分たってから回が抜ける個体を見逃す。  
+`tools/measure_atgm336h.py` で数分受信し、更新レートが落ちないか、モジュールが回を飛ばしていないかを確かめる。  
+`--rate-hz` と `--sentences` は測る前に送るだけで、保存しない (電源を入れ直すと保存してある設定に戻る)。
+
+```sh
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --query                            # $PCAS06 でファームウェア (SW) や衛星システム (MO) を問い合わせる
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 600                      # 今の設定のまま 10 分測る
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 120 --sentences gga-rmc  # GGA を足して使用衛星数も見る
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 240 --rate-hz 10         # 5 Hz で保存した個体を、保存せずに 10 Hz にして測る
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 600 --log run.log        # 受信した行を到着時刻つきで残す
+```
+
+- 平均の更新レート、20 秒ごとの更新レート、RMC の時刻の間隔の内訳、届いた間隔の最大、0.7 秒以上の停止の回数、測位の状態 (A / V)、使用衛星数 (GGA を出しているときだけ) を表示する
+- 10 Hz の設定で RMC の時刻の間隔に 0.2 秒があれば、モジュールが回を飛ばしている (ロガーやPCでの取りこぼしではない)
+- 決勝の個体は、測位してから約 2 分で更新レートが落ちた。4 分以上測る
+- 計算の重さは使用衛星数で変わるかもしれないので、個体を比べるときは使用衛星数をそろえる
+
 ## ソフトウェア依存ライブラリ (platformio.ini より)
 
 - [TinyGPSPlus](https://github.com/mikalhart/TinyGPSPlus)
