@@ -83,6 +83,7 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX                       # 設
 python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --verify-only         # 書き込まず、現在の出力を確認するだけ
 python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --rate-hz 5           # 更新レートを変える (1 / 2 / 4 / 5 / 10)
 python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す (衛星数・HDOP・GNSS高度)
+python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --gnss gps            # 衛星システムを GPS のみにする (5N 版は 10 Hz を保つのに要る)
 ```
 
 | 項目 | 出荷状態 | 設定後 (既定) | 送るコマンド |
@@ -90,18 +91,24 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 | 出力センテンス | GGA / GLL / GSA / GSV / RMC / VTG / ZDA / TXT | RMC のみ | `$PCAS03,0,0,0,0,1,0,0,0,0,0,,,0,0*03` |
 | ボーレート | 9600 bps | 115200 bps | `$PCAS01,5*19` |
 | 更新レート | 1 Hz | 10 Hz | `$PCAS02,100*1E` |
+| 衛星システム | GPS+BDS (5N 版) | 変えない (`--gnss` を付けたときだけ送る) | `$PCAS04,1*18` (GPS のみ) / `$PCAS04,3*1A` (GPS+BDS) |
 | 保存 | - | モジュール内に保存 (電源を切っても残る) | `$PCAS00*01` |
 
 - 現在のボーレートは受信して自動で判定するので、設定済みのモジュールにかけ直してもよい
-- 書き込んだあと 5 秒間受信し、ボーレート・出力センテンス・更新レート・壊れた行の有無を `OK` / `NG` で表示する。`NG` があれば終了コードが 1 になる
+- 書き込んだあと 5 秒間受信し、ボーレート・出力センテンス・更新レート・壊れた行の有無を `OK` / `NG` で表示する。`--gnss` を付けたときは、`$PCAS06,2` の応答 (`MO=G` など) で衛星システムも確かめる。`NG` があれば終了コードが 1 になる
 - 設定後に一度電源を入れ直し、`--verify-only` で設定が残っていることを確かめる
 - 更新レートは測位している状態で確かめる。測位前は 10 Hz で出ていても、測位すると下がる個体がある
-- 測位中に 10 Hz を保てるかは個体によって違う (#28)。保てない個体は `--rate-hz 5` で保存する
+- 測位中に 10 Hz を保てるかは、モジュールの世代で違う (#28)。5N 版 (チップ AT6558、ファームウェア `SW=URANUS5`) は、GPS+BDS で測位すると 10 Hz の計算が間に合わず、回が抜ける。**5N 版は `--gnss gps` で GPS のみにして保存する**。世代は `measure_atgm336h.py --query` の `SW` で分かる (下の「測位中の更新レートを測る」を参照)
 
-  | 個体 | 10 Hz の設定で測位中の出力 | 5 Hz の設定で測位中の出力 |
-  | --- | --- | --- |
-  | Rhinozix ATGM336H GPS+BDS (2026 年全国大会の決勝で使用) | 約 6 Hz。回が抜ける (決勝のログでは約 3 Hz) | 5.00 Hz。回は抜けない |
-  | M5Stack Unit GPS SMA (ATGM336H-6N) | 10 Hz を保つ | 未確認 |
+  | 個体 | GPS+BDS・10 Hz | GPS のみ・10 Hz | GPS+BDS・5 Hz |
+  | --- | --- | --- | --- |
+  | Rhinozix ATGM336H GPS+BDS (5N 版、2026 年全国大会の決勝で使用) | 約 6 Hz。回が抜ける (屋内。決勝のログでは約 3 Hz) | 10.00 Hz。回は抜けない (屋外で 10 分、使用衛星 11〜13) | 5.00 Hz。回は抜けない (屋内) |
+  | ATGM336H-5N-31 (5N 版、2026 年 11 月に入手) | 6.17 Hz。回が抜ける (屋外、使用衛星 19〜21) | 10.00 Hz。回は抜けない (屋外で 10 分、使用衛星 10〜11) | 4.86 Hz。約 3% 抜ける (屋外) |
+  | M5Stack Unit GPS SMA (ATGM336H-6N、`SW=URANUS6`) | 10 Hz を保つ (GPS+BDS+GLONASS+Galileo+QZSS、屋内) | 未確認 | 未確認 |
+
+- 5N 版は、GPS+BDS で使う衛星が 12 個前後を超えると回が抜け始める (GPS のみなら 13 個でも抜けなかった)。屋内などで衛星が少ないと GPS+BDS でも 10 Hz を保つので、屋外で確かめる
+- GPS のみにすると使う衛星が約半分になり、HDOP が 0.6 から 0.8 に上がった (屋外で止まった状態。2 個体とも 0.8)。空が隠れる場所で測位が外れやすくならないかは、走行ではまだ確かめていない
+- 5N 版のファームウェアを新しくして直す見込みはない。見つかる URANUS5 はどれも `V5.3.0.0` (ビルド 2020-03-26) で、更新用のファイルも公開されていない
 
 - Rhinozix の個体は、4 Hz の設定 (`$PCAS02,250`) を送っても 5 Hz で出た
 - ロガーが使うのは時刻・日付・緯度経度・速度で、すべて RMC に入っている。RMC のみにすると衛星数・HDOP・GNSS高度は出ないが、ファームでは使っていない

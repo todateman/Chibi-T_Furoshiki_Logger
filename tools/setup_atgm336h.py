@@ -8,6 +8,10 @@
   - ボーレート 115200 bps（src/main.cpp の gnss_bps と同じ）
   - 更新レート 10 Hz
   - 出力センテンスは RMC のみ（ロガーが使う時刻・日付・緯度経度・速度はすべて RMC に入っている）
+  - --gnss を付けたときだけ、使う衛星システム（付けなければモジュールの設定のまま）
+
+5N 版（AT6558、ファームウェア URANUS5）は、GPS+BDS で測位すると 10 Hz の計算が間に合わず、回が抜ける（#28）。
+--gnss gps で GPS だけに絞ると、屋外で 10 Hz を保つ。
 
 現在のボーレートは受信して自動で判定するので、設定済みのモジュールにもそのまま使える。
 書き込んだあとは実際の出力を数秒受信し、設定どおりになっているかを確かめる。
@@ -17,6 +21,7 @@
   python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --verify-only         # 現在の出力を確認するだけ
   python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --rate-hz 5           # 更新レートを変える
   python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す（衛星数・HDOP・高度）
+  python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --gnss gps            # 衛星システムを GPS のみにする（5N 版）
 """
 
 import argparse
@@ -46,11 +51,19 @@ SENTENCE_SETS = {
     "gga-rmc": ("1,0,0,0,1,0,0,0,0,0,,,0,0", {"GGA", "RMC"}),
 }
 
+# 衛星システムの名前 → ($PCAS04 の引数, $PCAS06,2 の応答の MO=)
+# $PCAS04 の引数はビットの和（1:GPS 2:BDS 4:GLONASS）
+GNSS_SETS = {
+    "gps": ("1", "G"),
+    "gps-bds": ("3", "GB"),
+}
+
 # 1 Hz・RMC のみの出力でも複数行を受信できる長さにする（先頭と末尾の行は数えないため）
 DETECT_SECONDS = 3.5
 VERIFY_SECONDS = 5.0
 COMMAND_WAIT_SECONDS = 0.3
 STALE_SECONDS = 0.3  # 受信を始める前に、USB シリアル変換に残っていた古い受信データが届ききるまで待つ時間
+QUERY_SECONDS = 1.0  # $PCAS06 の応答を待つ時間（応答は 0.1 秒以内に返る）
 RATE_TOLERANCE = 0.15  # 行数から求めた更新レートの許容誤差（割合）
 
 SENTENCE_PATTERN = re.compile(rb"^\$([A-Z]{2}[A-Z0-9]{3}),?([\x20-\x7e]*)\*([0-9A-Fa-f]{2})$")
@@ -127,7 +140,25 @@ def send(port: serial.Serial, body: str, note: str) -> None:
     time.sleep(COMMAND_WAIT_SECONDS)
 
 
-def configure(port: serial.Serial, current_baud: int, rate_hz: int, sentences: str) -> None:
+def query_systems(port: serial.Serial) -> str | None:
+    """$PCAS06,2 で、使っている衛星システム（MO=）を問い合わせて返す。応答がなければ None。"""
+    port.reset_input_buffer()
+    port.write(build_command("PCAS06,2"))
+    port.flush()
+    started = time.monotonic()
+    buffer = bytearray()
+    while time.monotonic() - started < QUERY_SECONDS:
+        buffer += port.read(4096)
+    # 応答は送ってすぐの最初の行になることがあるので、parse() と違って先頭の行も見る
+    for piece in bytes(buffer).split(b"\n"):
+        line = piece.rstrip(b"\r")
+        matched = SENTENCE_PATTERN.match(line)
+        if matched and b"MO=" in line and checksum(line[1:-3].decode("ascii")) == int(matched.group(3), 16):
+            return line.split(b"MO=", 1)[1].split(b"*", 1)[0].decode("ascii")
+    return None
+
+
+def configure(port: serial.Serial, current_baud: int, rate_hz: int, sentences: str, gnss: str | None) -> None:
     # 9600 bps のまま更新レートを上げると全センテンスを送りきれないので、先に出力を絞る
     send(port, f"PCAS03,{SENTENCE_SETS[sentences][0]}", f"出力センテンス: {sentences}")
     if current_baud != LOGGER_BAUD:
@@ -136,10 +167,12 @@ def configure(port: serial.Serial, current_baud: int, rate_hz: int, sentences: s
         if not listen(port, DETECT_SECONDS).sentences:
             raise RuntimeError(f"{LOGGER_BAUD} bps へ切り替えたあと、NMEA を受信できません")
     send(port, f"PCAS02,{RATE_INTERVAL_MS[rate_hz]}", f"更新レート: {rate_hz} Hz")
+    if gnss:
+        send(port, f"PCAS04,{GNSS_SETS[gnss][0]}", f"衛星システム: {gnss}")
     send(port, "PCAS00", "設定をモジュールへ保存")
 
 
-def verify(port: serial.Serial, baud: int, rate_hz: int, sentences: str) -> bool:
+def verify(port: serial.Serial, baud: int, rate_hz: int, sentences: str, gnss: str | None) -> bool:
     """実際の出力を受信し、ロガーが読める設定になっているかを表示して返す。"""
     capture = listen(port, VERIFY_SECONDS)
     counts = capture.counts()
@@ -154,8 +187,14 @@ def verify(port: serial.Serial, baud: int, rate_hz: int, sentences: str) -> bool
         ("更新レート", f"{measured_hz:.1f} Hz", abs(measured_hz - rate_hz) <= max(0.5, rate_hz * RATE_TOLERANCE)),
         ("壊れた行", f"{capture.broken} 行", capture.broken == 0),
     ]
+    systems = query_systems(port)
+    systems_text = f"MO={systems}" if systems is not None else "応答なし"
+    if gnss:
+        checks.append(("衛星システム", systems_text, systems == GNSS_SETS[gnss][1]))
     for name, value, ok in checks:
         print(f"  {'OK' if ok else 'NG'}  {name}: {value}")
+    if not gnss:
+        print(f"  --  衛星システム: {systems_text}（G: GPS、B: BDS、R: GLONASS、E: Galileo、Q: QZSS）")
 
     rmc = [line.split(",") for line in capture.sentences if line[3:6] == "RMC"]
     if rmc:
@@ -171,6 +210,11 @@ def main() -> int:
     parser.add_argument("port", help="モジュールをつないだシリアルポート（例: /dev/cu.usbmodemXXXX）")
     parser.add_argument("--rate-hz", type=int, choices=sorted(RATE_INTERVAL_MS), default=10, help="更新レート [Hz]（既定 10）")
     parser.add_argument("--sentences", choices=sorted(SENTENCE_SETS), default="rmc", help="出力センテンス（既定 rmc）")
+    parser.add_argument(
+        "--gnss",
+        choices=sorted(GNSS_SETS),
+        help="使う衛星システム（既定: 送らずモジュールの設定のまま。5N 版は gps で 10 Hz を保つ）",
+    )
     parser.add_argument("--verify-only", action="store_true", help="設定を書き込まず、現在の出力が設定どおりかを確認する")
     args = parser.parse_args()
 
@@ -184,12 +228,12 @@ def main() -> int:
 
             if not args.verify_only:
                 print("設定を書き込み中...")
-                configure(port, baud, args.rate_hz, args.sentences)
+                configure(port, baud, args.rate_hz, args.sentences, args.gnss)
                 baud = LOGGER_BAUD
 
             print(f"出力を確認中（{VERIFY_SECONDS:.0f} 秒）...")
             port.baudrate = baud
-            ok = verify(port, baud, args.rate_hz, args.sentences)
+            ok = verify(port, baud, args.rate_hz, args.sentences, args.gnss)
     except (OSError, RuntimeError) as e:
         print(f"{args.port}: エラー: {e}", file=sys.stderr)
         return 1
