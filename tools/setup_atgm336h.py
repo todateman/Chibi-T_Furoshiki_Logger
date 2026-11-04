@@ -50,6 +50,7 @@ SENTENCE_SETS = {
 DETECT_SECONDS = 3.5
 VERIFY_SECONDS = 5.0
 COMMAND_WAIT_SECONDS = 0.3
+STALE_SECONDS = 0.3  # 受信を始める前に、USB シリアル変換に残っていた古い受信データが届ききるまで待つ時間
 RATE_TOLERANCE = 0.15  # 行数から求めた更新レートの許容誤差（割合）
 
 SENTENCE_PATTERN = re.compile(rb"^\$([A-Z]{2}[A-Z0-9]{3}),?([\x20-\x7e]*)\*([0-9A-Fa-f]{2})$")
@@ -96,6 +97,10 @@ def parse(buffer: bytes, seconds: float) -> Capture:
 
 
 def listen(port: serial.Serial, seconds: float) -> Capture:
+    # USB シリアル変換の中に、前にポートを閉じたあとに受信した行が残っていて、開いた直後に届くことがある。
+    # 前のボーレートで正しく受信された行なので、残したままだと今のボーレートで読めたと誤判定する。少し待ってから捨てる
+    port.reset_input_buffer()
+    time.sleep(STALE_SECONDS)
     port.reset_input_buffer()
     started = time.monotonic()
     buffer = bytearray()
