@@ -83,6 +83,7 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX                       # 設
 python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --verify-only         # 書き込まず、現在の出力を確認するだけ
 python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --rate-hz 5           # 更新レートを変える (1 / 2 / 4 / 5 / 10)
 python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す (衛星数・HDOP・GNSS高度)
+python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --gnss gps            # 衛星システムを GPS のみにする (5N 版は 10 Hz を保つのに要る)
 ```
 
 | 項目 | 出荷状態 | 設定後 (既定) | 送るコマンド |
@@ -90,22 +91,47 @@ python3 tools/setup_atgm336h.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA
 | 出力センテンス | GGA / GLL / GSA / GSV / RMC / VTG / ZDA / TXT | RMC のみ | `$PCAS03,0,0,0,0,1,0,0,0,0,0,,,0,0*03` |
 | ボーレート | 9600 bps | 115200 bps | `$PCAS01,5*19` |
 | 更新レート | 1 Hz | 10 Hz | `$PCAS02,100*1E` |
+| 衛星システム | GPS+BDS (5N 版) | 変えない (`--gnss` を付けたときだけ送る) | `$PCAS04,1*18` (GPS のみ) / `$PCAS04,3*1A` (GPS+BDS) |
 | 保存 | - | モジュール内に保存 (電源を切っても残る) | `$PCAS00*01` |
 
 - 現在のボーレートは受信して自動で判定するので、設定済みのモジュールにかけ直してもよい
-- 書き込んだあと 5 秒間受信し、ボーレート・出力センテンス・更新レート・壊れた行の有無を `OK` / `NG` で表示する。`NG` があれば終了コードが 1 になる
+- 書き込んだあと 5 秒間受信し、ボーレート・出力センテンス・更新レート・壊れた行の有無を `OK` / `NG` で表示する。`--gnss` を付けたときは、`$PCAS06,2` の応答 (`MO=G` など) で衛星システムも確かめる。`NG` があれば終了コードが 1 になる
 - 設定後に一度電源を入れ直し、`--verify-only` で設定が残っていることを確かめる
 - 更新レートは測位している状態で確かめる。測位前は 10 Hz で出ていても、測位すると下がる個体がある
-- 測位中に 10 Hz を保てるかは個体によって違う (#28)。保てない個体は `--rate-hz 5` で保存する
+- 測位中に 10 Hz を保てるかは、モジュールの世代で違う (#28)。5N 版 (チップ AT6558、ファームウェア `SW=URANUS5`) は、GPS+BDS で測位すると 10 Hz の計算が間に合わず、回が抜ける。**5N 版は `--gnss gps` で GPS のみにして保存する**。世代は `measure_atgm336h.py --query` の `SW` で分かる (下の「測位中の更新レートを測る」を参照)
 
-  | 個体 | 10 Hz の設定で測位中の出力 | 5 Hz の設定で測位中の出力 |
-  | --- | --- | --- |
-  | Rhinozix ATGM336H GPS+BDS (2026 年全国大会の決勝で使用) | 約 6 Hz。回が抜ける (決勝のログでは約 3 Hz) | 5.00 Hz。回は抜けない |
-  | M5Stack Unit GPS SMA (ATGM336H-6N) | 10 Hz を保つ | 未確認 |
+  | 個体 | GPS+BDS・10 Hz | GPS のみ・10 Hz | GPS+BDS・5 Hz |
+  | --- | --- | --- | --- |
+  | Rhinozix ATGM336H GPS+BDS (5N 版、2026 年全国大会の決勝で使用) | 約 6 Hz。回が抜ける (屋内。決勝のログでは約 3 Hz) | 10.00 Hz。回は抜けない (屋外で 10 分、使用衛星 11〜13) | 5.00 Hz。回は抜けない (屋内) |
+  | ATGM336H-5N-31 (5N 版、2026 年 11 月に入手) | 6.17 Hz。回が抜ける (屋外、使用衛星 19〜21) | 10.00 Hz。回は抜けない (屋外で 10 分、使用衛星 10〜11) | 4.86 Hz。約 3% 抜ける (屋外) |
+  | M5Stack Unit GPS SMA (ATGM336H-6N、`SW=URANUS6`) | 10 Hz を保つ (GPS+BDS+GLONASS+Galileo+QZSS、屋内) | 未確認 | 未確認 |
+
+- 5N 版は、GPS+BDS で使う衛星が 12 個前後を超えると回が抜け始める (GPS のみなら 13 個でも抜けなかった)。屋内などで衛星が少ないと GPS+BDS でも 10 Hz を保つので、屋外で確かめる
+- GPS のみにすると使う衛星が約半分になり、HDOP が 0.6 から 0.8 に上がった (屋外で止まった状態。2 個体とも 0.8)。空が隠れる場所で測位が外れやすくならないかは、走行ではまだ確かめていない
+- 5N 版のファームウェアを新しくして直す見込みはない。見つかる URANUS5 はどれも `V5.3.0.0` (ビルド 2020-03-26) で、更新用のファイルも公開されていない
 
 - Rhinozix の個体は、4 Hz の設定 (`$PCAS02,250`) を送っても 5 Hz で出た
 - ロガーが使うのは時刻・日付・緯度経度・速度で、すべて RMC に入っている。RMC のみにすると衛星数・HDOP・GNSS高度は出ないが、ファームでは使っていない
 - ファーム側の変更は不要 (`src/main.cpp` の `gnss_bps` は 115200 のまま)。配線は GY-NEO-6MV2 と同じで、つないだあと屋外で画面右上の GNSS の表示が `O` になることを確認する (`O` は直近 3 秒以内に測位した位置があること。一度測位したあとも、位置が古くなれば `x` に戻る)
+
+#### 測位中の更新レートを測る
+
+`setup_atgm336h.py` の確認は 5 秒しか受信しないので、測位して数分たってから回が抜ける個体を見逃す。  
+`tools/measure_atgm336h.py` で数分受信し、更新レートが落ちないか、モジュールが回を飛ばしていないかを確かめる。  
+`--rate-hz` と `--sentences` は測る前に送るだけで、保存しない (電源を入れ直すと保存してある設定に戻る)。
+
+```sh
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --query                            # $PCAS06 でファームウェア (SW) や衛星システム (MO) を問い合わせる
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 600                      # 今の設定のまま 10 分測る
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 120 --sentences gga-rmc  # GGA を足して使用衛星数も見る
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 240 --rate-hz 10         # 5 Hz で保存した個体を、保存せずに 10 Hz にして測る
+python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 600 --log run.log        # 受信した行を到着時刻つきで残す
+```
+
+- 平均の更新レート、20 秒ごとの更新レート、RMC の時刻の間隔の内訳、届いた間隔の最大、0.7 秒以上の停止の回数、測位の状態 (A / V)、使用衛星数 (GGA を出しているときだけ) を表示する
+- 10 Hz の設定で RMC の時刻の間隔に 0.2 秒があれば、モジュールが回を飛ばしている (ロガーやPCでの取りこぼしではない)
+- 決勝の個体は、測位してから約 2 分で更新レートが落ちた。4 分以上測る
+- 計算の重さは使用衛星数で変わるかもしれないので、個体を比べるときは使用衛星数をそろえる
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
 
