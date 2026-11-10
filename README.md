@@ -46,6 +46,7 @@ M5Stack Core2 / Basic 上で動作するエコラン競技車両向けロガー�
     3. 文は届くのに、一度測位したあと位置が `GNSS_FIX_LOST_RESTART_MS` (10秒) 更新されない: ホットスタートを送る (最短 30 秒おき)
     - モジュールが完全に固まって UART の入力を受け付けないときは戻らない (電源の入れ直しが要る)。ホットスタートは ATGM336H 用なので、ポータブル仕様 (M5Stack GNSS Module) では 1 の開き直しだけ行う
   - ATGM336H も使える。出荷状態は 9600 bps でそのままでは読めないので、先に `tools/setup_atgm336h.py` で設定を書き込んでおく (「ATGM336H を使う場合の設定」を参照)
+  - MAX-M10S (u-blox M10) も使える。出荷状態は 38400 bps でそのままでは読めないので、先に `tools/setup_max_m10s.py` で設定を書き込んでおく (「MAX-M10S を使う場合の設定」を参照)。2 と 3 のホットスタート (`$PCAS10`) は MAX-M10S には効かない
 - 環境センサ (気圧/気温/湿度): 起動時に下の順で探し、先に見つかった方を使う。SDA/SCLは `M5.Ex_I2C.getSDA()/getSCL()` でボード既定値を自動取得
   1. [Unit ENV-III](https://docs.m5stack.com/en/unit/Unit_ENV-III): I2C 0x44 (SHT30: 気温/湿度) + 0x70 (QMP6988: 気圧)。BME280 より精度が高い (気温 ±0.2℃、湿度 ±2%RH)。BME280 と同じ I2C バス (Port A) に繋ぐ (M5Stack Basic で BLE 中継機と同時に使うときは Grove ハブで分岐する)
   2. BME280: I2C 0x76 / 0x77 (Unit ENV-III が見つからないときだけ使う)
@@ -144,6 +145,50 @@ python3 tools/measure_atgm336h.py /dev/cu.usbmodemXXXX --seconds 600 --log run.l
 - 10 Hz の設定で RMC の時刻の間隔に 0.2 秒があれば、モジュールが回を飛ばしている (ロガーやPCでの取りこぼしではない)
 - 決勝の個体は、測位してから約 2 分で更新レートが落ちた。4 分以上測る
 - 計算の重さは使用衛星数で変わるかもしれないので、個体を比べるときは使用衛星数をそろえる
+- MAX-M10S もオプションなしなら測れる (何も送らずに受信するだけ)。`--query`、`--rate-hz`、`--sentences` は ATGM336H 用のコマンド (`$PCAS`) なので、MAX-M10S には効かない
+
+### MAX-M10S を使う場合の設定
+
+u-blox の [MAX-M10S](https://www.u-blox.com/en/product/max-m10-series) を載せた基板も、ATGM336H の代わりに使える (#28)。  
+出荷状態は 38400 bps・1 Hz・6 種類のセンテンス出力なので、ロガーにつなぐ前に `tools/setup_max_m10s.py` で設定を書き込み、モジュールに保存しておく。  
+`setup_atgm336h.py` と同じく、PC上で実行する (Python 3.10 以上、`pyserial` が必要)。設定は UBX の `UBX-CFG-VALSET` で送る。
+
+```sh
+python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX                       # 設定して保存し、実際の出力と保存した設定を確認
+python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --verify-only         # 書き込まず、現在の出力と保存した設定を確認するだけ
+python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --query               # ファームウェア (UBX-MON-VER) と RAM・BBR の設定を表示する
+python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す (衛星数・HDOP・GNSS高度)
+python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --gnss gps            # 衛星システムを GPS のみにする
+```
+
+| 項目 | 出荷状態 | 設定後 (既定) |
+| --- | --- | --- |
+| 出力センテンス | GGA / GLL / GSA / GSV / RMC / VTG | RMC のみ |
+| ボーレート | 38400 bps | 115200 bps |
+| 更新レート | 1 Hz | 10 Hz |
+| 衛星システム | GPS+Galileo+BeiDou (B1I)+QZSS+SBAS | GPS+Galileo+QZSS+SBAS (BeiDou を止める) |
+| 保存先 | - | RAM と BBR (V_BCKP の電池で保つ RAM) |
+
+- **出荷時の衛星システムのままでは 10 Hz を保てない。** データシートの最大の更新レートは、GPS+Galileo+BeiDou が 3 Hz、GPS+Galileo が 10 Hz、GPS のみが 18 Hz。実測 (ベランダで 3 分、10 Hz・GGA+RMC) では次のとおりで、既定を GPS+Galileo にした
+
+  | 衛星システム | 更新レート | RMC の時刻の間隔 | HDOP | 平均位置からの距離 50% / 95% |
+  | --- | --- | --- | --- | --- |
+  | GPS+Galileo+BeiDou+QZSS+SBAS (出荷時) | 8.98 Hz | 0.1 秒: 1434 回、0.2 秒: 179 回 | 0.69 | 0.5 m / 1.2 m |
+  | GPS+Galileo+QZSS+SBAS (既定) | 10.00 Hz | すべて 0.1 秒 | 0.91 | 0.8 m / 1.3 m |
+  | GPS+QZSS+SBAS (`--gnss gps`) | 10.00 Hz | すべて 0.1 秒 | 2.37 | 2.8 m / 6.2 m |
+
+- データシートには、より高い更新レートにする「高性能モード」もある。ただし OTP (1 回しか書き込めないメモリ) への書き込みが要り、元に戻せないので、このスクリプトでは扱わない
+- 既定の設定で、ベランダで 10 分測って 10.00 Hz (RMC の時刻の間隔はすべて 0.1 秒)。同じ場所・同じアンテナの ATGM336H-6N-74 と比べた結果 (止まった状態で 5 分、測った日は違う):
+
+  | モジュール | 平均位置からの距離 50% / 95% | 止まっているときの速度 (中央値 / 最大) | 高度の標準偏差 | HDOP |
+  | --- | --- | --- | --- | --- |
+  | MAX-M10S (GPS+Galileo+QZSS+SBAS) | 1.8 m / 4.4 m | 0.16 km/h / 1.5 km/h | 2.1 m | 0.9 |
+  | ATGM336H-6N-74 (GPS+BDS+QZSS) | 3.0 m / 8.4 m | 1.4 km/h / 7.3 km/h | 3.1 m | 0.6 |
+
+- MAX-M10S にはフラッシュがない。電池の載った基板 (V_BCKP に電池) なら、電源を入れ直しても BBR の設定と衛星の軌道情報が残り、0.6 秒で測位した。電池が切れると出荷時の設定 (38400 bps・1 Hz) に戻り、ロガーで読めなくなる。電池がどれだけ持つかはまだ確かめていない。ロガーにつなぐ前に `--verify-only` で確かめる
+- 試した基板 ([AliExpress で入手](https://ja.aliexpress.com/item/1005012864034777.html)、シルク `GNSS-GPS+BD`、ファームウェア `ROM SPG 5.10`) には、電池のほかに I2C の EEPROM (BL24C02F) も載っている。MAX-M10S は I2C の EEPROM に設定を保存できないので、この EEPROM は使われない
+- u-blox の NMEA は GGA の使用衛星数を 12 までしか出さないので、`measure_atgm336h.py` の使用衛星数は 12 で頭打ちになる
+- ファーム側の変更は要らない見込み (`src/main.cpp` の `gnss_bps` は 115200 のまま。TinyGPS++ は `$GNRMC` を読める)。ただし、ロガーにつないではまだ試していない。受信が止まったときのホットスタート (`$PCAS10`) は効かず、Serial2 の開き直しだけになる
 
 ## ソフトウェア依存ライブラリ (platformio.ini より)
 

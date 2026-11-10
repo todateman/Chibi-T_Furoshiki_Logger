@@ -16,7 +16,7 @@ for path in sys.argv[1:]:
 PY
 
 echo "== pre-push: tools/*.py の --help"
-for f in tools/setup_atgm336h.py tools/measure_atgm336h.py; do
+for f in tools/setup_atgm336h.py tools/measure_atgm336h.py tools/setup_max_m10s.py; do
     if [ -f "$f" ]; then
         PYTHONDONTWRITEBYTECODE=1 python3 "$f" --help >/dev/null
         echo "  OK $f --help"
