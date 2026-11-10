@@ -24,6 +24,7 @@
 #include "CourseMap.h"
 #include "LimitMargin.h"
 #include "StrategyAssist.h"
+#include "UbloxM10.h"
 #include "UnitEnvIII.h"
 #include "secrets.h"
 
@@ -91,8 +92,19 @@ constexpr uint8_t BLE_I2C_SCL = 22;
 #define GNSS_STALL_MS 3000UL              // NMEAの文がこの時間届かなければUARTを開き直す
 #define GNSS_FIX_LOST_RESTART_MS 10000UL  // 文は届くのに測位がこの時間更新されなければモジュールを再起動する（一度測位した後のみ）
 #define GNSS_RESTART_RETRY_MS 30000UL     // 測位が戻らないときのモジュール再起動の最短間隔
-// モジュールの再起動コマンド($PCAS10)はATGM336H用。M5Stack GNSS Module(u-blox)には送らない
+// モジュールの再起動は、ATGM336H 用の $PCAS10 と u-blox（MAX-M10S など）用の UBX-CFG-RST を両方送る（それぞれ相手のコマンドは無視する）
+// M5Stack GNSS Module には送らない
 #define GNSS_HOT_START_AVAILABLE (!GNSS_MODULE_M5)
+
+// 起動時のGNSSモジュールの設定確認（車載のみ。#28）
+// MAX-M10S は設定を電池で保つ RAM（BBR）にしか残せず、電池が切れると出荷時の 38400 bps・1 Hz に戻る。
+// 起動時に gnss_bps で読めなければ 38400 bps で受信してみて、読めれば UBX で設定を送り直す
+#define GNSS_BOOT_LISTEN_MS 1200UL        // 各ボーレートで受信してみる時間（1 Hz・複数センテンスのモジュールでも 2 文以上届く長さ）
+#define GNSS_BOOT_STALE_MS 50UL           // ボーレートを切り替えたあと、前のボーレートの受信データを捨てるまで待つ時間
+#define GNSS_BOOT_ROUNDS 2                // どちらのボーレートでも読めないとき、モジュールの起動待ちとしてやり直す回数
+#define GNSS_BOOT_APPLY_WAIT_MS 1000UL    // 衛星システムを変えると GNSS が再起動するので、ボーレートを送る前に待つ時間
+#define GNSS_BOOT_VERIFY_MS 2500UL        // 設定を送ったあと、gnss_bps で RMC が届くかを確かめる時間
+#define GNSS_BOOT_VERIFY_MIN_RMC 5        // この数以上 RMC が届けば、設定し直せたとみなす
 
 // ECU/SDログ処理の高速化用バッファ・しきい値（10Hzロギング対応）
 #define ECU_LINE_BUFFER_SIZE 128
@@ -228,6 +240,10 @@ unsigned long gnssLastRestartAt = 0;   // 最後にモジュールへ再起動�
 uint8_t gnssStallAttempts = 0;         // 受信が止まってからUARTを開き直した回数（文が届けば0に戻す）
 uint16_t gnssUartReinitCount = 0;      // UARTを開き直した累計回数
 uint16_t gnssRestartCount = 0;         // モジュールへ再起動を送った累計回数
+// 起動時のGNSSモジュールの設定確認の結果（SDログの「GNSS起動時設定」列。ポータブル仕様と仮想走行では確かめないので空欄）
+//   0: gnss_bps で読めた（設定済み）  1: 出荷時の MAX-M10S だったので設定を送り直し、gnss_bps で読めた
+//   2: 設定を送り直したが gnss_bps で読めなかった  3: gnss_bps でも 38400 bps でも読めなかった（未接続、ATGM336H の出荷状態など）
+const char* gnssBootConfigResult = "";
 String Loc = "";    // ロケーション識別子（"su":鈴鹿, "mo":茂木, "to":豊田）
 
 // 環境センサー（気圧・気温・湿度）。高度推定にも使う
@@ -2025,10 +2041,71 @@ void updateLapCountByControlLineCrossing(bool positionUpdated, double prevLat, d
 
 // GNSSモジュールへホットスタート（保存した設定と衛星の軌道情報を保ったままの再起動）を送る
 void restartGnssModule() {
-  Serial2.print(F("$PCAS10,0*1C\r\n"));
+  Serial2.print(F("$PCAS10,0*1C\r\n"));  // ATGM336H
+  uint8_t frame[UbloxM10::MAX_FRAME_BYTES];
+  const size_t length = UbloxM10::buildHotStart(frame, sizeof(frame));  // u-blox（MAX-M10S など）
+  Serial2.write(frame, length);
   gnssLastRestartAt = millis();
   gnssRestartCount++;
 }
+
+#if !GNSS_MODULE_M5
+// baud で Serial2 を開き直し、ms のあいだ受信して、チェックサムの合う NMEA を数える
+UbloxM10::NmeaCounter listenGnssAt(uint32_t baud, unsigned long ms) {
+  Serial2.begin(baud);  // 2回目以降のbegin()はUARTドライバを入れ直す（ピンは前回のまま）
+  delay(GNSS_BOOT_STALE_MS);
+  while (Serial2.available() > 0) {
+    Serial2.read();  // 前のボーレートで受信した残りを捨てる
+  }
+  UbloxM10::NmeaCounter counter;
+  const unsigned long started = millis();
+  while (millis() - started < ms) {
+    while (Serial2.available() > 0) {
+      counter.feed(static_cast<char>(Serial2.read()));
+    }
+    delay(1);
+  }
+  return counter;
+}
+
+// 起動時に、GNSSモジュールの出力が gnss_bps で読めるかを確かめる。
+// 読めず、38400 bps で読めれば出荷時の設定に戻った MAX-M10S とみなし、tools/setup_max_m10s.py の既定と同じ設定を
+// RAM と BBR へ送り直す（#28）。38400 bps で読めたときだけ UBX を送るので、ほかのモジュールには送らない
+void ensureGnssModuleConfigured() {
+  for (uint8_t round = 0; round < GNSS_BOOT_ROUNDS; round++) {
+    if (listenGnssAt(gnss_bps, GNSS_BOOT_LISTEN_MS).valid() >= 2) {
+      gnssBootConfigResult = "0";
+      Serial.printf("[GNSS] boot: readable at %d bps\n", gnss_bps);
+      return;
+    }
+    if (listenGnssAt(UbloxM10::FACTORY_BAUD, GNSS_BOOT_LISTEN_MS).valid() < 2) {
+      continue;  // モジュールがまだ起動していないかもしれないので、もう一度試す
+    }
+
+    Serial.printf("[GNSS] boot: factory output at %lu bps, sending MAX-M10S config\n",
+                  static_cast<unsigned long>(UbloxM10::FACTORY_BAUD));
+    uint8_t frame[UbloxM10::MAX_FRAME_BYTES];
+    size_t length = UbloxM10::buildLoggerConfig(frame, sizeof(frame));
+    Serial2.write(frame, length);
+    Serial2.flush();
+    delay(GNSS_BOOT_APPLY_WAIT_MS);
+    // ボーレートは最後に変える（送るとすぐに切り替わり、そのあとの UBX は届かない）
+    length = UbloxM10::buildBaudrate(static_cast<uint32_t>(gnss_bps), frame, sizeof(frame));
+    Serial2.write(frame, length);
+    Serial2.flush();
+
+    const UbloxM10::NmeaCounter verified = listenGnssAt(gnss_bps, GNSS_BOOT_VERIFY_MS);
+    const bool ok = verified.rmc() >= GNSS_BOOT_VERIFY_MIN_RMC;
+    gnssBootConfigResult = ok ? "1" : "2";
+    Serial.printf("[GNSS] boot: MAX-M10S config %s (%u RMC in %lums at %d bps)\n", ok ? "applied" : "FAILED",
+                  static_cast<unsigned int>(verified.rmc()), GNSS_BOOT_VERIFY_MS, gnss_bps);
+    return;
+  }
+  gnssBootConfigResult = "3";
+  Serial2.begin(gnss_bps);
+  Serial.printf("[GNSS] boot: no NMEA at %d or %lu bps\n", gnss_bps, static_cast<unsigned long>(UbloxM10::FACTORY_BAUD));
+}
+#endif
 
 // GNSSの受信が止まっていれば立ち直らせる
 // 1回目はUARTの開き直しだけを行い、それでも届かなければモジュールの再起動も送る
@@ -2540,7 +2617,7 @@ void updateSDLog() {
       if (isNewFile) {
         logFile.timestamp(T_CREATE, 2024, 1, 31, 23, 59, 59);
         logFile.write(0xEF); logFile.write(0xBB); logFile.write(0xBF);
-        logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa),GNSS測位経過(ms),GNSS受信文字数,GNSS正常文数,GNSSエラー文数,GNSS UART再初期化(回),GNSS再起動(回)"));
+        logFile.println(F("記録日時,速度(km/h),ラップ数(周目),走行時間(秒),回転数(rpm),燃料噴射時間(ms),点火進角角度(CA),燃料噴射終了角度(CA),走行距離積算(m),積算燃料消費量(ml),燃費(km/l),lat(緯度),lng(経度),標高(m),場所,温度(C),気圧(kPa),気温(C),湿度(%),1次空気圧(MPa),2次空気圧(MPa),燃圧(MPa),GNSS測位経過(ms),GNSS受信文字数,GNSS正常文数,GNSSエラー文数,GNSS UART再初期化(回),GNSS再起動(回),GNSS起動時設定"));
         saveNextLogIndex(fileNum + 1);
       }
       logFileInitialized = true;
@@ -2560,7 +2637,7 @@ void updateSDLog() {
     char logLine[SD_LINE_BUFFER_SIZE] = {0};
     int lineLen = snprintf(logLine,
                            sizeof(logLine),
-                           "%s,%.1f,%u,%.1f,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f,%s,%lu,%lu,%lu,%u,%u\n",
+                           "%s,%.1f,%u,%.1f,%u,%.1f,%u,%d,%u,%.1f,%.1f,%.7f,%.7f,%.1f,%s,%.2f,%s,%s,%s,%.3f,%.3f,%.3f,%s,%lu,%lu,%lu,%u,%u,%s\n",
                            datetime,
                            speed,
                            static_cast<unsigned int>(Lapcount) + 1u,  // ログは「周目」なので完了周回数+1（1周目=1）
@@ -2588,7 +2665,8 @@ void updateSDLog() {
                            static_cast<unsigned long>(gps.passedChecksum()),
                            static_cast<unsigned long>(gps.failedChecksum()),
                            static_cast<unsigned int>(gnssUartReinitCount),
-                           static_cast<unsigned int>(gnssRestartCount));
+                           static_cast<unsigned int>(gnssRestartCount),
+                           gnssBootConfigResult);
 
     if (lineLen <= 0 || lineLen >= static_cast<int>(sizeof(logLine))) {
       Serial.println("SD log line build failed");
@@ -2962,6 +3040,11 @@ void setup() {
   // ECUと同じく、MQTT/HTTP等のブロッキング中もNMEAを取りこぼさないようbegin()より前にRXバッファを拡大する
   Serial2.setRxBufferSize(1024);
   Serial2.begin(gnss_bps);
+#if !GNSS_MODULE_M5 && !STRATEGY_SIM
+  // 出荷時の設定に戻った MAX-M10S なら設定し直す（最後は gnss_bps で開いた状態で戻る）
+  // 机上確認用の仮想走行では GNSS をつながないことが多く、起動が約 5 秒遅れるので行わない
+  ensureGnssModuleConfigured();
+#endif
 
   // BLE中継機(NanoC6)用I2Cバスの初期化
   // Basicは気圧センサー用Wireバスと同一ピンのため、Wire.begin()の再呼び出しによる速度低下(400kHz→100kHz)を避けて共用する
