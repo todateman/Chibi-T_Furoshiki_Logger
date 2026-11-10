@@ -24,7 +24,7 @@ MAX-M10S にはフラッシュがない。設定は RAM と BBR（V_BCKP の電�
 使い方:
   python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX                       # 設定して保存、結果を確認
   python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --verify-only         # 現在の出力と保存した設定を確認するだけ
-  python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --query               # ファームウェアと RAM・BBR の設定を表示する
+  python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --query               # ファームウェア、RAM・BBR の設定、補正（SLAS・SBAS）の状態を表示する
   python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す（衛星数・HDOP・高度）
   python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --gnss gps            # 衛星システムを GPS のみにする
 """
@@ -67,7 +67,15 @@ KEY_NMEA = {  # UART1 へ何測位ごとに出すか（0 は出さない）
     "RMC": 0x209100AC,
     "VTG": 0x209100B1,
 }
+# 補正（SLAS・SBAS）の設定。--query で表示するだけで、書き込まない（既定ではすべて有効）
+KEY_QZSS_L1S = 0x10310014  # みちびきの L1S 信号（SLAS の補正が載っている）を受信する
+KEY_SLAS_DGNSS = 0x10370005  # SLAS の補正を測位に使う
+KEY_SLAS_TESTMODE = 0x10370006  # 試験中の衛星の SLAS の補正も使う
+KEY_SLAS_MAX_BASELINE = 0x30370008  # 最寄りの監視局からこの距離 [km] までなら SLAS の補正を使う
+KEY_SBAS_DIFFCORR = 0x10360004  # SBAS の補正を測位に使う
 VALUE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8}  # キーの 28〜30 ビット → 値のバイト数
+# UBX-NAV-SIG の corrSource（信号ごとの補正元）
+CORRECTION_SOURCES = {0: "なし", 1: "SBAS", 2: "BeiDou", 3: "RTCM2", 4: "RTCM3 OSR", 5: "RTCM3 SSR", 6: "QZSS SLAS", 7: "SPARTN", 8: "CLAS"}
 
 LAYER_RAM = 0x01  # UBX-CFG-VALSET の layers（ビットの和）
 LAYER_BBR = 0x02
@@ -210,6 +218,71 @@ def query(port: serial.Serial) -> None:
     for layer, name in ((GET_LAYER_RAM, "RAM（今の設定）"), (GET_LAYER_BBR, "BBR（保存した設定）")):
         values = valget(port, ALL_KEYS, layer)
         print(f"  {name}: " + ("応答なし" if values is None else describe(values) if values else "保存なし"))
+    query_corrections(port)
+
+
+def poll(port: serial.Serial, cls: int, msg_id: int) -> bytes | None:
+    """UBX のメッセージを問い合わせ（中身なしで送る）、応答の中身を返す。応答がなければ None。"""
+    for got_cls, got_id, body in ubx_request(port, ubx_frame(cls, msg_id), {(cls, msg_id)}):
+        if (got_cls, got_id) == (cls, msg_id):
+            return body
+    return None
+
+
+def query_corrections(port: serial.Serial) -> None:
+    """SLAS（みちびきの L1S 信号による補正）と SBAS の設定と、いま補正が使われているかを表示する。"""
+    keys = [KEY_QZSS_L1S, KEY_SLAS_DGNSS, KEY_SLAS_TESTMODE, KEY_SLAS_MAX_BASELINE, KEY_SBAS_DIFFCORR]
+    values = valget(port, keys, GET_LAYER_RAM)
+    if values:
+
+        def on(key: int) -> str:
+            return "有効" if values.get(key) else "無効"
+
+        print(
+            f"  SLAS の設定: L1S の受信 {on(KEY_QZSS_L1S)}、補正を使う {on(KEY_SLAS_DGNSS)}、"
+            f"試験中の衛星 {'使う' if values.get(KEY_SLAS_TESTMODE) else '使わない'}、"
+            f"監視局から {values.get(KEY_SLAS_MAX_BASELINE)} km まで"
+        )
+        print(f"  SBAS の補正: {on(KEY_SBAS_DIFFCORR)}")
+    else:
+        print("  SLAS・SBAS の設定: 応答なし")
+
+    pvt = poll(port, 0x01, 0x07)  # UBX-NAV-PVT
+    if pvt is None or len(pvt) < 24:
+        print("  測位: 応答なし")
+        return
+    fix_type, flags, satellites = pvt[20], pvt[21], pvt[23]
+    if not flags & 0x01:
+        print(f"  測位: なし（fixType {fix_type}。屋外でアンテナをつないで確かめる）")
+        return
+    print(f"  測位: {fix_type}D、使用衛星 {satellites}、補正 {'あり' if flags & 0x02 else 'なし'}（UBX-NAV-PVT の diffSoln）")
+
+    slas = poll(port, 0x01, 0x42)  # UBX-NAV-SLAS
+    if slas is not None and len(slas) >= 20:
+        gms_lon, gms_lat, gms_code, qzss_sv, service, count = struct.unpack("<iiBBBB", slas[8:20])
+        if service & 0x01:
+            test = "、試験中" if service & 0x04 else ""
+            print(
+                f"  SLAS: 監視局 {gms_code}（{gms_lat / 1e3:.3f}, {gms_lon / 1e3:.3f}）、"
+                f"補正を送るみちびき svId {qzss_sv}{test}、補正 {count} 機"
+            )
+        else:
+            print("  SLAS: 使える監視局なし（L1S を受信できていない、または監視局から遠い）")
+
+    signals = poll(port, 0x01, 0x43)  # UBX-NAV-SIG
+    if signals is not None and len(signals) >= 8:
+        used = 0
+        sources: dict[str, int] = {}
+        for start in range(8, 8 + signals[5] * 16, 16):
+            record = signals[start : start + 16]
+            sig_flags = struct.unpack("<H", record[10:12])[0]
+            if not sig_flags & 0x08:  # prUsed: 擬似距離を測位に使った
+                continue
+            used += 1
+            source = CORRECTION_SOURCES.get(record[8], str(record[8])) if sig_flags & 0x40 else "なし"
+            sources[source] = sources.get(source, 0) + 1
+        detail = "、".join(f"{name} {count}" for name, count in sorted(sources.items(), key=lambda item: -item[1]))
+        print(f"  測位に使った信号: {used}（補正元: {detail or 'なし'}）")
 
 
 def configure(port: serial.Serial, current_baud: int, rate_hz: int, sentences: str, gnss: str) -> None:
@@ -280,7 +353,7 @@ def main() -> int:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--verify-only", action="store_true", help="設定を書き込まず、現在の出力と保存した設定を確認する")
-    mode.add_argument("--query", action="store_true", help="ファームウェアと RAM・BBR の設定を表示して終わる（設定は変えない）")
+    mode.add_argument("--query", action="store_true", help="ファームウェア、RAM・BBR の設定、補正（SLAS・SBAS）の状態を表示して終わる（設定は変えない）")
     args = parser.parse_args()
 
     try:

@@ -159,7 +159,7 @@ u-blox の [MAX-M10S](https://www.u-blox.com/en/product/max-m10-series) を載�
 ```sh
 python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX                       # 設定して保存し、実際の出力と保存した設定を確認
 python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --verify-only         # 書き込まず、現在の出力と保存した設定を確認するだけ
-python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --query               # ファームウェア (UBX-MON-VER) と RAM・BBR の設定を表示する
+python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --query               # ファームウェア (UBX-MON-VER)、RAM・BBR の設定、補正 (SLAS・SBAS) の状態を表示する
 python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --sentences gga-rmc   # GGA も出す (衛星数・HDOP・GNSS高度)
 python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --gnss gps            # 衛星システムを GPS のみにする
 ```
@@ -180,6 +180,7 @@ python3 tools/setup_max_m10s.py /dev/cu.usbmodemXXXX --gnss gps            # 衛
   | GPS+Galileo+QZSS+SBAS (既定) | 10.00 Hz | すべて 0.1 秒 | 0.91 | 0.8 m / 1.3 m |
   | GPS+QZSS+SBAS (`--gnss gps`) | 10.00 Hz | すべて 0.1 秒 | 2.37 | 2.8 m / 6.2 m |
 
+- みちびきの L1S 信号による補正 (SLAS) も使える。L1S の受信 (`CFG-SIGNAL-QZSS_L1S_ENA`) と補正の利用 (`CFG-QZSS-USE_SLAS_DGNSS`) は出荷時から有効で、`setup_max_m10s.py` もロガーの起動時の再設定も、これらのキーには触れない (QZSS 全体を有効にするだけ)。補正を使うのは最寄りの監視局から 200 km 以内 (`CFG-QZSS-SLAS_MAX_BASELINE`) で、範囲の外では SBAS の補正に切り替わる ([Integration manual](https://content.u-blox.com/sites/default/files/MAX-M10S_IntegrationManual_UBX-20053088.pdf) 3.1.2)。NMEA の測位モード `D` だけでは補正元を区別できないので、屋外で `--query` を使い、`UBX-NAV-SLAS` と `UBX-NAV-SIG` から、使っている監視局と、補正元ごとの信号の数を見る
 - データシートには、より高い更新レートにする「高性能モード」もある。ただし OTP (1 回しか書き込めないメモリ) への書き込みが要り、元に戻せないので、このスクリプトでは扱わない
 - 既定の設定で、ベランダで 10 分測って 10.00 Hz (RMC の時刻の間隔はすべて 0.1 秒)。同じ場所・同じアンテナの ATGM336H-6N-74 と比べた結果 (止まった状態で 5 分、測った日は違う):
 
